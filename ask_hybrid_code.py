@@ -538,7 +538,7 @@ def call_llm(prompt, model, temperature=0.1):
                 stream=False,
                 options=dict(temperature=temperature)
             ),
-            timeout=120
+            timeout=600
         )
         return r.json()["response"]
     except Exception as e:
@@ -549,7 +549,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--index_dir", required=True)
     ap.add_argument("--embed_model", default="intfloat/multilingual-e5-base")
-    ap.add_argument("--model", default="qwen2.5-coder")
+    ap.add_argument("--model", default="qwen2.5-coder:32b")
     ap.add_argument("--top_k", type=int, default=10)
     ap.add_argument("--rerank_top_k", type=int, default=5)
     ap.add_argument("--verbose", action="store_true")
