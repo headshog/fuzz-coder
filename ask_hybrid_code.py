@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Hybrid Code Query System with Query Planning, Reranking, and Precise Retrieval
+Advanced Code Query System with Thinking Mode, Context Memory, and Multi-Step Reasoning
+Supports follow-up questions, code generation examples, and deep codebase understanding
 """
 
 from sentence_transformers import SentenceTransformer, CrossEncoder
@@ -14,6 +15,7 @@ import argparse
 import os
 from collections import defaultdict
 import time
+from typing import List, Dict, Any, Optional
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -80,24 +82,32 @@ def keyword_match_score(query, chunk):
     if chunk.get("parameters"):
         for p in chunk["parameters"]:
             chunk_words.add(p["name"].lower())
+            chunk_words.add(p["type"].lower())
 
     if not query_words:
         return 0.0
 
     overlap = len(query_words & chunk_words)
-    return overlap / len(query_words)
+    return overlap / max(len(query_words), 1)
 
 
 def parameter_match_score(query, chunk):
     """Check if query mentions parameters and if chunk has them"""
-    param_keywords = ["param", "argument", "arg", "input", "receive", "accept", "take"]
+    param_keywords = ["param", "argument", "arg", "input", "receive", "accept", "take", "байт", "массив", "array", "byte"]
     has_param_query = any(kw in query.lower() for kw in param_keywords)
 
     if not has_param_query:
         return 0.5  # Neutral if query doesn't care about params
 
     if chunk.get("parameters") and len(chunk["parameters"]) > 0:
-        return 1.0
+        # Check if parameter types match query intent
+        query_lower = query.lower()
+        for p in chunk["parameters"]:
+            p_type = p["type"].lower()
+            p_name = p["name"].lower()
+            if any(kw in p_type or kw in p_name for kw in ["byte", "uint8", "char", "buffer", "data", "array", "vector", "string"]):
+                return 1.0
+        return 0.7  # Has params but not exact match
     return 0.0
 
 
@@ -106,11 +116,12 @@ def input_type_match_score(query, chunk):
     query_lower = query.lower()
 
     # Check what input types the query is asking about
-    wants_stdin = any(w in query_lower for w in ["stdin", "standard input", "console input", "cin", "scanf"])
-    wants_file = any(w in query_lower for w in ["file", "fopen", "ifstream", "read from file"])
-    wants_api = any(w in query_lower for w in ["api", "http", "request", "network"])
+    wants_stdin = any(w in query_lower for w in ["stdin", "standard input", "console input", "cin", "scanf", "getchar", "fgets"])
+    wants_file = any(w in query_lower for w in ["file", "fopen", "ifstream", "fstream", "read from file"])
+    wants_api = any(w in query_lower for w in ["api", "http", "request", "network", "curl", "socket"])
+    wants_param = any(w in query_lower for w in ["param", "argument", "input", "receive", "accept", "pass", "переда", "вход"])
 
-    if not (wants_stdin or wants_file or wants_api):
+    if not (wants_stdin or wants_file or wants_api or wants_param):
         return 0.5  # No specific input type requested
 
     score = 0.0
@@ -120,14 +131,50 @@ def input_type_match_score(query, chunk):
         score += 0.5
     if wants_api and chunk.get("has_api_call"):
         score += 0.5
-
-    # Penalize mismatches
-    if wants_stdin and not chunk.get("has_stdin") and not chunk.get("has_file_input"):
-        score -= 0.3
-    if wants_file and not chunk.get("has_file_input") and not chunk.get("has_stdin"):
-        score -= 0.3
+    if wants_param and chunk.get("parameters") and len(chunk["parameters"]) > 0:
+        score += 0.5
 
     return max(0.0, min(1.0, score))
+
+
+def type_match_score(query, chunk):
+    """Check if query asks about specific types and chunk has them"""
+    query_lower = query.lower()
+
+    # Type keywords in Russian and English
+    type_patterns = {
+        "byte_array": ["byte", "uint8", "char*", "buffer", "массив байт", "байт"],
+        "string": ["string", "str", "char[]", "строка"],
+        "int": ["int", "integer", "число", "int32", "int64"],
+        "float": ["float", "double", "веществен", "floating"],
+        "vector": ["vector", "array", "список", "массив"],
+        "pointer": ["pointer", "*", "указатель"],
+        "reference": ["reference", "&", "ссылка"],
+    }
+
+    matched_types = []
+    for type_name, keywords in type_patterns.items():
+        if any(kw in query_lower for kw in keywords):
+            matched_types.append(type_name)
+
+    if not matched_types:
+        return 0.5  # No specific type requested
+
+    if not chunk.get("parameters"):
+        return 0.0
+
+    # Check if chunk parameters match requested types
+    chunk_types = []
+    for p in chunk["parameters"]:
+        p_type = p["type"].lower()
+        p_raw = p["raw"].lower()
+        for type_name, keywords in type_patterns.items():
+            if any(kw in p_type or kw in p_raw for kw in keywords):
+                chunk_types.append(type_name)
+
+    # Calculate overlap
+    overlap = len(set(matched_types) & set(chunk_types))
+    return min(1.0, overlap / max(len(matched_types), 1))
 
 
 def rerank_chunks(query, chunks, meta, call_graph=None):
@@ -144,12 +191,14 @@ def rerank_chunks(query, chunks, meta, call_graph=None):
         kw_score = keyword_match_score(query, chunk)
         param_score = parameter_match_score(query, chunk)
         input_score = input_type_match_score(query, chunk)
+        type_score = type_match_score(query, chunk)
 
         # Combine scores with weights
         total_score = (
-            0.4 * kw_score +
-            0.3 * param_score +
-            0.3 * input_score
+            0.3 * kw_score +
+            0.25 * param_score +
+            0.25 * input_score +
+            0.2 * type_score
         )
 
         scored_chunks.append({
@@ -159,7 +208,8 @@ def rerank_chunks(query, chunks, meta, call_graph=None):
             "breakdown": {
                 "keyword": kw_score,
                 "parameter": param_score,
-                "input_type": input_score
+                "input_type": input_score,
+                "type_match": type_score
             }
         })
 
@@ -169,7 +219,7 @@ def rerank_chunks(query, chunks, meta, call_graph=None):
 
 
 class QueryPlanner:
-    """Plan query execution strategy"""
+    """Advanced query planner with thinking mode support"""
 
     def __init__(self, special_indices, symbols, call_graph, called_by):
         self.special_indices = special_indices
@@ -177,55 +227,105 @@ class QueryPlanner:
         self.call_graph = call_graph
         self.called_by = called_by
 
-    def analyze_query(self, query):
-        """Analyze query to determine search strategy"""
+    def analyze_query(self, query, context_history=None):
+        """Analyze query to determine search strategy with thinking mode"""
         query_lower = query.lower()
 
         analysis = {
             "query_type": "general",
-            "keywords": re.findall(r"[a-z_]\w+", query_lower),
+            "keywords": re.findall(r"[a-z_а-яё]\w+", query_lower),
             "needs_stdin": False,
             "needs_file": False,
             "needs_api": False,
             "needs_params": False,
+            "needs_type_info": False,
+            "requested_types": [],
             "function_names": [],
             "expand_callers": False,
-            "expand_callees": False
+            "expand_callees": False,
+            "needs_example": False,
+            "needs_implementation": False,
+            "follow_up": False,
+            "referenced_functions": []
         }
 
         # Detect input type requirements
-        if any(w in query_lower for w in ["stdin", "standard input", "console", "cin", "scanf", "getchar"]):
+        if any(w in query_lower for w in ["stdin", "standard input", "console", "cin", "scanf", "getchar", "fgets", "ввод"]):
             analysis["needs_stdin"] = True
-            analysis["query_type"] = "input_specific"
 
-        if any(w in query_lower for w in ["file", "fopen", "ifstream", "fstream", "read from file"]):
+        if any(w in query_lower for w in ["file", "fopen", "ifstream", "fstream", "read from file", "файл"]):
             analysis["needs_file"] = True
-            analysis["query_type"] = "input_specific"
 
-        if any(w in query_lower for w in ["api", "http", "request", "network", "curl", "socket"]):
+        if any(w in query_lower for w in ["api", "http", "request", "network", "curl", "socket", "сеть"]):
             analysis["needs_api"] = True
-            analysis["query_type"] = "input_specific"
 
         # Detect parameter-related queries
-        if any(w in query_lower for w in ["param", "argument", "input", "receive", "accept", "take"]):
+        if any(w in query_lower for w in ["param", "argument", "arg", "input", "receive", "accept", "take", "переда", "вход", "параметр"]):
             analysis["needs_params"] = True
+
+        # Detect type-specific queries
+        type_keywords = {
+            "byte_array": ["byte", "uint8", "char*", "buffer", "массив байт", "байтов", "байты"],
+            "string": ["string", "str", "char[]", "строка", "строку"],
+            "int": ["int", "integer", "число", "int32", "int64", "цел"],
+            "float": ["float", "double", "веществен", "floating", "плавающ"],
+            "vector": ["vector", "array", "список", "массив", "std::vector"],
+            "pointer": ["pointer", "*", "указатель"],
+            "reference": ["reference", "&", "ссылка"],
+        }
+
+        for type_name, keywords in type_keywords.items():
+            if any(kw in query_lower for kw in keywords):
+                analysis["requested_types"].append(type_name)
+                analysis["needs_type_info"] = True
 
         # Detect function name mentions
         if self.symbols:
             for func_name in self.symbols.keys():
-                if func_name.lower() in query_lower:
+                if func_name.lower() in query_lower or func_name in query:
                     analysis["function_names"].append(func_name)
+                    analysis["referenced_functions"].append(func_name)
 
         # Detect call graph expansion needs
-        if any(w in query_lower for w in ["call", "invoke", "use", "caller", "callee", "called by"]):
-            if "caller" in query_lower or "called by" in query_lower:
+        if any(w in query_lower for w in ["call", "invoke", "use", "caller", "callee", "called by", "вызыва", "использу"]):
+            if "caller" in query_lower or "called by" in query_lower or "кто вызыва" in query_lower:
                 analysis["expand_callers"] = True
             else:
                 analysis["expand_callees"] = True
 
         # Detect listing/enumeration queries
-        if any(w in query_lower for w in ["list", "enumerate", "show all", "find all", "which functions"]):
+        if any(w in query_lower for w in ["list", "enumerate", "show all", "find all", "which functions", "какие функции", "перечисли", "покажи все"]):
             analysis["query_type"] = "listing"
+
+        # Detect example generation requests
+        if any(w in query_lower for w in ["example", "пример", "как вызвать", "как использовать", "usage", "использовани"]):
+            analysis["needs_example"] = True
+            analysis["query_type"] = "example_generation"
+
+        # Detect implementation questions
+        if any(w in query_lower for w in ["implement", "реализ", "как работает", "how does", "algorithm", "алгоритм"]):
+            analysis["needs_implementation"] = True
+            analysis["query_type"] = "implementation_explanation"
+
+        # Check for follow-up questions
+        if context_history:
+            if any(w in query_lower for w in ["this", "that", "these", "those", "эти", "этот", "такой", "так", "далее", "дальше", "продолж"]):
+                analysis["follow_up"] = True
+            # Check if referencing previous answer
+            if any(w in query_lower for w in ["from the list", "из списка", "функци", "function a", "function b", "function c"]):
+                analysis["follow_up"] = True
+
+        # Determine query type
+        if analysis["needs_example"]:
+            analysis["query_type"] = "example_generation"
+        elif analysis["needs_implementation"]:
+            analysis["query_type"] = "implementation_explanation"
+        elif analysis["needs_stdin"] or analysis["needs_file"] or analysis["needs_api"]:
+            analysis["query_type"] = "input_specific"
+        elif analysis["needs_type_info"]:
+            analysis["query_type"] = "type_specific"
+        elif len(analysis["function_names"]) > 0:
+            analysis["query_type"] = "function_specific"
 
         return analysis
 
@@ -259,13 +359,140 @@ class QueryPlanner:
                         expanded.update(self.call_graph[str(idx)].get("resolved_calls", []))
             candidates = expanded
 
-        return list(candidates)[:k*2]  # Return more candidates for reranking
+        return list(candidates)[:k*3]  # Return more candidates for better reranking
 
 
-def build_prompt(frags, q, analysis=None):
-    """Build enhanced prompt with structured context"""
+def build_thinking_prompt(frags, q, analysis=None, conversation_history=None):
+    """Build prompt with thinking mode for complex reasoning"""
+
+    # Build function context
     ctx = ""
+    for i, f in enumerate(frags, 1):
+        param_info = ""
+        if f.get("parameters"):
+            params = f["parameters"]
+            param_strs = [f"{p['name']}: {p['type']}" for p in params]
+            param_info = f"\n  Parameters: {', '.join(param_strs)}"
 
+        input_info = ""
+        if f.get("has_stdin"):
+            input_info = " [STDIN]"
+        elif f.get("has_file_input"):
+            input_info = " [FILE]"
+        elif f.get("has_api_call"):
+            input_info = " [API]"
+
+        ctx += f"""
+[Function {i}] {f["name"]}{input_info}
+  File: {f["file"]}:{f["start_line"]}-{f["end_line"]}
+  Signature: {f["signature"]}{param_info}
+  Code:
+```cpp
+{f["code"][:1500]}
+```
+"""
+
+    # Build conversation history context
+    history_ctx = ""
+    if conversation_history:
+        history_ctx = "\n### Conversation History:\n"
+        for idx, (prev_q, prev_a) in enumerate(conversation_history[-3:], 1):  # Last 3 exchanges
+            history_ctx += f"User: {prev_q}\nAssistant: {prev_a[:300]}...\n\n"
+
+    # Determine instructions based on query type
+    instructions = ""
+    if analysis:
+        if analysis["query_type"] == "listing":
+            instructions = """
+### Instructions:
+1. Carefully analyze EACH function in the context above
+2. Check if it matches ALL criteria from the question
+3. Create a numbered list of matching functions
+4. For each function include:
+   - Name and file location
+   - Relevant parameters with types
+   - Brief explanation why it matches
+5. Be precise - only include functions that truly match the criteria"""
+
+        elif analysis["query_type"] == "example_generation":
+            instructions = """
+### Instructions:
+1. Identify the specific function(s) mentioned or implied
+2. Write a complete, compilable code example showing how to call this function
+3. Include:
+   - Necessary #include statements
+   - Proper variable declarations with correct types
+   - The function call with appropriate arguments
+   - Error handling if relevant
+4. Add comments explaining key parts
+5. Make sure the example is realistic and follows the codebase patterns"""
+
+        elif analysis["query_type"] == "implementation_explanation":
+            instructions = """
+### Instructions:
+1. Explain the algorithm/logic step by step
+2. Reference specific code sections from the context
+3. Describe:
+   - What the function does
+   - How it processes inputs
+   - Key operations and their purpose
+   - Return value meaning
+4. Use simple language but be technically accurate"""
+
+        elif analysis["needs_type_info"]:
+            instructions = """
+### Instructions:
+1. Focus on parameter types mentioned in the question
+2. Check each function's signature carefully
+3. List only functions whose parameters match the requested type
+4. Include the exact type signature for verification
+5. If Russian terms used (e.g., "массив байтов"), match to C++ types like:
+   - byte array → uint8_t*, char*, std::vector<uint8_t>, QByteArray
+   - string → std::string, char*, const char*
+   - integer → int, int32_t, int64_t, size_t"""
+
+        elif analysis["follow_up"]:
+            instructions = """
+### Instructions:
+1. This is a follow-up question - consider the conversation context
+2. If user references "these functions" or "from the list", use previous answer
+3. Maintain consistency with earlier responses
+4. Build upon previous information rather than repeating"""
+
+    # Thinking prompt structure
+    thinking_instructions = """
+### Thinking Process (think step-by-step before answering):
+1. UNDERSTAND: What is the user really asking? Identify key requirements.
+2. ANALYZE: Look at each function in the context - what are their signatures?
+3. MATCH: Which functions satisfy the criteria? Why or why not?
+4. VERIFY: Double-check parameter types, input methods, etc.
+5. FORMULATE: Structure your answer clearly based on the question type.
+
+Now provide your answer:"""
+
+    return f"""You are an expert C/C++ code analyst with deep understanding of codebases.
+
+{history_ctx}
+### Current Question: {q}
+
+### Available Functions from Codebase:
+{ctx}
+{instructions}
+{thinking_instructions}
+"""
+
+
+def build_prompt(frags, q, analysis=None, conversation_history=None):
+    """Main prompt builder - uses thinking mode for complex queries"""
+    # Use thinking mode for complex queries
+    complex_types = ["listing", "example_generation", "implementation_explanation", "type_specific"]
+    use_thinking = (analysis and analysis["query_type"] in complex_types) or (conversation_history and len(conversation_history) > 0)
+
+    if use_thinking:
+        return build_thinking_prompt(frags, q, analysis, conversation_history)
+
+    # Simple prompt for straightforward queries
+    ctx = ""
     for i, f in enumerate(frags, 1):
         param_info = ""
         if f.get("parameters"):
@@ -287,35 +514,15 @@ File: {f["file"]}
 Function: {f["name"]}{param_info}{input_info}
 Signature: {f["signature"]}
 Code:
-{f["code"][:2000]}  # Truncate very long functions
+{f["code"][:2000]}
 
 """
-
-    # Add instructions based on query type
-    instructions = ""
-    if analysis:
-        if analysis["query_type"] == "listing":
-            instructions = """
-IMPORTANT: Provide a clear list of functions that match the criteria.
-For each function, mention:
-1. Function name
-2. File location
-3. Key parameters (if relevant to the question)
-4. How it matches the criteria (e.g., uses stdin, reads files, etc.)
-
-Be precise and accurate - only include functions that truly match."""
-
-        if analysis["needs_params"]:
-            instructions += """
-Pay special attention to function parameters. Only include functions that have input parameters
-if the question asks about receiving data through parameters."""
 
     return f"""You are an expert code analyst. Answer the question based on the provided code context.
 
 {ctx}
 
 Question: {q}
-{instructions}
 
 Answer:"""
 
@@ -375,6 +582,9 @@ def main():
     # Initialize query planner
     planner = QueryPlanner(special_indices, symbols, call_graph, called_by)
 
+    # Conversation history for follow-up questions
+    conversation_history = []  # List of (question, answer) tuples
+
     print(f"\nReady! Using model: {args.model}")
     print(f"Index contains {len(meta)} functions")
     print("Type 'quit' to exit\n")
@@ -393,15 +603,17 @@ def main():
 
         start_time = time.time()
 
-        # Step 1: Analyze query
-        analysis = planner.analyze_query(q)
+        # Step 1: Analyze query with conversation context
+        analysis = planner.analyze_query(q, conversation_history if conversation_history else None)
 
         if args.verbose:
             print(f"\n[Query Analysis]")
             print(f"  Type: {analysis['query_type']}")
+            print(f"  Follow-up: {analysis['follow_up']}")
             print(f"  Needs stdin: {analysis['needs_stdin']}")
             print(f"  Needs file: {analysis['needs_file']}")
             print(f"  Needs params: {analysis['needs_params']}")
+            print(f"  Requested types: {analysis['requested_types']}")
             print(f"  Keywords: {analysis['keywords'][:5]}...")
 
         # Step 2: Get candidates
@@ -446,17 +658,24 @@ def main():
 
         # Step 5: Build context and generate answer
         frags = [meta[i] for i in ranked_ids]
-        prompt = build_prompt(frags, q, analysis)
+        prompt = build_prompt(frags, q, analysis, conversation_history if conversation_history else None)
 
         if args.verbose:
             print(f"\n[Generation]")
             print(f"  Context size: {len(frags)} functions")
+            print(f"  Prompt length: {len(prompt)} chars")
 
         ans = call_llm(prompt, args.model)
 
         elapsed = time.time() - start_time
         print(f"\n{ans}")
         print(f"\n[Response time: {elapsed:.2f}s]")
+
+        # Update conversation history
+        conversation_history.append((q, ans))
+        # Keep only last 5 exchanges to avoid context explosion
+        if len(conversation_history) > 5:
+            conversation_history.pop(0)
 
 
 if __name__ == "__main__":
