@@ -65,6 +65,36 @@ API_CALL_PATTERNS = [
     r"\b(httplib::Client|boost::beast)\b",
 ]
 
+# Additional patterns for better code understanding
+OUTPUT_PATTERNS = [
+    r"\b(cout|printf|fprintf|sprintf)\b",
+    r"\b(std::)?(cout|cerr|clog|print|writeln)\b",
+    r"\b(Console\.Write|System\.out)\b",
+]
+
+MEMORY_MANAGEMENT_PATTERNS = [
+    r"\b(malloc|calloc|realloc|free)\b",
+    r"\b(new|delete)\b",
+    r"\b(shared_ptr|unique_ptr|weak_ptr)\b",
+]
+
+ERROR_HANDLING_PATTERNS = [
+    r"\b(throw|try|catch|finally)\b",
+    r"\b(errno|perror|strerror)\b",
+    r"\b(assert|static_assert)\b",
+]
+
+# Type system patterns for better type-based queries
+TYPE_PATTERNS = {
+    "byte_array": [r"\b(uint8_t|unsigned\s+char|char\s*\*|std::vector<uint8_t>|QByteArray|ByteBuffer)\b"],
+    "string": [r"\b(std::string|char\s*\*|const\s+char\s*\*|QString|std::wstring)\b"],
+    "integer": [r"\b(int|long|short|int32_t|int64_t|size_t|ssize_t)\b"],
+    "float": [r"\b(float|double|long\s+double)\b"],
+    "pointer": [r"\w+\s*\*\s*\w+"],
+    "reference": [r"\w+\s*&\s*\w+"],
+    "template": [r"\b(std::vector|std::map|std::set|std::unordered_map|std::array)\b"],
+}
+
 
 def unpack_if_zip(src, dst):
     src = Path(src)
@@ -124,6 +154,47 @@ def detect_input_type(code):
             result["has_api_call"] = True
             result["input_sources"].append("api")
             break
+
+    return result
+
+
+def detect_code_features(code):
+    """Detect additional code features for better indexing"""
+    result = {
+        "has_output": False,
+        "uses_memory_management": False,
+        "has_error_handling": False,
+        "types_used": [],
+        "features": []
+    }
+
+    # Check for output operations
+    for pattern in OUTPUT_PATTERNS:
+        if re.search(pattern, code, re.IGNORECASE):
+            result["has_output"] = True
+            result["features"].append("output")
+            break
+
+    # Check for memory management
+    for pattern in MEMORY_MANAGEMENT_PATTERNS:
+        if re.search(pattern, code, re.IGNORECASE):
+            result["uses_memory_management"] = True
+            result["features"].append("memory_management")
+            break
+
+    # Check for error handling
+    for pattern in ERROR_HANDLING_PATTERNS:
+        if re.search(pattern, code, re.IGNORECASE):
+            result["has_error_handling"] = True
+            result["features"].append("error_handling")
+            break
+
+    # Detect types used
+    for type_name, patterns in TYPE_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, code, re.IGNORECASE):
+                result["types_used"].append(type_name)
+                break
 
     return result
 
@@ -659,6 +730,10 @@ def main():
             input_info = detect_input_type(fn["code"])
             fn.update(input_info)
 
+            # Detect additional code features
+            code_features = detect_code_features(fn["code"])
+            fn.update(code_features)
+
             chunks.append(fn)
 
     print(f"Extracted {len(chunks)} functions")
@@ -711,17 +786,35 @@ def main():
     file_indices = [i for i, c in enumerate(chunks) if c.get("has_file_input")]
     api_indices = [i for i, c in enumerate(chunks) if c.get("has_api_call")]
 
+    # Additional special indices for enhanced features
+    output_indices = [i for i, c in enumerate(chunks) if c.get("has_output")]
+    memory_mgmt_indices = [i for i, c in enumerate(chunks) if c.get("uses_memory_management")]
+    error_handling_indices = [i for i, c in enumerate(chunks) if c.get("has_error_handling")]
+
+    # Type-based indices
+    type_indices = {}
+    for type_name in ["byte_array", "string", "integer", "float", "pointer", "reference", "template"]:
+        type_indices[type_name] = [i for i, c in enumerate(chunks)
+                                   if type_name in c.get("types_used", [])]
+
     with open(out/"special_indices.json", "w") as f:
         json.dump({
             "stdin": stdin_indices,
             "file_input": file_indices,
-            "api_calls": api_indices
+            "api_calls": api_indices,
+            "output": output_indices,
+            "memory_management": memory_mgmt_indices,
+            "error_handling": error_handling_indices,
+            "by_type": type_indices
         }, f)
 
     print(f"Index ready: {out}")
     print(f"  - Functions with stdin: {len(stdin_indices)}")
     print(f"  - Functions with file input: {len(file_indices)}")
     print(f"  - Functions with API calls: {len(api_indices)}")
+    print(f"  - Functions with output: {len(output_indices)}")
+    print(f"  - Functions with memory management: {len(memory_mgmt_indices)}")
+    print(f"  - Functions with error handling: {len(error_handling_indices)}")
 
 
 if __name__ == "__main__":

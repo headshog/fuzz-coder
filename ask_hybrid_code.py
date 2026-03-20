@@ -343,6 +343,23 @@ class QueryPlanner:
         if analysis["needs_api"] and "api_calls" in self.special_indices:
             candidates.update(self.special_indices["api_calls"])
 
+        # Use additional feature-based indices
+        if analysis.get("needs_output") and "output" in self.special_indices:
+            candidates.update(self.special_indices["output"])
+
+        if analysis.get("needs_memory_mgmt") and "memory_management" in self.special_indices:
+            candidates.update(self.special_indices["memory_management"])
+
+        if analysis.get("needs_error_handling") and "error_handling" in self.special_indices:
+            candidates.update(self.special_indices["error_handling"])
+
+        # Type-based search
+        if analysis.get("requested_types"):
+            by_type = self.special_indices.get("by_type", {})
+            for type_name in analysis["requested_types"]:
+                if type_name in by_type:
+                    candidates.update(by_type[type_name])
+
         # Add function-specific candidates
         for func_name in analysis["function_names"]:
             if func_name in self.symbols:
@@ -363,9 +380,9 @@ class QueryPlanner:
 
 
 def build_thinking_prompt(frags, q, analysis=None, conversation_history=None):
-    """Build prompt with thinking mode for complex reasoning"""
+    """Build prompt with thinking mode for complex reasoning and self-verification"""
 
-    # Build function context
+    # Build function context with verification markers
     ctx = ""
     for i, f in enumerate(frags, 1):
         param_info = ""
@@ -404,7 +421,7 @@ def build_thinking_prompt(frags, q, analysis=None, conversation_history=None):
     if analysis:
         if analysis["query_type"] == "listing":
             instructions = """
-### Instructions:
+### Instructions for Listing Queries:
 1. Carefully analyze EACH function in the context above
 2. Check if it matches ALL criteria from the question
 3. Create a numbered list of matching functions
@@ -412,11 +429,17 @@ def build_thinking_prompt(frags, q, analysis=None, conversation_history=None):
    - Name and file location
    - Relevant parameters with types
    - Brief explanation why it matches
-5. Be precise - only include functions that truly match the criteria"""
+5. CRITICAL: Only include functions that ACTUALLY exist in the provided context
+6. DO NOT invent or assume functions beyond what is shown
+7. If no functions match, explicitly state "No matching functions found in the codebase"
+8. After listing, perform SELF-VERIFICATION:
+   - Re-check each listed function against the original criteria
+   - Confirm the function signature matches the requirements
+   - Mark any uncertain entries with [NEEDS REVIEW]"""
 
         elif analysis["query_type"] == "example_generation":
             instructions = """
-### Instructions:
+### Instructions for Example Generation:
 1. Identify the specific function(s) mentioned or implied
 2. Write a complete, compilable code example showing how to call this function
 3. Include:
@@ -425,23 +448,35 @@ def build_thinking_prompt(frags, q, analysis=None, conversation_history=None):
    - The function call with appropriate arguments
    - Error handling if relevant
 4. Add comments explaining key parts
-5. Make sure the example is realistic and follows the codebase patterns"""
+5. Make sure the example is realistic and follows the codebase patterns
+6. CRITICAL: Use ONLY the parameter types and names from the actual function signature
+7. DO NOT invent parameters or change types
+8. After generating, perform SELF-VERIFICATION:
+   - Check that all parameter types match the function signature exactly
+   - Verify the function name is correct
+   - Ensure the example would compile with the given signature"""
 
         elif analysis["query_type"] == "implementation_explanation":
             instructions = """
-### Instructions:
+### Instructions for Implementation Explanation:
 1. Explain the algorithm/logic step by step
-2. Reference specific code sections from the context
+2. Reference specific code sections from the context with line numbers
 3. Describe:
    - What the function does
    - How it processes inputs
    - Key operations and their purpose
    - Return value meaning
-4. Use simple language but be technically accurate"""
+4. Use simple language but be technically accurate
+5. CRITICAL: Base explanations ONLY on the provided code
+6. DO NOT speculate about implementation details not visible in the code
+7. If something is unclear from the code, state "Implementation detail not visible in provided code"
+8. After explaining, perform SELF-VERIFICATION:
+   - Cross-reference each claim with actual code lines
+   - Remove any assumptions not supported by the code"""
 
         elif analysis["needs_type_info"]:
             instructions = """
-### Instructions:
+### Instructions for Type-Specific Queries:
 1. Focus on parameter types mentioned in the question
 2. Check each function's signature carefully
 3. List only functions whose parameters match the requested type
@@ -449,26 +484,63 @@ def build_thinking_prompt(frags, q, analysis=None, conversation_history=None):
 5. If Russian terms used (e.g., "массив байтов"), match to C++ types like:
    - byte array → uint8_t*, char*, std::vector<uint8_t>, QByteArray
    - string → std::string, char*, const char*
-   - integer → int, int32_t, int64_t, size_t"""
+   - integer → int, int32_t, int64_t, size_t
+6. CRITICAL: Verify the type match before including in the answer
+7. DO NOT include functions where you're unsure about the type
+8. After listing, perform SELF-VERIFICATION:
+   - For each function, quote the exact parameter type from the signature
+   - Explain why this type matches (or doesn't match) the query
+   - Mark uncertain matches with [TYPE UNCERTAIN]"""
 
         elif analysis["follow_up"]:
             instructions = """
-### Instructions:
+### Instructions for Follow-up Questions:
 1. This is a follow-up question - consider the conversation context
 2. If user references "these functions" or "from the list", use previous answer
 3. Maintain consistency with earlier responses
-4. Build upon previous information rather than repeating"""
+4. Build upon previous information rather than repeating
+5. CRITICAL: If referencing functions from previous answer, verify they exist in current context
+6. If the current context doesn't contain previously mentioned functions, state this explicitly"""
 
-    # Thinking prompt structure
+    # Enhanced thinking and verification prompt structure
     thinking_instructions = """
-### Thinking Process (think step-by-step before answering):
-1. UNDERSTAND: What is the user really asking? Identify key requirements.
-2. ANALYZE: Look at each function in the context - what are their signatures?
-3. MATCH: Which functions satisfy the criteria? Why or why not?
-4. VERIFY: Double-check parameter types, input methods, etc.
-5. FORMULATE: Structure your answer clearly based on the question type.
+### Step-by-Step Reasoning Process:
 
-Now provide your answer:"""
+**Phase 1: UNDERSTAND**
+- What exactly is the user asking?
+- What are the key criteria/constraints?
+- What type of answer is expected (list, explanation, example)?
+
+**Phase 2: ANALYZE CONTEXT**
+- Review each function in the provided context
+- Extract key information: signatures, parameters, types, input methods
+- Note which functions are relevant and why
+
+**Phase 3: MATCH & FILTER**
+- Compare each function against the query criteria
+- Eliminate functions that don't match
+- Keep only functions with clear evidence
+
+**Phase 4: DRAFT ANSWER**
+- Formulate your initial answer based on the analysis
+- Include specific evidence (signatures, line numbers, etc.)
+
+**Phase 5: SELF-VERIFICATION (CRITICAL)**
+- Review your draft answer against the original context
+- For each function mentioned:
+  * Does it actually exist in the provided context?
+  * Are the signature and parameters quoted correctly?
+  * Does it truly match the query criteria?
+- Remove any functions that fail verification
+- Flag any uncertain claims with [UNCERTAIN]
+- If you cannot verify a claim, do not include it
+
+**Phase 6: FINAL ANSWER**
+- Present only verified information
+- Be explicit about limitations
+- If no matching functions found, say so clearly
+
+Now provide your answer following this process:"""
 
     return f"""You are an expert C/C++ code analyst with deep understanding of codebases.
 
@@ -528,7 +600,7 @@ Answer:"""
 
 
 def call_llm(prompt, model, temperature=0.1):
-    """Call LLM with retry logic"""
+    """Call LLM with retry logic and verification mode"""
     try:
         r = requests.post(
             OLLAMA_URL,
@@ -543,6 +615,35 @@ def call_llm(prompt, model, temperature=0.1):
         return r.json()["response"]
     except Exception as e:
         return f"Error calling LLM: {e}"
+
+
+def verify_answer_with_context(answer, context_frags):
+    """Verify that functions mentioned in the answer actually exist in the context"""
+    # Extract function names from the answer
+    func_pattern = re.compile(r'\b([A-Za-z_]\w*)\s*\(', re.MULTILINE)
+    mentioned_funcs = set(func_pattern.findall(answer))
+
+    # Get actual function names from context
+    actual_funcs = set(f["name"] for f in context_frags)
+
+    # Find hallucinated functions (mentioned but not in context)
+    hallucinated = mentioned_funcs - actual_funcs
+
+    # Filter out common keywords that might be matched
+    common_keywords = {"if", "for", "while", "switch", "return", "sizeof", "catch",
+                       "new", "delete", "throw", "else", "do", "class", "struct",
+                       "namespace", "template", "typedef", "using", "enum", "union",
+                       "printf", "scanf", "malloc", "free", "memset", "memcpy",
+                       "std::vector", "std::string", "std::map", "std::set"}
+
+    hallucinated = hallucinated - common_keywords
+
+    return {
+        "mentioned": mentioned_funcs,
+        "actual": actual_funcs,
+        "hallucinated": hallucinated,
+        "is_valid": len(hallucinated) == 0
+    }
 
 
 def main():
@@ -667,9 +768,21 @@ def main():
 
         ans = call_llm(prompt, args.model)
 
+        # Step 6: Verify answer for hallucinations (optional, verbose mode)
+        if args.verbose:
+            verification = verify_answer_with_context(ans, frags)
+            if not verification["is_valid"]:
+                print(f"\n[⚠️  VERIFICATION WARNING]")
+                print(f"  Potentially hallucinated functions: {verification['hallucinated']}")
+                print(f"  Consider asking for clarification or re-querying with more context")
+
         elapsed = time.time() - start_time
         print(f"\n{ans}")
         print(f"\n[Response time: {elapsed:.2f}s]")
+
+        # Add verification note to conversation history if hallucinations detected
+        if not verification.get("is_valid", True):
+            ans += f"\n\n[Note: Answer may contain unverified function names: {verification['hallucinated']}]"
 
         # Update conversation history
         conversation_history.append((q, ans))
