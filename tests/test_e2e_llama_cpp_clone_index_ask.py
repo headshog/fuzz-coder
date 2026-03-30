@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -114,5 +115,7 @@ def test_e2e_llama_cpp_clone_index_and_ask(tmp_path, monkeypatch, capsys):
     assert "Path filters: ['src']" in output
 
     prompt = captured_prompt["prompt"].replace("\\", "/")
-    assert "/src/" in prompt
-    assert "/examples/" not in prompt
+    file_lines = re.findall(r"^\s*File:\s*(.+)$", prompt, flags=re.MULTILINE)
+    assert file_lines, "Prompt must include at least one File: line"
+    assert any("/src/" in p or p.startswith("src/") for p in file_lines)
+    assert all("/examples/" not in p and not p.startswith("examples/") for p in file_lines)
