@@ -22,6 +22,295 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
+TYPE_KEYWORDS = {
+    "byte_array": ["byte", "uint8", "char*", "buffer", "массив байт", "байт", "bytes", "qbytearray"],
+    "string": ["string", "str", "char[]", "строка", "строку", "cstring", "wstring"],
+    "integer": ["int", "integer", "число", "int32", "int64", "цел", "size_t", "ssize_t"],
+    "float": ["float", "double", "веществен", "floating", "плавающ"],
+    "template": ["vector", "array", "список", "массив", "std::vector", "template", "std::array"],
+    "pointer": ["pointer", "указатель"],
+    "reference": ["reference", "ссылка"],
+}
+
+# Canonical names used by index_hybrid_code.py -> special_indices["by_type"]
+TYPE_ALIASES = {
+    "int": "integer",
+    "vector": "template",
+}
+
+TYPE_INDEX_ALIASES = {
+    "integer": ["int"],
+    "template": ["vector"],
+}
+
+WRITE_LIKE_KEYWORDS = [
+    "write", "output", "print", "printf", "fprintf", "cout", "cerr", "clog",
+    "log", "dump", "serialize", "save", "emit", "flush", "store",
+    "запис", "вывод", "печат", "лог",
+]
+
+PARSE_LIKE_KEYWORDS = [
+    "parse", "parser", "token", "tokenize", "split", "decode", "deserialize",
+    "scan", "lex", "grammar", "peg", "readline", "from_string", "parse_",
+    "парс", "разбор",
+]
+
+FUZZ_QUERY_KEYWORDS = [
+    "fuzz", "fuzzer", "fuzzing", "libfuzzer", "afl", "afl++", "honggfuzz",
+    "oss-fuzz", "mutation", "coverage-guided", "asan", "ubsan", "sanitizer",
+    "фазз", "фаззинг", "фузз", "фуззинг",
+]
+
+FUZZ_TARGET_KEYWORDS = [
+    "parse", "decode", "deserialize", "token", "grammar", "load", "read",
+    "json", "xml", "yaml", "gguf", "tensor", "prompt", "chat", "template",
+    "sample", "kv", "buffer", "memcpy", "memmove", "strncpy", "snprintf",
+    "base64", "utf8", "utf-8", "binary", "header", "payload",
+]
+
+
+def query_contains_keyword(query_lower, keyword):
+    """Match keywords safely; short alpha keywords use token boundaries."""
+    if len(keyword) <= 3 and keyword.isalpha():
+        pattern = rf"(?<![A-Za-z0-9_]){re.escape(keyword)}(?![A-Za-z0-9_])"
+        return re.search(pattern, query_lower) is not None
+    return keyword in query_lower
+
+
+def query_has_any_keyword(query_lower, keywords):
+    """Check if query contains any keyword using safe matching rules."""
+    return any(query_contains_keyword(query_lower, kw) for kw in keywords)
+
+
+def normalize_type_name(type_name):
+    """Normalize type names to canonical keys."""
+    t = type_name.lower().strip()
+    return TYPE_ALIASES.get(t, t)
+
+
+def extract_requested_types(query_lower):
+    """Extract canonical requested types from query."""
+    matched = []
+    for type_name, keywords in TYPE_KEYWORDS.items():
+        if any(query_contains_keyword(query_lower, kw) for kw in keywords):
+            matched.append(type_name)
+
+    # Pointer/reference are special symbols and may be requested explicitly
+    if "*" in query_lower and "pointer" not in matched:
+        matched.append("pointer")
+    if "&" in query_lower and "reference" not in matched:
+        matched.append("reference")
+
+    return sorted(set(normalize_type_name(t) for t in matched))
+
+
+def query_excludes_output(query_lower):
+    """Detect negative output/write constraints like 'not write-like'."""
+    explicit_phrases = [
+        "not write", "not write-like", "but not write", "without write",
+        "exclude write", "except write", "not output", "exclude output",
+        "without output", "не запис", "не вывод", "без вывода", "кроме write",
+        "кроме вывода", "excluding write",
+    ]
+    if any(p in query_lower for p in explicit_phrases):
+        return True
+
+    # Pattern-based negative constraints close to output keywords
+    neg_en = r"\b(not|without|exclude|except|excluding)\b[^.\n]{0,60}\b(write|output|print|printf|fprintf|cout|log|dump|serialize)\b"
+    neg_ru = r"\b(не|без|кроме|исключая)\b[^.\n]{0,60}\b(запис\w*|вывод\w*|печат\w*|лог\w*)\b"
+    return re.search(neg_en, query_lower) is not None or re.search(neg_ru, query_lower) is not None
+
+
+def parameter_matches_type(param, type_name):
+    """Check if parameter likely matches a canonical type."""
+    p_raw = f"{param.get('raw', '')} {param.get('type', '')}".lower()
+    type_name = normalize_type_name(type_name)
+
+    if type_name == "pointer":
+        return "*" in p_raw
+    if type_name == "reference":
+        return "&" in p_raw
+
+    type_param_hints = {
+        "byte_array": ["uint8", "unsigned char", "char *", "byte", "qbytearray", "vector<uint8"],
+        "string": ["std::string", "string", "char *", "const char *", "qstring", "wstring", "char[]"],
+        "integer": ["int", "long", "short", "int32", "int64", "size_t", "ssize_t", "uint32", "uint64"],
+        "float": ["float", "double", "long double"],
+        "template": ["std::vector", "vector<", "std::array", "array<", "std::map", "map<", "std::set", "set<", "unordered_map"],
+    }
+    return any(h in p_raw for h in type_param_hints.get(type_name, []))
+
+
+def chunk_matches_requested_types(chunk, requested_types):
+    """Return True if chunk has at least one parameter matching any requested type."""
+    if not requested_types:
+        return True
+    if not chunk.get("parameters"):
+        return False
+
+    canonical = [normalize_type_name(t) for t in requested_types]
+    for p in chunk["parameters"]:
+        for t in canonical:
+            if parameter_matches_type(p, t):
+                return True
+    return False
+
+
+def is_write_like_chunk(chunk):
+    """Heuristic detector for write/output-like functions."""
+    if chunk.get("has_output"):
+        return True
+
+    fields = " ".join([
+        chunk.get("name", ""),
+        chunk.get("signature", ""),
+        chunk.get("code", "")[:1200],
+    ]).lower()
+
+    return any(kw in fields for kw in WRITE_LIKE_KEYWORDS)
+
+
+def is_parse_like_chunk(chunk):
+    """Heuristic detector for parse/input-processing functions."""
+    name = chunk.get("name", "").lower()
+    sig = chunk.get("signature", "").lower()
+    code = chunk.get("code", "")[:1200].lower()
+    fields = " ".join([name, sig, code])
+    return any(kw in fields for kw in PARSE_LIKE_KEYWORDS)
+
+
+def fuzz_target_score(chunk):
+    """Estimate how suitable a function is as a fuzzing target (0.0-1.0)."""
+    score = 0.0
+
+    if chunk.get("has_stdin"):
+        score += 0.20
+    if chunk.get("has_file_input"):
+        score += 0.20
+    if chunk.get("has_api_call"):
+        score += 0.10
+    if chunk.get("uses_memory_management"):
+        score += 0.15
+    if chunk.get("has_error_handling"):
+        score += 0.05
+    if is_parse_like_chunk(chunk):
+        score += 0.25
+
+    params = chunk.get("parameters") or []
+    if params:
+        score += min(0.20, 0.04 * len(params))
+
+    for p in params:
+        p_text = f"{p.get('raw', '')} {p.get('type', '')} {p.get('name', '')}".lower()
+        if "*" in p_text or "&" in p_text:
+            score += 0.05
+        if any(token in p_text for token in [
+            "char", "string", "buffer", "data", "byte", "uint8",
+            "vector<", "array<", "span", "size_t", "int", "len", "length"
+        ]):
+            score += 0.04
+
+    fields = " ".join([
+        chunk.get("name", ""),
+        chunk.get("signature", ""),
+        chunk.get("code", "")[:1600],
+    ]).lower()
+    if any(kw in fields for kw in FUZZ_TARGET_KEYWORDS):
+        score += 0.18
+
+    # Deprioritize pure output sinks when they do not parse/read/process inputs.
+    if is_write_like_chunk(chunk) and not (
+        chunk.get("has_stdin") or
+        chunk.get("has_file_input") or
+        chunk.get("has_api_call") or
+        is_parse_like_chunk(chunk)
+    ):
+        score -= 0.10
+
+    if chunk.get("name", "").lower() in {"main"}:
+        score -= 0.10
+
+    return max(0.0, min(1.0, score))
+
+
+def collect_positive_constraint_matches(chunk, analysis):
+    """Collect positive input/parse matches for flexible all/any filtering."""
+    matches = {}
+    if analysis.get("needs_stdin"):
+        matches["stdin"] = bool(chunk.get("has_stdin"))
+    if analysis.get("needs_file"):
+        matches["file"] = bool(chunk.get("has_file_input"))
+    if analysis.get("needs_api"):
+        matches["api"] = bool(chunk.get("has_api_call"))
+    if analysis.get("requested_types"):
+        matches["types"] = chunk_matches_requested_types(chunk, analysis["requested_types"])
+    if analysis.get("needs_parse_like"):
+        matches["parse_like"] = is_parse_like_chunk(chunk)
+    if analysis.get("needs_fuzz_targets"):
+        min_fuzz_score = analysis.get("min_fuzz_score", 0.35)
+        matches["fuzz_target"] = fuzz_target_score(chunk) >= min_fuzz_score
+    return matches
+
+
+def chunk_matches_constraints(chunk, analysis):
+    """Hard constraints matcher used for strict listing pre-filter."""
+    if analysis.get("needs_params") and not chunk.get("parameters"):
+        return False
+    if analysis.get("exclude_output") and is_write_like_chunk(chunk):
+        return False
+
+    positive_matches = collect_positive_constraint_matches(chunk, analysis)
+    if positive_matches:
+        mode = analysis.get("constraint_mode", "all")
+        if mode == "any":
+            if not any(positive_matches.values()):
+                return False
+        else:
+            if not all(positive_matches.values()):
+                return False
+
+    return True
+
+
+def prefilter_listing_candidates(candidate_ids, meta, analysis):
+    """Strict pre-filter before LLM for listing-like queries."""
+    out = []
+    for cid in candidate_ids:
+        chunk = meta[cid]
+        if not chunk_matches_constraints(chunk, analysis):
+            continue
+        if analysis.get("needs_fuzz_targets"):
+            min_fuzz_score = analysis.get("min_fuzz_score", 0.35)
+            if fuzz_target_score(chunk) < min_fuzz_score:
+                continue
+        out.append(cid)
+
+    if out or not analysis.get("needs_fuzz_targets"):
+        return out
+
+    # Fallback for broad fuzzing queries: keep best available candidates
+    # instead of returning an empty set too often.
+    relaxed = []
+    for cid in candidate_ids:
+        chunk = meta[cid]
+        if chunk_matches_constraints(chunk, analysis):
+            relaxed.append((cid, fuzz_target_score(chunk)))
+
+    relaxed.sort(key=lambda x: x[1], reverse=True)
+    min_fallback = analysis.get("min_fallback_fuzz_score", 0.15)
+    return [cid for cid, s in relaxed if s >= min_fallback]
+
+
+def reciprocal_rank_fusion(rank_lists, rrf_k=60):
+    """Fuse multiple ranked lists using RRF."""
+    scores = defaultdict(float)
+    for rank_list in rank_lists:
+        for rank, doc_id in enumerate(rank_list):
+            scores[int(doc_id)] += 1.0 / (rrf_k + rank + 1)
+
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [doc_id for doc_id, _ in ranked], scores
+
 
 def load_meta(path):
     """Load metadata from index"""
@@ -140,22 +429,7 @@ def input_type_match_score(query, chunk):
 def type_match_score(query, chunk):
     """Check if query asks about specific types and chunk has them"""
     query_lower = query.lower()
-
-    # Type keywords in Russian and English
-    type_patterns = {
-        "byte_array": ["byte", "uint8", "char*", "buffer", "массив байт", "байт"],
-        "string": ["string", "str", "char[]", "строка"],
-        "int": ["int", "integer", "число", "int32", "int64"],
-        "float": ["float", "double", "веществен", "floating"],
-        "vector": ["vector", "array", "список", "массив"],
-        "pointer": ["pointer", "*", "указатель"],
-        "reference": ["reference", "&", "ссылка"],
-    }
-
-    matched_types = []
-    for type_name, keywords in type_patterns.items():
-        if any(kw in query_lower for kw in keywords):
-            matched_types.append(type_name)
+    matched_types = extract_requested_types(query_lower)
 
     if not matched_types:
         return 0.5  # No specific type requested
@@ -163,21 +437,17 @@ def type_match_score(query, chunk):
     if not chunk.get("parameters"):
         return 0.0
 
-    # Check if chunk parameters match requested types
-    chunk_types = []
+    chunk_types = set()
     for p in chunk["parameters"]:
-        p_type = p["type"].lower()
-        p_raw = p["raw"].lower()
-        for type_name, keywords in type_patterns.items():
-            if any(kw in p_type or kw in p_raw for kw in keywords):
-                chunk_types.append(type_name)
+        for t in TYPE_KEYWORDS.keys():
+            if parameter_matches_type(p, t):
+                chunk_types.add(t)
 
-    # Calculate overlap
-    overlap = len(set(matched_types) & set(chunk_types))
+    overlap = len(set(matched_types) & chunk_types)
     return min(1.0, overlap / max(len(matched_types), 1))
 
 
-def rerank_chunks(query, chunks, meta, call_graph=None):
+def rerank_chunks(query, chunks, meta, call_graph=None, analysis=None):
     """Rerank chunks using multiple signals"""
     if not chunks:
         return []
@@ -192,6 +462,8 @@ def rerank_chunks(query, chunks, meta, call_graph=None):
         param_score = parameter_match_score(query, chunk)
         input_score = input_type_match_score(query, chunk)
         type_score = type_match_score(query, chunk)
+        parse_score = 1.0 if is_parse_like_chunk(chunk) else 0.0
+        fuzz_score = fuzz_target_score(chunk)
 
         # Combine scores with weights
         total_score = (
@@ -201,17 +473,48 @@ def rerank_chunks(query, chunks, meta, call_graph=None):
             0.2 * type_score
         )
 
+        # Soft constraints to help reranking even before strict pre-filter.
+        if analysis:
+            if analysis.get("needs_parse_like"):
+                total_score += 0.2 * parse_score
+            if analysis.get("needs_fuzz_targets"):
+                total_score += 0.35 * fuzz_score
+                if fuzz_score < analysis.get("min_fallback_fuzz_score", 0.15):
+                    total_score -= 0.1
+
+            positive_matches = collect_positive_constraint_matches(chunk, analysis)
+            if positive_matches:
+                if analysis.get("constraint_mode") == "any":
+                    if any(positive_matches.values()):
+                        total_score += 0.1
+                    else:
+                        total_score -= 0.2
+                else:
+                    if all(positive_matches.values()):
+                        total_score += 0.1
+                    else:
+                        total_score -= 0.2
+
+            if analysis.get("exclude_output") and is_write_like_chunk(chunk):
+                total_score -= 0.25
+            if analysis.get("requested_types") and not chunk_matches_requested_types(chunk, analysis["requested_types"]):
+                total_score -= 0.15
+            if analysis.get("needs_params") and not chunk.get("parameters"):
+                total_score -= 0.15
+
         scored_chunks.append({
             "idx": idx,
             "chunk": chunk,
             "score": total_score,
-            "breakdown": {
-                "keyword": kw_score,
-                "parameter": param_score,
-                "input_type": input_score,
-                "type_match": type_score
-            }
-        })
+                "breakdown": {
+                    "keyword": kw_score,
+                    "parameter": param_score,
+                    "input_type": input_score,
+                    "type_match": type_score,
+                    "parse_like": parse_score,
+                    "fuzz_target": fuzz_score
+                }
+            })
 
     # Sort by total score
     scored_chunks.sort(key=lambda x: x["score"], reverse=True)
@@ -234,12 +537,20 @@ class QueryPlanner:
         analysis = {
             "query_type": "general",
             "keywords": re.findall(r"[a-z_а-яё]\w+", query_lower),
+            "is_listing": False,
             "needs_stdin": False,
             "needs_file": False,
             "needs_api": False,
             "needs_params": False,
+            "needs_types": False,
+            "needs_parse_like": False,
+            "needs_fuzz_targets": False,
             "needs_type_info": False,
             "requested_types": [],
+            "constraint_mode": "all",
+            "exclude_output": False,
+            "min_fuzz_score": 0.35,
+            "min_fallback_fuzz_score": 0.15,
             "function_names": [],
             "expand_callers": False,
             "expand_callees": False,
@@ -264,20 +575,23 @@ class QueryPlanner:
             analysis["needs_params"] = True
 
         # Detect type-specific queries
-        type_keywords = {
-            "byte_array": ["byte", "uint8", "char*", "buffer", "массив байт", "байтов", "байты"],
-            "string": ["string", "str", "char[]", "строка", "строку"],
-            "int": ["int", "integer", "число", "int32", "int64", "цел"],
-            "float": ["float", "double", "веществен", "floating", "плавающ"],
-            "vector": ["vector", "array", "список", "массив", "std::vector"],
-            "pointer": ["pointer", "*", "указатель"],
-            "reference": ["reference", "&", "ссылка"],
-        }
+        analysis["requested_types"] = extract_requested_types(query_lower)
+        if analysis["requested_types"]:
+            analysis["needs_type_info"] = True
+            analysis["needs_types"] = True
 
-        for type_name, keywords in type_keywords.items():
-            if any(kw in query_lower for kw in keywords):
-                analysis["requested_types"].append(type_name)
-                analysis["needs_type_info"] = True
+        # Detect parse-like intent
+        if any(w in query_lower for w in [
+            "parse", "parser", "parsing", "tokenize", "split", "decode", "deserialize",
+            "scan", "lex", "grammar", "peg", "разбор", "парс"
+        ]):
+            analysis["needs_parse_like"] = True
+
+        # Detect fuzzing-target intent
+        if query_has_any_keyword(query_lower, FUZZ_QUERY_KEYWORDS):
+            analysis["needs_fuzz_targets"] = True
+            # Fuzzing asks are effectively listing/ranking asks even without explicit "list".
+            analysis["is_listing"] = True
 
         # Detect function name mentions
         if self.symbols:
@@ -295,7 +609,33 @@ class QueryPlanner:
 
         # Detect listing/enumeration queries
         if any(w in query_lower for w in ["list", "enumerate", "show all", "find all", "which functions", "какие функции", "перечисли", "покажи все"]):
+            analysis["is_listing"] = True
             analysis["query_type"] = "listing"
+
+        # Detect exclusion constraints
+        if query_excludes_output(query_lower):
+            analysis["exclude_output"] = True
+
+        # Decide whether positive constraints are all-required or any-of
+        positive_signals = 0
+        positive_signals += int(analysis["needs_stdin"])
+        positive_signals += int(analysis["needs_file"])
+        positive_signals += int(analysis["needs_api"])
+        positive_signals += int(bool(analysis["requested_types"]))
+        positive_signals += int(analysis["needs_parse_like"])
+        positive_signals += int(analysis["needs_fuzz_targets"])
+
+        has_or_connector = re.search(r"\b(or|или)\b", query_lower) is not None
+        has_and_connector = re.search(r"\b(and|и)\b", query_lower) is not None
+
+        if positive_signals > 1:
+            if has_or_connector:
+                analysis["constraint_mode"] = "any"
+            elif has_and_connector:
+                analysis["constraint_mode"] = "all"
+            elif analysis["is_listing"] and analysis["needs_parse_like"]:
+                # Typical query style: "parse ... or stdin/string/bytes input"
+                analysis["constraint_mode"] = "any"
 
         # Detect example generation requests
         if any(w in query_lower for w in ["example", "пример", "как вызвать", "как использовать", "usage", "использовани"]):
@@ -320,6 +660,8 @@ class QueryPlanner:
             analysis["query_type"] = "example_generation"
         elif analysis["needs_implementation"]:
             analysis["query_type"] = "implementation_explanation"
+        elif analysis["is_listing"]:
+            analysis["query_type"] = "listing"
         elif analysis["needs_stdin"] or analysis["needs_file"] or analysis["needs_api"]:
             analysis["query_type"] = "input_specific"
         elif analysis["needs_type_info"]:
@@ -353,12 +695,29 @@ class QueryPlanner:
         if analysis.get("needs_error_handling") and "error_handling" in self.special_indices:
             candidates.update(self.special_indices["error_handling"])
 
+        # Fuzz-target discovery mode: broaden candidates to likely crash-prone surfaces.
+        if analysis.get("needs_fuzz_targets"):
+            for key in ["stdin", "file_input", "api_calls", "memory_management", "error_handling"]:
+                if key in self.special_indices:
+                    candidates.update(self.special_indices[key])
+
+            by_type = self.special_indices.get("by_type", {})
+            for type_name in ["byte_array", "string", "template", "pointer", "integer"]:
+                if type_name in by_type:
+                    candidates.update(by_type[type_name])
+                for alias in TYPE_INDEX_ALIASES.get(type_name, []):
+                    if alias in by_type:
+                        candidates.update(by_type[alias])
+
         # Type-based search
         if analysis.get("requested_types"):
             by_type = self.special_indices.get("by_type", {})
             for type_name in analysis["requested_types"]:
                 if type_name in by_type:
                     candidates.update(by_type[type_name])
+                for alias in TYPE_INDEX_ALIASES.get(type_name, []):
+                    if alias in by_type:
+                        candidates.update(by_type[alias])
 
         # Add function-specific candidates
         for func_name in analysis["function_names"]:
@@ -376,7 +735,11 @@ class QueryPlanner:
                         expanded.update(self.call_graph[str(idx)].get("resolved_calls", []))
             candidates = expanded
 
-        return list(candidates)[:k*3]  # Return more candidates for better reranking
+        # Strict exclusion at retrieval level when user asked for "not write-like/output"
+        if analysis.get("exclude_output") and "output" in self.special_indices:
+            candidates.difference_update(self.special_indices["output"])
+
+        return sorted(candidates)[:k*3]  # deterministic order for stable retrieval
 
 
 def build_thinking_prompt(frags, q, analysis=None, conversation_history=None):
@@ -419,23 +782,56 @@ def build_thinking_prompt(frags, q, analysis=None, conversation_history=None):
     # Determine instructions based on query type
     instructions = ""
     if analysis:
+        listing_constraints = []
+        if analysis.get("needs_stdin"):
+            listing_constraints.append("must read from stdin")
+        if analysis.get("needs_file"):
+            listing_constraints.append("must read from files")
+        if analysis.get("needs_api"):
+            listing_constraints.append("must make API/network calls")
+        if analysis.get("needs_params"):
+            listing_constraints.append("must have input parameters")
+        if analysis.get("requested_types"):
+            listing_constraints.append(f"must match requested types: {', '.join(analysis['requested_types'])}")
+        if analysis.get("needs_parse_like"):
+            listing_constraints.append("should be parse/input-processing related")
+        if analysis.get("exclude_output"):
+            listing_constraints.append("must NOT be write/output-like functions")
+        if analysis.get("needs_fuzz_targets"):
+            listing_constraints.append("should be good fuzzing targets (parsing/decoding, memory handling, complex input processing)")
+
+        listing_constraints_text = ""
+        if listing_constraints:
+            mode_text = "all must hold" if analysis.get("constraint_mode") == "all" else "any of positive constraints may match"
+            listing_constraints_text = f"\nConstraint mode: {mode_text}. Constraints: " + "; ".join(listing_constraints)
+
         if analysis["query_type"] == "listing":
-            instructions = """
+            if analysis.get("needs_fuzz_targets"):
+                step3_text = "Create a numbered list of the BEST fuzzing-target candidates (rank strongest to weaker)"
+                step4_extra = "\n   - Why it is fuzzable (input surface, parser/state complexity, memory/bounds risk)"
+                step7_text = "If strict matches are unclear, still return best candidates by fuzzing potential; avoid empty output unless context is empty"
+            else:
+                step3_text = "Create a numbered list of matching functions"
+                step4_extra = ""
+                step7_text = 'If no functions match, explicitly state "No matching functions found in the codebase"'
+
+            instructions = f"""
 ### Instructions for Listing Queries:
 1. Carefully analyze EACH function in the context above
-2. Check if it matches ALL criteria from the question
-3. Create a numbered list of matching functions
+2. Check if it matches the criteria from the question (respect the declared constraint mode)
+3. {step3_text}
 4. For each function include:
    - Name and file location
    - Relevant parameters with types
-   - Brief explanation why it matches
+   - Brief explanation why it matches{step4_extra}
 5. CRITICAL: Only include functions that ACTUALLY exist in the provided context
 6. DO NOT invent or assume functions beyond what is shown
-7. If no functions match, explicitly state "No matching functions found in the codebase"
+7. {step7_text}
 8. After listing, perform SELF-VERIFICATION:
    - Re-check each listed function against the original criteria
    - Confirm the function signature matches the requirements
-   - Mark any uncertain entries with [NEEDS REVIEW]"""
+   - Mark any uncertain entries with [NEEDS REVIEW]
+9. Respect negative constraints (e.g. "not write-like") strictly{listing_constraints_text}"""
 
         elif analysis["query_type"] == "example_generation":
             instructions = """
@@ -502,45 +898,11 @@ def build_thinking_prompt(frags, q, analysis=None, conversation_history=None):
 5. CRITICAL: If referencing functions from previous answer, verify they exist in current context
 6. If the current context doesn't contain previously mentioned functions, state this explicitly"""
 
-    # Enhanced thinking and verification prompt structure
+    # Internal reasoning instructions (do not expose chain-of-thought in answer)
     thinking_instructions = """
-### Step-by-Step Reasoning Process:
-
-**Phase 1: UNDERSTAND**
-- What exactly is the user asking?
-- What are the key criteria/constraints?
-- What type of answer is expected (list, explanation, example)?
-
-**Phase 2: ANALYZE CONTEXT**
-- Review each function in the provided context
-- Extract key information: signatures, parameters, types, input methods
-- Note which functions are relevant and why
-
-**Phase 3: MATCH & FILTER**
-- Compare each function against the query criteria
-- Eliminate functions that don't match
-- Keep only functions with clear evidence
-
-**Phase 4: DRAFT ANSWER**
-- Formulate your initial answer based on the analysis
-- Include specific evidence (signatures, line numbers, etc.)
-
-**Phase 5: SELF-VERIFICATION (CRITICAL)**
-- Review your draft answer against the original context
-- For each function mentioned:
-  * Does it actually exist in the provided context?
-  * Are the signature and parameters quoted correctly?
-  * Does it truly match the query criteria?
-- Remove any functions that fail verification
-- Flag any uncertain claims with [UNCERTAIN]
-- If you cannot verify a claim, do not include it
-
-**Phase 6: FINAL ANSWER**
-- Present only verified information
-- Be explicit about limitations
-- If no matching functions found, say so clearly
-
-Now provide your answer following this process:"""
+Think through the task step-by-step internally.
+Do NOT output the phase-by-phase reasoning.
+Return only the final answer with concise evidence (function name, file, signature, why it matches)."""
 
     return f"""You are an expert C/C++ code analyst with deep understanding of codebases.
 
@@ -557,7 +919,7 @@ Now provide your answer following this process:"""
 def build_prompt(frags, q, analysis=None, conversation_history=None):
     """Main prompt builder - uses thinking mode for complex queries"""
     # Use thinking mode for complex queries
-    complex_types = ["listing", "example_generation", "implementation_explanation", "type_specific"]
+    complex_types = ["listing", "example_generation", "implementation_explanation", "type_specific", "input_specific"]
     use_thinking = (analysis and analysis["query_type"] in complex_types) or (conversation_history and len(conversation_history) > 0)
 
     if use_thinking:
@@ -619,27 +981,36 @@ def call_llm(prompt, model, temperature=0.1):
 
 def verify_answer_with_context(answer, context_frags):
     """Verify that functions mentioned in the answer actually exist in the context"""
-    # Extract function names from the answer
-    func_pattern = re.compile(r'\b([A-Za-z_]\w*)\s*\(', re.MULTILINE)
-    mentioned_funcs = set(func_pattern.findall(answer))
-
     # Get actual function names from context
     actual_funcs = set(f["name"] for f in context_frags)
 
+    # Mentioned known functions (exact names from context)
+    mentioned_funcs = set()
+    for fn in actual_funcs:
+        if re.search(rf"\b{re.escape(fn)}\b", answer):
+            mentioned_funcs.add(fn)
+
+    # Extract additional call-like patterns without optional whitespace
+    func_pattern = re.compile(r'\b([A-Za-z_]\w*)\(', re.MULTILINE)
+    call_like = set(func_pattern.findall(answer))
+    code_ticks = set(re.findall(r"`([A-Za-z_]\w*)`", answer))
+    mentioned_candidates = mentioned_funcs | call_like | code_ticks
+
     # Find hallucinated functions (mentioned but not in context)
-    hallucinated = mentioned_funcs - actual_funcs
+    hallucinated = mentioned_candidates - actual_funcs
 
     # Filter out common keywords that might be matched
     common_keywords = {"if", "for", "while", "switch", "return", "sizeof", "catch",
                        "new", "delete", "throw", "else", "do", "class", "struct",
                        "namespace", "template", "typedef", "using", "enum", "union",
                        "printf", "scanf", "malloc", "free", "memset", "memcpy",
-                       "std::vector", "std::string", "std::map", "std::set"}
+                       "std::vector", "std::string", "std::map", "std::set",
+                       "phase", "criteria", "console", "input", "output", "function"}
 
-    hallucinated = hallucinated - common_keywords
+    hallucinated = {h for h in hallucinated if h.lower() not in common_keywords and len(h) > 2}
 
     return {
-        "mentioned": mentioned_funcs,
+        "mentioned": mentioned_candidates,
         "actual": actual_funcs,
         "hallucinated": hallucinated,
         "is_valid": len(hallucinated) == 0
@@ -710,32 +1081,57 @@ def main():
         if args.verbose:
             print(f"\n[Query Analysis]")
             print(f"  Type: {analysis['query_type']}")
+            print(f"  Is listing: {analysis['is_listing']}")
             print(f"  Follow-up: {analysis['follow_up']}")
             print(f"  Needs stdin: {analysis['needs_stdin']}")
             print(f"  Needs file: {analysis['needs_file']}")
             print(f"  Needs params: {analysis['needs_params']}")
+            print(f"  Needs parse-like: {analysis['needs_parse_like']}")
+            print(f"  Needs fuzz-targets: {analysis['needs_fuzz_targets']}")
+            print(f"  Constraint mode: {analysis['constraint_mode']}")
+            print(f"  Exclude output/write-like: {analysis['exclude_output']}")
             print(f"  Requested types: {analysis['requested_types']}")
             print(f"  Keywords: {analysis['keywords'][:5]}...")
 
         # Step 2: Get candidates
         candidate_ids = planner.get_search_candidates(analysis, k=args.top_k)
 
-        # Step 3: Semantic search
-        emb = embed(q, embed_model)
-        sem_ids, sem_scores = semantic_search(idx, emb, args.top_k * 2)
+        # Step 3: Semantic + lexical retrieval with RRF fusion
+        is_listing = analysis.get("is_listing", False)
+        semantic_k = args.top_k * (4 if is_listing else 2)
+        lexical_k = args.top_k * (6 if is_listing else 3)
+        retrieval_budget = max(args.top_k * (12 if is_listing else 6), args.rerank_top_k * 4)
+        if is_listing:
+            retrieval_budget = max(retrieval_budget, 150)
+        retrieval_budget = min(len(meta), retrieval_budget)
 
-        # Combine candidates
-        all_candidates = list(set(candidate_ids + sem_ids.tolist()))
+        emb = embed(q, embed_model)
+        sem_ids, sem_scores = semantic_search(idx, emb, semantic_k)
+        lex_ids, lex_scores = lexical_search(q, lex, meta)
+        lex_ranked_ids = lex_ids[:lexical_k]
+
+        fused_ids, fused_scores = reciprocal_rank_fusion(
+            [candidate_ids, sem_ids.tolist(), lex_ranked_ids],
+            rrf_k=50
+        )
+        all_candidates = fused_ids[:retrieval_budget]
 
         if args.verbose:
             print(f"\n[Retrieval]")
             print(f"  Special index candidates: {len(candidate_ids)}")
             print(f"  Semantic search candidates: {len(sem_ids)}")
-            print(f"  Total unique candidates: {len(all_candidates)}")
+            print(f"  Lexical search candidates: {len(lex_ranked_ids)}")
+            print(f"  Fused candidates (RRF): {len(all_candidates)}")
+            print(f"  Retrieval budget: {retrieval_budget}")
 
         # Step 4: Rerank
-        if reranker:
-            # Use cross-encoder reranking
+        effective_rerank_top_k = args.rerank_top_k
+        if analysis.get("is_listing"):
+            effective_rerank_top_k = min(50, max(20, args.rerank_top_k * 4))
+        rerank_pool_size = max(effective_rerank_top_k * 4, effective_rerank_top_k + 10)
+
+        if reranker and all_candidates:
+            # Use cross-encoder + heuristic reranking fusion
             texts = []
             for cid in all_candidates:
                 c = meta[cid]
@@ -744,18 +1140,60 @@ def main():
 
             pairs = [[q, t] for t in texts]
             rerank_scores = reranker.predict(pairs)
+            cross_sorted = sorted(
+                [(all_candidates[i], rerank_scores[i]) for i in range(len(all_candidates))],
+                key=lambda x: x[1],
+                reverse=True
+            )
+            cross_ranked_ids = [x[0] for x in cross_sorted]
 
-            scored = [(all_candidates[i], rerank_scores[i]) for i in range(len(all_candidates))]
-            scored.sort(key=lambda x: x[1], reverse=True)
-            ranked_ids = [x[0] for x in scored[:args.rerank_top_k]]
+            heuristic_ranked = rerank_chunks(q, all_candidates, meta, call_graph, analysis)
+            heuristic_ranked_ids = [x["idx"] for x in heuristic_ranked]
+
+            rerank_fused_ids, _ = reciprocal_rank_fusion(
+                [cross_ranked_ids, heuristic_ranked_ids],
+                rrf_k=20
+            )
+            ranked_pool_ids = rerank_fused_ids[:rerank_pool_size]
         else:
             # Use heuristic reranking
-            reranked = rerank_chunks(q, all_candidates, meta, call_graph)
-            ranked_ids = [x["idx"] for x in reranked[:args.rerank_top_k]]
+            reranked = rerank_chunks(q, all_candidates, meta, call_graph, analysis)
+            ranked_pool_ids = [x["idx"] for x in reranked[:rerank_pool_size]]
+
+        # Step 4.1: strict listing pre-filter before LLM
+        fuzz_fallback_applied = False
+        if analysis.get("is_listing"):
+            ranked_ids = prefilter_listing_candidates(ranked_pool_ids, meta, analysis)[:effective_rerank_top_k]
+            if not ranked_ids and analysis.get("needs_fuzz_targets") and ranked_pool_ids:
+                fuzz_fallback_applied = True
+                ranked_ids = sorted(
+                    ranked_pool_ids,
+                    key=lambda cid: fuzz_target_score(meta[cid]),
+                    reverse=True
+                )[:effective_rerank_top_k]
+        else:
+            ranked_ids = ranked_pool_ids[:effective_rerank_top_k]
 
         if args.verbose:
             print(f"\n[Reranking]")
+            print(f"  Effective rerank_top_k: {effective_rerank_top_k}")
+            print(f"  Rerank pool size: {len(ranked_pool_ids)}")
             print(f"  Selected top {len(ranked_ids)} chunks")
+            if analysis.get("is_listing"):
+                print(f"  Strict pre-filter applied: yes")
+            if fuzz_fallback_applied:
+                print(f"  Fuzz-target fallback applied: yes")
+
+        # If strict listing constraints removed everything, return deterministic answer
+        if analysis.get("is_listing") and not ranked_ids:
+            elapsed = time.time() - start_time
+            ans = "No matching functions found in the indexed codebase for the specified constraints."
+            print(f"\n{ans}")
+            print(f"\n[Response time: {elapsed:.2f}s]")
+            conversation_history.append((q, ans))
+            if len(conversation_history) > 5:
+                conversation_history.pop(0)
+            continue
 
         # Step 5: Build context and generate answer
         frags = [meta[i] for i in ranked_ids]
@@ -768,7 +1206,8 @@ def main():
 
         ans = call_llm(prompt, args.model)
 
-        # Step 6: Verify answer for hallucinations (optional, verbose mode)
+        # Step 6: Verify answer for hallucinations
+        verification = {"is_valid": True, "hallucinated": set()}
         if args.verbose:
             verification = verify_answer_with_context(ans, frags)
             if not verification["is_valid"]:

@@ -39,10 +39,13 @@ CONTROL_KEYWORDS = {
 # Patterns for detecting input sources
 STDIN_PATTERNS = [
     r"\b(cin)\s*>>",
-    r"\b(scanf|fgets|gets|getline|read)\s*\(",
-    r"\b(std::)?(cin|getline|readSome)\b",
-    r"\b(fgets|fread|fscanf|getc|getchar|gets_s)\s*\(",
-    r"\b(System\.Console\.(Read|Write))",
+    r"\b(scanf|getchar|getc|gets|gets_s)\s*\(",
+    r"\b(fgets|fscanf)\s*\([^)]*(stdin)\b",
+    r"\bstd::getline\s*\(\s*(std::)?cin\b",
+    r"\bgetline\s*\(\s*(std::)?cin\b",
+    r"\bread\s*\(\s*(0|STDIN_FILENO)\b",
+    r"\b(std::)?cin\b",
+    r"\b(System\.Console\.Read)\b",
     r"\b(Console\.Read|ReadLine|ReadKey)\b",
     r"\b(input|raw_input)\s*\(",
     r"\b(sys\.stdin|process\.stdin)\b",
@@ -222,7 +225,8 @@ class TreeSitterParser:
 
         functions = []
         try:
-            tree = self.parser.parse(bytes(code, "utf-8"))
+            source_bytes = code.encode("utf-8", errors="ignore")
+            tree = self.parser.parse(source_bytes)
             root = tree.root_node
 
             # Query for function definitions
@@ -263,7 +267,7 @@ class TreeSitterParser:
                     if name_node is None:
                         continue
 
-                    func_name = code[name_node.start_byte:name_node.end_byte].decode("utf-8")
+                    func_name = source_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="ignore")
 
                     if func_name in CONTROL_KEYWORDS:
                         continue
@@ -271,7 +275,7 @@ class TreeSitterParser:
                     # Extract parameters
                     params = []
                     if params_node:
-                        params_text = code[params_node.start_byte:params_node.end_byte].decode("utf-8")
+                        params_text = source_bytes[params_node.start_byte:params_node.end_byte].decode("utf-8", errors="ignore")
                         params = self._parse_parameters(params_text)
 
                     # Get function body
@@ -279,11 +283,11 @@ class TreeSitterParser:
                     if not body_node:
                         continue
 
-                    func_code = code[func_node.start_byte:func_node.end_byte].decode("utf-8")
+                    func_code = source_bytes[func_node.start_byte:func_node.end_byte].decode("utf-8", errors="ignore")
 
                     # Calculate line numbers
-                    start_line = code[:func_node.start_byte].count("\n") + 1
-                    end_line = code[:func_node.end_byte].count("\n") + 1
+                    start_line = source_bytes[:func_node.start_byte].count(b"\n") + 1
+                    end_line = source_bytes[:func_node.end_byte].count(b"\n") + 1
 
                     functions.append({
                         "name": func_name,
@@ -796,6 +800,10 @@ def main():
     for type_name in ["byte_array", "string", "integer", "float", "pointer", "reference", "template"]:
         type_indices[type_name] = [i for i, c in enumerate(chunks)
                                    if type_name in c.get("types_used", [])]
+
+    # Backward/forward-compatible aliases for query-side type normalization
+    type_indices["int"] = list(type_indices["integer"])
+    type_indices["vector"] = list(type_indices["template"])
 
     with open(out/"special_indices.json", "w") as f:
         json.dump({
