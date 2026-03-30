@@ -162,6 +162,18 @@ def chunk_matches_path_filters(chunk, path_filters):
     return any(f in file_path for f in path_filters)
 
 
+def extract_function_names_from_text(text, symbols):
+    """Extract known function names mentioned in free text."""
+    if not text or not symbols:
+        return set()
+
+    found = set()
+    for fn in symbols.keys():
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(fn)}(?![A-Za-z0-9_])", text):
+            found.add(fn)
+    return found
+
+
 def normalize_type_name(type_name):
     """Normalize type names to canonical keys."""
     t = type_name.lower().strip()
@@ -638,6 +650,7 @@ class QueryPlanner:
             "min_fuzz_score": 0.35,
             "min_fallback_fuzz_score": 0.15,
             "path_filters": [],
+            "exclude_previously_listed": False,
             "function_names": [],
             "expand_callers": False,
             "expand_callees": False,
@@ -706,6 +719,13 @@ class QueryPlanner:
         # Detect path/module filters
         analysis["path_filters"] = extract_path_filters_from_query(query, query_lower)
 
+        # Detect novelty requests: "other/different/new functions"
+        if any(w in query_lower for w in [
+            "other", "another", "different", "new", "remaining", "else",
+            "друг", "еще", "ещё", "остальн", "дополнительно"
+        ]):
+            analysis["exclude_previously_listed"] = True
+
         # Decide whether positive constraints are all-required or any-of
         positive_signals = 0
         positive_signals += int(analysis["needs_stdin"])
@@ -744,6 +764,8 @@ class QueryPlanner:
             # Check if referencing previous answer
             if any(w in query_lower for w in ["from the list", "из списка", "функци", "function a", "function b", "function c"]):
                 analysis["follow_up"] = True
+            if analysis["exclude_previously_listed"]:
+                analysis["follow_up"] = True
 
         # Determine query type
         if analysis["needs_example"]:
@@ -760,6 +782,19 @@ class QueryPlanner:
             analysis["query_type"] = "function_specific"
 
         return analysis
+
+    def collect_previously_listed_ids(self, context_history):
+        """Collect function ids mentioned in prior assistant responses."""
+        if not context_history:
+            return set()
+
+        ids = set()
+        for _q, ans in context_history:
+            mentioned = extract_function_names_from_text(ans, self.symbols)
+            for fn in mentioned:
+                for idx in self.symbols.get(fn, []):
+                    ids.add(idx)
+        return ids
 
     def get_search_candidates(self, analysis, k=20):
         """Get candidate indices based on query analysis"""

@@ -74,12 +74,16 @@ def main():
 
         # Step 1: Analyze query with conversation context
         analysis = planner.analyze_query(q, conversation_history if conversation_history else None)
+        excluded_prev_ids = set()
+        if analysis.get("exclude_previously_listed"):
+            excluded_prev_ids = planner.collect_previously_listed_ids(conversation_history)
 
         if args.verbose:
             print(f"\n[Query Analysis]")
             print(f"  Type: {analysis['query_type']}")
             print(f"  Is listing: {analysis['is_listing']}")
             print(f"  Follow-up: {analysis['follow_up']}")
+            print(f"  Exclude previously listed: {analysis['exclude_previously_listed']}")
             print(f"  Needs stdin: {analysis['needs_stdin']}")
             print(f"  Needs file: {analysis['needs_file']}")
             print(f"  Needs params: {analysis['needs_params']}")
@@ -93,6 +97,8 @@ def main():
 
         # Step 2: Get candidates
         candidate_ids = planner.get_search_candidates(analysis, k=args.top_k)
+        if excluded_prev_ids:
+            candidate_ids = [cid for cid in candidate_ids if cid not in excluded_prev_ids]
 
         # Step 3: Semantic + lexical retrieval with RRF fusion
         is_listing = analysis.get("is_listing", False)
@@ -113,6 +119,8 @@ def main():
             rrf_k=50
         )
         all_candidates = fused_ids[:retrieval_budget]
+        if excluded_prev_ids:
+            all_candidates = [cid for cid in all_candidates if cid not in excluded_prev_ids]
 
         if args.verbose:
             print(f"\n[Retrieval]")
@@ -158,6 +166,8 @@ def main():
             # Use heuristic reranking
             reranked = core.rerank_chunks(q, all_candidates, meta, call_graph, analysis)
             ranked_pool_ids = [x["idx"] for x in reranked[:rerank_pool_size]]
+        if excluded_prev_ids:
+            ranked_pool_ids = [cid for cid in ranked_pool_ids if cid not in excluded_prev_ids]
 
         # Step 4.1: strict listing pre-filter before LLM
         fuzz_fallback_applied = False
@@ -178,6 +188,8 @@ def main():
             print(f"  Effective rerank_top_k: {effective_rerank_top_k}")
             print(f"  Rerank pool size: {len(ranked_pool_ids)}")
             print(f"  Selected top {len(ranked_ids)} chunks")
+            if excluded_prev_ids:
+                print(f"  Excluded previously listed ids: {len(excluded_prev_ids)}")
             if analysis.get("is_listing"):
                 print(f"  Strict pre-filter applied: yes")
             if fuzz_fallback_applied:
@@ -186,7 +198,10 @@ def main():
         # If strict listing constraints removed everything, return deterministic answer
         if analysis.get("is_listing") and not ranked_ids:
             elapsed = time.time() - start_time
-            ans = "No matching functions found in the indexed codebase for the specified constraints."
+            if analysis.get("exclude_previously_listed"):
+                ans = "No additional matching functions found beyond those already listed."
+            else:
+                ans = "No matching functions found in the indexed codebase for the specified constraints."
             print(f"\n{ans}")
             print(f"\n[Response time: {elapsed:.2f}s]")
             conversation_history.append((q, ans))

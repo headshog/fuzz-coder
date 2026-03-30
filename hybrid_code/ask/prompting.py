@@ -60,6 +60,8 @@ def _build_thinking_prompt_with_limit(frags, q, analysis=None, conversation_hist
             listing_constraints.append("should be good fuzzing targets (parsing/decoding, memory handling, complex input processing)")
         if analysis.get("path_filters"):
             listing_constraints.append(f"must be located in path/module: {', '.join(analysis['path_filters'])}")
+        if analysis.get("exclude_previously_listed"):
+            listing_constraints.append("must exclude functions already listed in previous answers")
 
         listing_constraints_text = ""
         if listing_constraints:

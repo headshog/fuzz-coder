@@ -41,3 +41,13 @@ def test_analyze_query_without_path_filter():
 
     assert analysis["needs_stdin"] is True
     assert analysis["path_filters"] == []
+
+
+def test_analyze_query_detects_exclude_previously_listed():
+    planner = QueryPlanner(special_indices={}, symbols={}, call_graph={}, called_by={}, meta=[])
+    q = "Дай список других функций для фаззинга"
+
+    analysis = planner.analyze_query(q, context_history=[("Q1", "A1")])
+
+    assert analysis["exclude_previously_listed"] is True
+    assert analysis["follow_up"] is True
