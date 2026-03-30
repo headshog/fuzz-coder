@@ -213,9 +213,21 @@ class TreeSitterParser:
             return
 
         try:
-            self.language = Language(tree_sitter_cpp.language())
+            raw_language = tree_sitter_cpp.language()
+            try:
+                # tree-sitter API variant where Language(...) accepts capsule/ptr.
+                self.language = Language(raw_language)
+            except Exception:
+                # tree-sitter API variant where language() already returns Language.
+                self.language = raw_language
+
             self.parser = Parser()
-            self.parser.set_language(self.language)
+            if hasattr(self.parser, "set_language"):
+                # Older API
+                self.parser.set_language(self.language)
+            else:
+                # Newer API
+                self.parser.language = self.language
         except Exception as e:
             print(f"Warning: Could not initialize tree-sitter: {e}")
             self.parser = None
@@ -230,77 +242,50 @@ class TreeSitterParser:
             source_bytes = code.encode("utf-8", errors="ignore")
             tree = self.parser.parse(source_bytes)
             root = tree.root_node
+            for func_node in self._iter_nodes_by_type(root, "function_definition"):
+                name_node = self._extract_function_name_node(func_node)
+                if name_node is None:
+                    continue
 
-            # Query for function definitions
-            query = self.language.query("""
-                (function_definition
-                    declarator: (function_declarator
-                        declarator: (identifier) @name
-                        parameters: (parameter_list) @params)) @func
+                func_name = source_bytes[name_node.start_byte:name_node.end_byte].decode(
+                    "utf-8", errors="ignore"
+                )
 
-                (function_definition
-                    declarator: (qualified_identifier
-                        name: (identifier) @name)
-                    parameters: (parameter_list) @params) @func
-            """)
+                if func_name in CONTROL_KEYWORDS:
+                    continue
 
-            captures = query.captures(root)
+                # Extract parameters
+                params = []
+                params_node = self._extract_function_params_node(func_node)
+                if params_node:
+                    params_text = source_bytes[params_node.start_byte:params_node.end_byte].decode(
+                        "utf-8", errors="ignore"
+                    )
+                    params = self._parse_parameters(params_text)
 
-            for node, capture_name in captures:
-                if capture_name == "func":
-                    func_node = node
+                # Get function body
+                body_node = func_node.child_by_field_name("body")
+                if not body_node:
+                    continue
 
-                    # Find function name
-                    name_node = None
-                    params_node = None
+                func_code = source_bytes[func_node.start_byte:func_node.end_byte].decode(
+                    "utf-8", errors="ignore"
+                )
 
-                    for child in func_node.children:
-                        if child.type == "function_declarator":
-                            for gc in child.children:
-                                if gc.type == "identifier":
-                                    name_node = gc
-                                elif gc.type == "parameter_list":
-                                    params_node = gc
-                        elif child.type == "qualified_identifier":
-                            name_node = child.child_by_field_name("name")
-                        elif child.type == "parameter_list":
-                            params_node = child
+                # Calculate line numbers
+                start_line = source_bytes[:func_node.start_byte].count(b"\n") + 1
+                end_line = source_bytes[:func_node.end_byte].count(b"\n") + 1
 
-                    if name_node is None:
-                        continue
-
-                    func_name = source_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="ignore")
-
-                    if func_name in CONTROL_KEYWORDS:
-                        continue
-
-                    # Extract parameters
-                    params = []
-                    if params_node:
-                        params_text = source_bytes[params_node.start_byte:params_node.end_byte].decode("utf-8", errors="ignore")
-                        params = self._parse_parameters(params_text)
-
-                    # Get function body
-                    body_node = func_node.child_by_field_name("body")
-                    if not body_node:
-                        continue
-
-                    func_code = source_bytes[func_node.start_byte:func_node.end_byte].decode("utf-8", errors="ignore")
-
-                    # Calculate line numbers
-                    start_line = source_bytes[:func_node.start_byte].count(b"\n") + 1
-                    end_line = source_bytes[:func_node.end_byte].count(b"\n") + 1
-
-                    functions.append({
-                        "name": func_name,
-                        "signature": self._build_signature(func_name, params),
-                        "parameters": params,
-                        "code": func_code,
-                        "body": func_code,
-                        "start_line": start_line,
-                        "end_line": end_line,
-                        "parser": "tree-sitter"
-                    })
+                functions.append({
+                    "name": func_name,
+                    "signature": self._build_signature(func_name, params),
+                    "parameters": params,
+                    "code": func_code,
+                    "body": func_code,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "parser": "tree-sitter"
+                })
 
         except Exception as e:
             print(f"Tree-sitter error for {filepath}: {e}")
@@ -370,6 +355,62 @@ class TreeSitterParser:
                 "is_const": False,
                 "raw": param_text
             }
+
+    def _iter_nodes_by_type(self, root_node, node_type):
+        """Yield nodes of a specific type via DFS traversal."""
+        stack = [root_node]
+        while stack:
+            node = stack.pop()
+            if node.type == node_type:
+                yield node
+            # Reverse children to keep left-to-right traversal order.
+            stack.extend(reversed(node.children))
+
+    def _extract_function_name_node(self, func_node):
+        """Extract function name node from function_definition declarator chain."""
+        declarator = func_node.child_by_field_name("declarator")
+        if declarator is None:
+            return None
+
+        current = declarator
+        for _ in range(32):
+            if current.type in {"identifier", "field_identifier"}:
+                return current
+
+            if current.type == "qualified_identifier":
+                name_node = current.child_by_field_name("name")
+                if name_node is not None:
+                    if name_node.type in {"identifier", "field_identifier"}:
+                        return name_node
+                    current = name_node
+                    continue
+
+            next_decl = current.child_by_field_name("declarator")
+            if next_decl is None:
+                break
+            current = next_decl
+
+        return None
+
+    def _extract_function_params_node(self, func_node):
+        """Extract parameter list node from function_definition declarator chain."""
+        declarator = func_node.child_by_field_name("declarator")
+        if declarator is None:
+            return None
+
+        current = declarator
+        for _ in range(32):
+            if current.type == "function_declarator":
+                params = current.child_by_field_name("parameters")
+                if params is not None:
+                    return params
+
+            next_decl = current.child_by_field_name("declarator")
+            if next_decl is None:
+                break
+            current = next_decl
+
+        return None
 
     def _build_signature(self, name, params):
         """Build function signature string"""

@@ -7,7 +7,7 @@ from pathlib import Path
 import faiss
 from sentence_transformers import CrossEncoder
 
-from hybrid_code.embeddings.registry import get_embedding_backend
+from fuzz_coder.embeddings.registry import get_embedding_backend
 
 from . import core
 

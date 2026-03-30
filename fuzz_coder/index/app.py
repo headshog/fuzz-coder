@@ -8,8 +8,8 @@ from pathlib import Path
 import faiss
 from tqdm import tqdm
 
-from hybrid_code.embeddings.registry import get_embedding_backend
-from hybrid_code.languages.registry import get_language_profile
+from fuzz_coder.embeddings.registry import get_embedding_backend
+from fuzz_coder.languages.registry import get_language_profile
 
 from . import core
 

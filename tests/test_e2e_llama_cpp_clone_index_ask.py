@@ -6,8 +6,8 @@ import sys
 import numpy as np
 import pytest
 
-from hybrid_code.ask import app as ask_app
-from hybrid_code.index import app as index_app
+from fuzz_coder.ask import app as ask_app
+from fuzz_coder.index import app as index_app
 
 
 class _DeterministicEmbeddingBackend:
@@ -66,7 +66,7 @@ def test_e2e_llama_cpp_clone_index_and_ask(tmp_path, monkeypatch, capsys):
     # Index llama.cpp with deterministic backend for repeatability and no external model downloads.
     monkeypatch.setattr(index_app, "get_embedding_backend", lambda *a, **k: _DeterministicEmbeddingBackend(dim=24))
     monkeypatch.setattr(sys, "argv", [
-        "index_hybrid_code.py",
+        "index_fuzz_coder.py",
         "--src", str(repo),
         "--out", str(out),
         "--language", "c_cpp",
@@ -93,7 +93,7 @@ def test_e2e_llama_cpp_clone_index_and_ask(tmp_path, monkeypatch, capsys):
         captured_prompt["prompt"] = json["prompt"]
         return _Resp({"response": "LLM_E2E_OK"})
 
-    monkeypatch.setattr("hybrid_code.ask.llm.requests.post", _fake_post)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _fake_post)
 
     inputs = iter([
         "Напиши список функций пригодных для фаззинга из директории src",
@@ -101,7 +101,7 @@ def test_e2e_llama_cpp_clone_index_and_ask(tmp_path, monkeypatch, capsys):
     ])
     monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
     monkeypatch.setattr(sys, "argv", [
-        "ask_hybrid_code.py",
+        "ask_fuzz_coder.py",
         "--index_dir", str(out),
         "--model", "dummy-model",
         "--verbose",
