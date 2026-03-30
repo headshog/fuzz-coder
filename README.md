@@ -292,3 +292,9 @@ python ask_hybrid_code.py \
 6. **Conversation Memory** - контекст для follow-up вопросов
 7. **Multi-Signal Scoring** - множество признаков для релевантности
 8. **AST-based Code Parsing** - точное извлечение структуры кода
+
+# Тесты
+
+```bash
+RUN_LLAMA_CPP_E2E=1 python3 -m pytest -q tests
+```

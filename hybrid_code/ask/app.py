@@ -48,7 +48,7 @@ def main():
         print("Reranker not available, using heuristic reranking")
 
     # Initialize query planner
-    planner = core.QueryPlanner(special_indices, symbols, call_graph, called_by)
+    planner = core.QueryPlanner(special_indices, symbols, call_graph, called_by, meta=meta)
 
     # Conversation history for follow-up questions
     conversation_history = []  # List of (question, answer) tuples
@@ -84,6 +84,7 @@ def main():
             print(f"  Needs params: {analysis['needs_params']}")
             print(f"  Needs parse-like: {analysis['needs_parse_like']}")
             print(f"  Needs fuzz-targets: {analysis['needs_fuzz_targets']}")
+            print(f"  Path filters: {analysis['path_filters']}")
             print(f"  Constraint mode: {analysis['constraint_mode']}")
             print(f"  Exclude output/write-like: {analysis['exclude_output']}")
             print(f"  Requested types: {analysis['requested_types']}")

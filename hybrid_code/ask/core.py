@@ -68,6 +68,15 @@ FUZZ_TARGET_KEYWORDS = [
     "base64", "utf8", "utf-8", "binary", "header", "payload",
 ]
 
+PATH_FILTER_PATTERNS = [
+    # English: from/in module|directory|subdirectory|folder|path <value>
+    r"\b(?:from|in)\s+(?:the\s+)?(?:module|directory|subdirectory|folder|path)\s+([`\"']?)([^`\"'\n,;]+)\1",
+    r"\bunder\s+([`\"']?)([^`\"'\n,;]+)\1",
+    # Russian: из/в модуля|директории|поддиректории|папки <value>
+    r"\bиз\s+(?:модуля|директории|поддиректории|папки)\s+([`\"']?)([^`\"'\n,;]+)\1",
+    r"\bв\s+(?:модуле|директории|поддиректории|папке)\s+([`\"']?)([^`\"'\n,;]+)\1",
+]
+
 
 def query_contains_keyword(query_lower, keyword):
     """Match keywords safely; short alpha keywords use token boundaries."""
@@ -80,6 +89,73 @@ def query_contains_keyword(query_lower, keyword):
 def query_has_any_keyword(query_lower, keywords):
     """Check if query contains any keyword using safe matching rules."""
     return any(query_contains_keyword(query_lower, kw) for kw in keywords)
+
+
+def normalize_path_filter(path):
+    """Normalize user-provided path/module filters for robust matching."""
+    p = (path or "").strip().strip("`'\"")
+    p = p.replace("\\", "/")
+    p = re.sub(r"/{2,}", "/", p)
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.strip().rstrip("/")
+    return p.lower()
+
+
+def clean_path_candidate(raw):
+    """Trim natural-language tails captured by broad path patterns."""
+    p = (raw or "").strip()
+    if not p:
+        return p
+
+    # Stop at common relative clauses/conjunctions after path mention.
+    p = re.split(
+        r"\s+(?:that|which|where|with|and|or|who|whose|котор(?:ый|ая|ые|ого|ому|ых)?|где|и|или|с)\b",
+        p,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+
+    return p.strip(" \t\r\n.,:;!?")
+
+
+def extract_path_filters_from_query(query, query_lower):
+    """Extract module/directory constraints from query."""
+    filters = []
+
+    for pattern in PATH_FILTER_PATTERNS:
+        for m in re.finditer(pattern, query, flags=re.IGNORECASE):
+            raw = m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(1)
+            norm = normalize_path_filter(clean_path_candidate(raw))
+            if norm:
+                filters.append(norm)
+
+    # Additional explicit path-like hints in backticks or quotes.
+    for p in re.findall(r"`([^`]+[/\\][^`]+)`", query):
+        norm = normalize_path_filter(p)
+        if norm:
+            filters.append(norm)
+    for p in re.findall(r"['\"]([^'\"]+[/\\][^'\"]+)['\"]", query):
+        norm = normalize_path_filter(p)
+        if norm:
+            filters.append(norm)
+
+    # Deduplicate while preserving order
+    seen = set()
+    out = []
+    for f in filters:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
+
+def chunk_matches_path_filters(chunk, path_filters):
+    """Check whether chunk file path satisfies at least one path filter."""
+    if not path_filters:
+        return True
+    file_path = normalize_path_filter(str(chunk.get("file", "")))
+    return any(f in file_path for f in path_filters)
 
 
 def normalize_type_name(type_name):
@@ -257,6 +333,8 @@ def chunk_matches_constraints(chunk, analysis):
     if analysis.get("needs_params") and not chunk.get("parameters"):
         return False
     if analysis.get("exclude_output") and is_write_like_chunk(chunk):
+        return False
+    if analysis.get("path_filters") and not chunk_matches_path_filters(chunk, analysis["path_filters"]):
         return False
 
     positive_matches = collect_positive_constraint_matches(chunk, analysis)
@@ -527,11 +605,12 @@ def rerank_chunks(query, chunks, meta, call_graph=None, analysis=None):
 class QueryPlanner:
     """Advanced query planner with thinking mode support"""
 
-    def __init__(self, special_indices, symbols, call_graph, called_by):
+    def __init__(self, special_indices, symbols, call_graph, called_by, meta=None):
         self.special_indices = special_indices
         self.symbols = symbols
         self.call_graph = call_graph
         self.called_by = called_by
+        self.meta = meta or []
 
     def analyze_query(self, query, context_history=None):
         """Analyze query to determine search strategy with thinking mode"""
@@ -554,6 +633,7 @@ class QueryPlanner:
             "exclude_output": False,
             "min_fuzz_score": 0.35,
             "min_fallback_fuzz_score": 0.15,
+            "path_filters": [],
             "function_names": [],
             "expand_callers": False,
             "expand_callees": False,
@@ -618,6 +698,9 @@ class QueryPlanner:
         # Detect exclusion constraints
         if query_excludes_output(query_lower):
             analysis["exclude_output"] = True
+
+        # Detect path/module filters
+        analysis["path_filters"] = extract_path_filters_from_query(query, query_lower)
 
         # Decide whether positive constraints are all-required or any-of
         positive_signals = 0
@@ -697,6 +780,12 @@ class QueryPlanner:
 
         if analysis.get("needs_error_handling") and "error_handling" in self.special_indices:
             candidates.update(self.special_indices["error_handling"])
+
+        # Path/module constraint candidates (deterministic, independent from vector search).
+        if analysis.get("path_filters") and self.meta:
+            for idx, chunk in enumerate(self.meta):
+                if chunk_matches_path_filters(chunk, analysis["path_filters"]):
+                    candidates.add(idx)
 
         # Fuzz-target discovery mode: broaden candidates to likely crash-prone surfaces.
         if analysis.get("needs_fuzz_targets"):
@@ -802,6 +891,8 @@ def build_thinking_prompt(frags, q, analysis=None, conversation_history=None):
             listing_constraints.append("must NOT be write/output-like functions")
         if analysis.get("needs_fuzz_targets"):
             listing_constraints.append("should be good fuzzing targets (parsing/decoding, memory handling, complex input processing)")
+        if analysis.get("path_filters"):
+            listing_constraints.append(f"must be located in path/module: {', '.join(analysis['path_filters'])}")
 
         listing_constraints_text = ""
         if listing_constraints:

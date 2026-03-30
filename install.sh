@@ -12,7 +12,7 @@
 #pip install --upgrade pip
 
 # 3) Core dependencies
-pip install sentence-transformers transformers torch tqdm python-magic regex requests
+pip install sentence-transformers transformers torch tqdm python-magic regex requests pytest
 
 # Tree-sitter for accurate AST parsing (highly recommended)
 pip install tree_sitter tree_sitter_cpp
