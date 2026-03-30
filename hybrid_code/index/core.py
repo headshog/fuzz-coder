@@ -15,6 +15,8 @@ import json
 import argparse
 import os
 import hashlib
+from .call_graph import detect_calls as _detect_calls_impl
+from .call_graph import build_call_graph as _build_call_graph_impl
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -603,43 +605,12 @@ def find_matching_brace(text, pos):
 
 def detect_calls(body):
     """Detect function calls in code body"""
-    calls = []
-    for m in CALL_RE.finditer(body):
-        n = m.group(1)
-        if n not in CONTROL_KEYWORDS:
-            calls.append(n)
-    return list(set(calls))
-
-
-CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+    return _detect_calls_impl(body, CONTROL_KEYWORDS)
 
 
 def build_call_graph(chunks):
     """Build a call graph from function chunks"""
-    # Map function names to their IDs
-    name_to_ids = defaultdict(list)
-    for c in chunks:
-        name_to_ids[c["name"]].append(c["id"])
-
-    # Build call graph
-    call_graph = {}
-    called_by = defaultdict(list)
-
-    for c in chunks:
-        calls = detect_calls(c["body"])
-        resolved_calls = []
-        for call in calls:
-            if call in name_to_ids:
-                resolved_calls.extend(name_to_ids[call])
-                called_by[call].append(c["id"])
-
-        call_graph[c["id"]] = {
-            "calls": calls,
-            "resolved_calls": list(set(resolved_calls)),
-            "called_by": list(set(called_by.get(c["name"], [])))
-        }
-
-    return call_graph, called_by
+    return _build_call_graph_impl(chunks, CONTROL_KEYWORDS)
 
 
 def build_embeddings(chunks, model_name, embedding_backend=None):
@@ -701,4 +672,3 @@ def build_lexical_index(chunks):
         for w in words:
             idx[w].append(i)
     return idx
-

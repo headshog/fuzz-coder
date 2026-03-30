@@ -93,7 +93,7 @@ def test_e2e_llama_cpp_clone_index_and_ask(tmp_path, monkeypatch, capsys):
         captured_prompt["prompt"] = json["prompt"]
         return _Resp({"response": "LLM_E2E_OK"})
 
-    monkeypatch.setattr("hybrid_code.ask.core.requests.post", _fake_post)
+    monkeypatch.setattr("hybrid_code.ask.llm.requests.post", _fake_post)
 
     inputs = iter([
         "Напиши список функций пригодных для фаззинга из директории src",

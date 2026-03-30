@@ -19,6 +19,7 @@ def main():
     ap.add_argument("--model", default="qwen2.5-coder:32b")
     ap.add_argument("--top_k", type=int, default=10)
     ap.add_argument("--rerank_top_k", type=int, default=5)
+    ap.add_argument("--max_prompt_chars", type=int, default=25000)
     ap.add_argument("--embedding_backend", default="sentence_transformers")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -195,18 +196,31 @@ def main():
 
         # Step 5: Build context and generate answer
         frags = [meta[i] for i in ranked_ids]
-        prompt = core.build_prompt(frags, q, analysis, conversation_history if conversation_history else None)
+        prompt = core.build_prompt(
+            frags,
+            q,
+            analysis,
+            conversation_history if conversation_history else None,
+            max_prompt_chars=args.max_prompt_chars,
+        )
 
         if args.verbose:
             print(f"\n[Generation]")
             print(f"  Context size: {len(frags)} functions")
             print(f"  Prompt length: {len(prompt)} chars")
 
-        ans = core.call_llm(prompt, args.model)
+        llm_result = core.call_llm(prompt, args.model)
+        if llm_result.get("ok"):
+            ans = llm_result.get("response", "")
+        else:
+            ans = f"Error calling LLM: {llm_result.get('error', 'unknown error')}"
+            if args.verbose:
+                print(f"\n[LLM ERROR]")
+                print(f"  {llm_result.get('error', 'unknown error')}")
 
         # Step 6: Verify answer for hallucinations
         verification = {"is_valid": True, "hallucinated": set()}
-        if args.verbose:
+        if args.verbose and llm_result.get("ok"):
             verification = core.verify_answer_with_context(ans, frags)
             if not verification["is_valid"]:
                 print(f"\n[⚠️  VERIFICATION WARNING]")

@@ -16,6 +16,10 @@ import os
 from collections import defaultdict
 import time
 from typing import List, Dict, Any, Optional
+from .llm import call_llm as _call_llm_impl
+from .prompting import build_prompt as _build_prompt_impl
+from .prompting import _build_thinking_prompt_with_limit as _build_thinking_prompt_impl
+from .verification import verify_answer_with_context as _verify_answer_with_context_impl
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -835,277 +839,26 @@ class QueryPlanner:
 
 
 def build_thinking_prompt(frags, q, analysis=None, conversation_history=None):
-    """Build prompt with thinking mode for complex reasoning and self-verification"""
-
-    # Build function context with verification markers
-    ctx = ""
-    for i, f in enumerate(frags, 1):
-        param_info = ""
-        if f.get("parameters"):
-            params = f["parameters"]
-            param_strs = [f"{p['name']}: {p['type']}" for p in params]
-            param_info = f"\n  Parameters: {', '.join(param_strs)}"
-
-        input_info = ""
-        if f.get("has_stdin"):
-            input_info = " [STDIN]"
-        elif f.get("has_file_input"):
-            input_info = " [FILE]"
-        elif f.get("has_api_call"):
-            input_info = " [API]"
-
-        ctx += f"""
-[Function {i}] {f["name"]}{input_info}
-  File: {f["file"]}:{f["start_line"]}-{f["end_line"]}
-  Signature: {f["signature"]}{param_info}
-  Code:
-```cpp
-{f["code"][:1500]}
-```
-"""
-
-    # Build conversation history context
-    history_ctx = ""
-    if conversation_history:
-        history_ctx = "\n### Conversation History:\n"
-        for idx, (prev_q, prev_a) in enumerate(conversation_history[-3:], 1):  # Last 3 exchanges
-            history_ctx += f"User: {prev_q}\nAssistant: {prev_a[:300]}...\n\n"
-
-    # Determine instructions based on query type
-    instructions = ""
-    if analysis:
-        listing_constraints = []
-        if analysis.get("needs_stdin"):
-            listing_constraints.append("must read from stdin")
-        if analysis.get("needs_file"):
-            listing_constraints.append("must read from files")
-        if analysis.get("needs_api"):
-            listing_constraints.append("must make API/network calls")
-        if analysis.get("needs_params"):
-            listing_constraints.append("must have input parameters")
-        if analysis.get("requested_types"):
-            listing_constraints.append(f"must match requested types: {', '.join(analysis['requested_types'])}")
-        if analysis.get("needs_parse_like"):
-            listing_constraints.append("should be parse/input-processing related")
-        if analysis.get("exclude_output"):
-            listing_constraints.append("must NOT be write/output-like functions")
-        if analysis.get("needs_fuzz_targets"):
-            listing_constraints.append("should be good fuzzing targets (parsing/decoding, memory handling, complex input processing)")
-        if analysis.get("path_filters"):
-            listing_constraints.append(f"must be located in path/module: {', '.join(analysis['path_filters'])}")
-
-        listing_constraints_text = ""
-        if listing_constraints:
-            mode_text = "all must hold" if analysis.get("constraint_mode") == "all" else "any of positive constraints may match"
-            listing_constraints_text = f"\nConstraint mode: {mode_text}. Constraints: " + "; ".join(listing_constraints)
-
-        if analysis["query_type"] == "listing":
-            if analysis.get("needs_fuzz_targets"):
-                step3_text = "Create a numbered list of the BEST fuzzing-target candidates (rank strongest to weaker)"
-                step4_extra = "\n   - Why it is fuzzable (input surface, parser/state complexity, memory/bounds risk)"
-                step7_text = "If strict matches are unclear, still return best candidates by fuzzing potential; avoid empty output unless context is empty"
-            else:
-                step3_text = "Create a numbered list of matching functions"
-                step4_extra = ""
-                step7_text = 'If no functions match, explicitly state "No matching functions found in the codebase"'
-
-            instructions = f"""
-### Instructions for Listing Queries:
-1. Carefully analyze EACH function in the context above
-2. Check if it matches the criteria from the question (respect the declared constraint mode)
-3. {step3_text}
-4. For each function include:
-   - Name and file location
-   - Relevant parameters with types
-   - Brief explanation why it matches{step4_extra}
-5. CRITICAL: Only include functions that ACTUALLY exist in the provided context
-6. DO NOT invent or assume functions beyond what is shown
-7. {step7_text}
-8. After listing, perform SELF-VERIFICATION:
-   - Re-check each listed function against the original criteria
-   - Confirm the function signature matches the requirements
-   - Mark any uncertain entries with [NEEDS REVIEW]
-9. Respect negative constraints (e.g. "not write-like") strictly{listing_constraints_text}"""
-
-        elif analysis["query_type"] == "example_generation":
-            instructions = """
-### Instructions for Example Generation:
-1. Identify the specific function(s) mentioned or implied
-2. Write a complete, compilable code example showing how to call this function
-3. Include:
-   - Necessary #include statements
-   - Proper variable declarations with correct types
-   - The function call with appropriate arguments
-   - Error handling if relevant
-4. Add comments explaining key parts
-5. Make sure the example is realistic and follows the codebase patterns
-6. CRITICAL: Use ONLY the parameter types and names from the actual function signature
-7. DO NOT invent parameters or change types
-8. After generating, perform SELF-VERIFICATION:
-   - Check that all parameter types match the function signature exactly
-   - Verify the function name is correct
-   - Ensure the example would compile with the given signature"""
-
-        elif analysis["query_type"] == "implementation_explanation":
-            instructions = """
-### Instructions for Implementation Explanation:
-1. Explain the algorithm/logic step by step
-2. Reference specific code sections from the context with line numbers
-3. Describe:
-   - What the function does
-   - How it processes inputs
-   - Key operations and their purpose
-   - Return value meaning
-4. Use simple language but be technically accurate
-5. CRITICAL: Base explanations ONLY on the provided code
-6. DO NOT speculate about implementation details not visible in the code
-7. If something is unclear from the code, state "Implementation detail not visible in provided code"
-8. After explaining, perform SELF-VERIFICATION:
-   - Cross-reference each claim with actual code lines
-   - Remove any assumptions not supported by the code"""
-
-        elif analysis["needs_type_info"]:
-            instructions = """
-### Instructions for Type-Specific Queries:
-1. Focus on parameter types mentioned in the question
-2. Check each function's signature carefully
-3. List only functions whose parameters match the requested type
-4. Include the exact type signature for verification
-5. If Russian terms used (e.g., "массив байтов"), match to C++ types like:
-   - byte array → uint8_t*, char*, std::vector<uint8_t>, QByteArray
-   - string → std::string, char*, const char*
-   - integer → int, int32_t, int64_t, size_t
-6. CRITICAL: Verify the type match before including in the answer
-7. DO NOT include functions where you're unsure about the type
-8. After listing, perform SELF-VERIFICATION:
-   - For each function, quote the exact parameter type from the signature
-   - Explain why this type matches (or doesn't match) the query
-   - Mark uncertain matches with [TYPE UNCERTAIN]"""
-
-        elif analysis["follow_up"]:
-            instructions = """
-### Instructions for Follow-up Questions:
-1. This is a follow-up question - consider the conversation context
-2. If user references "these functions" or "from the list", use previous answer
-3. Maintain consistency with earlier responses
-4. Build upon previous information rather than repeating
-5. CRITICAL: If referencing functions from previous answer, verify they exist in current context
-6. If the current context doesn't contain previously mentioned functions, state this explicitly"""
-
-    # Internal reasoning instructions (do not expose chain-of-thought in answer)
-    thinking_instructions = """
-Think through the task step-by-step internally.
-Do NOT output the phase-by-phase reasoning.
-Return only the final answer with concise evidence (function name, file, signature, why it matches)."""
-
-    return f"""You are an expert C/C++ code analyst with deep understanding of codebases.
-
-{history_ctx}
-### Current Question: {q}
-
-### Available Functions from Codebase:
-{ctx}
-{instructions}
-{thinking_instructions}
-"""
+    """Compatibility wrapper for thinking prompt builder."""
+    return _build_thinking_prompt_impl(frags, q, analysis=analysis, conversation_history=conversation_history)
 
 
-def build_prompt(frags, q, analysis=None, conversation_history=None):
-    """Main prompt builder - uses thinking mode for complex queries"""
-    # Use thinking mode for complex queries
-    complex_types = ["listing", "example_generation", "implementation_explanation", "type_specific", "input_specific"]
-    use_thinking = (analysis and analysis["query_type"] in complex_types) or (conversation_history and len(conversation_history) > 0)
-
-    if use_thinking:
-        return build_thinking_prompt(frags, q, analysis, conversation_history)
-
-    # Simple prompt for straightforward queries
-    ctx = ""
-    for i, f in enumerate(frags, 1):
-        param_info = ""
-        if f.get("parameters"):
-            params = f["parameters"]
-            param_strs = [f"{p['name']}: {p['type']}" for p in params]
-            param_info = f"\nParameters: {', '.join(param_strs)}"
-
-        input_info = ""
-        if f.get("has_stdin"):
-            input_info = "\n[Reads from stdin]"
-        elif f.get("has_file_input"):
-            input_info = "\n[Reads from files]"
-        elif f.get("has_api_call"):
-            input_info = "\n[Makes API calls]"
-
-        ctx += f"""
---- Function {i} ---
-File: {f["file"]}
-Function: {f["name"]}{param_info}{input_info}
-Signature: {f["signature"]}
-Code:
-{f["code"][:2000]}
-
-"""
-
-    return f"""You are an expert code analyst. Answer the question based on the provided code context.
-
-{ctx}
-
-Question: {q}
-
-Answer:"""
+def build_prompt(frags, q, analysis=None, conversation_history=None, max_prompt_chars=20000):
+    """Main prompt builder with total-character budget."""
+    return _build_prompt_impl(
+        frags,
+        q,
+        analysis=analysis,
+        conversation_history=conversation_history,
+        max_prompt_chars=max_prompt_chars,
+    )
 
 
 def call_llm(prompt, model, temperature=0.1):
-    """Call LLM with retry logic and verification mode"""
-    try:
-        r = requests.post(
-            OLLAMA_URL,
-            json=dict(
-                model=model,
-                prompt=prompt,
-                stream=False,
-                options=dict(temperature=temperature)
-            ),
-            timeout=600
-        )
-        return r.json()["response"]
-    except Exception as e:
-        return f"Error calling LLM: {e}"
+    """Call LLM and return structured status dict."""
+    return _call_llm_impl(prompt, model, OLLAMA_URL, temperature=temperature)
 
 
 def verify_answer_with_context(answer, context_frags):
-    """Verify that functions mentioned in the answer actually exist in the context"""
-    # Get actual function names from context
-    actual_funcs = set(f["name"] for f in context_frags)
-
-    # Mentioned known functions (exact names from context)
-    mentioned_funcs = set()
-    for fn in actual_funcs:
-        if re.search(rf"\b{re.escape(fn)}\b", answer):
-            mentioned_funcs.add(fn)
-
-    # Extract additional call-like patterns without optional whitespace
-    func_pattern = re.compile(r'\b([A-Za-z_]\w*)\(', re.MULTILINE)
-    call_like = set(func_pattern.findall(answer))
-    code_ticks = set(re.findall(r"`([A-Za-z_]\w*)`", answer))
-    mentioned_candidates = mentioned_funcs | call_like | code_ticks
-
-    # Find hallucinated functions (mentioned but not in context)
-    hallucinated = mentioned_candidates - actual_funcs
-
-    # Filter out common keywords that might be matched
-    common_keywords = {"if", "for", "while", "switch", "return", "sizeof", "catch",
-                       "new", "delete", "throw", "else", "do", "class", "struct",
-                       "namespace", "template", "typedef", "using", "enum", "union",
-                       "printf", "scanf", "malloc", "free", "memset", "memcpy",
-                       "std::vector", "std::string", "std::map", "std::set",
-                       "phase", "criteria", "console", "input", "output", "function"}
-
-    hallucinated = {h for h in hallucinated if h.lower() not in common_keywords and len(h) > 2}
-
-    return {
-        "mentioned": mentioned_candidates,
-        "actual": actual_funcs,
-        "hallucinated": hallucinated,
-        "is_valid": len(hallucinated) == 0
-    }
+    """Verify that functions mentioned in answer exist in provided context."""
+    return _verify_answer_with_context_impl(answer, context_frags)

@@ -128,7 +128,7 @@ def test_ask_cycle_with_mocked_requests_and_path_filter(tmp_path, monkeypatch, c
     monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(len(meta)))
     monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
     monkeypatch.setattr(ask_app, "CrossEncoder", _DummyCrossEncoder)
-    monkeypatch.setattr("hybrid_code.ask.core.requests.post", _fake_post)
+    monkeypatch.setattr("hybrid_code.ask.llm.requests.post", _fake_post)
 
     inputs = iter([
         "Напиши список функций пригодных для фаззинга из директории src/parsers",
