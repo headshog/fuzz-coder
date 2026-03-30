@@ -1127,7 +1127,8 @@ def main():
         # Step 4: Rerank
         effective_rerank_top_k = args.rerank_top_k
         if analysis.get("is_listing"):
-            effective_rerank_top_k = min(50, max(20, args.rerank_top_k * 4))
+            # Keep listing prompts compact to reduce context bloat.
+            effective_rerank_top_k = 10
         rerank_pool_size = max(effective_rerank_top_k * 4, effective_rerank_top_k + 10)
 
         if reranker and all_candidates:
