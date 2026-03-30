@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            sentence-transformers \
+            transformers \
+            torch \
+            tqdm \
+            python-magic \
+            regex \
+            requests \
+            pytest \
+            tree_sitter \
+            tree_sitter_cpp \
+            faiss-cpu \
+            numpy
+
+      - name: Run tests
+        env:
+          RUN_LLAMA_CPP_E2E: "1"
+        run: python -m pytest -q tests

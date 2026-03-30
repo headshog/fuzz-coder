@@ -1,5 +1,5 @@
-from hybrid_code.ask import core as ask_core
-from hybrid_code.index import core as index_core
+from fuzz_coder.ask import core as ask_core
+from fuzz_coder.index import core as index_core
 
 
 def test_call_llm_returns_structured_status(monkeypatch):
@@ -7,7 +7,7 @@ def test_call_llm_returns_structured_status(monkeypatch):
         def json(self):
             return {"response": "ok"}
 
-    monkeypatch.setattr("hybrid_code.ask.llm.requests.post", lambda *a, **k: _Resp())
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", lambda *a, **k: _Resp())
     result = ask_core.call_llm("prompt", "model")
     assert result["ok"] is True
     assert result["response"] == "ok"
@@ -18,7 +18,7 @@ def test_call_llm_error_returns_structured_status(monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("network down")
 
-    monkeypatch.setattr("hybrid_code.ask.llm.requests.post", _boom)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _boom)
     result = ask_core.call_llm("prompt", "model")
     assert result["ok"] is False
     assert result["response"] == ""

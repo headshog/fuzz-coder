@@ -1,4 +1,4 @@
-from hybrid_code.ask.core import QueryPlanner
+from fuzz_coder.ask.core import QueryPlanner
 
 
 def test_analyze_query_detects_fuzz_and_path_filter_ru():

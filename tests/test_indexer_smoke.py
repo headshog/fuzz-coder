@@ -3,7 +3,7 @@ import sys
 
 import numpy as np
 
-from hybrid_code.index import app as index_app
+from fuzz_coder.index import app as index_app
 
 
 class _DeterministicEmbeddingBackend:
@@ -46,7 +46,7 @@ def test_indexer_smoke_local_project(tmp_path, monkeypatch):
 
     monkeypatch.setattr(index_app, "get_embedding_backend", lambda *a, **k: _DeterministicEmbeddingBackend(dim=8))
     monkeypatch.setattr(sys, "argv", [
-        "index_hybrid_code.py",
+        "index_fuzz_coder.py",
         "--src", str(src),
         "--out", str(out),
         "--language", "c_cpp",

@@ -3,7 +3,7 @@ import sys
 
 import numpy as np
 
-from hybrid_code.ask import app as ask_app
+from fuzz_coder.ask import app as ask_app
 
 
 class _DummyEmbeddingBackend:
@@ -128,7 +128,7 @@ def test_ask_cycle_with_mocked_requests_and_path_filter(tmp_path, monkeypatch, c
     monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(len(meta)))
     monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
     monkeypatch.setattr(ask_app, "CrossEncoder", _DummyCrossEncoder)
-    monkeypatch.setattr("hybrid_code.ask.llm.requests.post", _fake_post)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _fake_post)
 
     inputs = iter([
         "Напиши список функций пригодных для фаззинга из директории src/parsers",
@@ -136,7 +136,7 @@ def test_ask_cycle_with_mocked_requests_and_path_filter(tmp_path, monkeypatch, c
     ])
     monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
     monkeypatch.setattr(sys, "argv", [
-        "ask_hybrid_code.py",
+        "ask_fuzz_coder.py",
         "--index_dir", str(index_dir),
         "--model", "dummy-model",
         "--verbose",
@@ -250,7 +250,7 @@ def test_ask_cycle_other_functions_excludes_previously_listed(tmp_path, monkeypa
     monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(len(meta)))
     monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
     monkeypatch.setattr(ask_app, "CrossEncoder", _DummyCrossEncoder)
-    monkeypatch.setattr("hybrid_code.ask.llm.requests.post", _fake_post)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _fake_post)
 
     inputs = iter([
         "Напиши список функций пригодных для фаззинга из директории src/parsers",
@@ -259,7 +259,7 @@ def test_ask_cycle_other_functions_excludes_previously_listed(tmp_path, monkeypa
     ])
     monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
     monkeypatch.setattr(sys, "argv", [
-        "ask_hybrid_code.py",
+        "ask_fuzz_coder.py",
         "--index_dir", str(index_dir),
         "--model", "dummy-model",
         "--verbose",
@@ -299,7 +299,7 @@ def test_help_command_prints_capabilities_without_llm_call(tmp_path, monkeypatch
     def _should_not_be_called(*_a, **_k):
         raise AssertionError("LLM must not be called for help command")
 
-    monkeypatch.setattr("hybrid_code.ask.llm.requests.post", _should_not_be_called)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _should_not_be_called)
 
     inputs = iter([
         "help",
@@ -307,7 +307,7 @@ def test_help_command_prints_capabilities_without_llm_call(tmp_path, monkeypatch
     ])
     monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
     monkeypatch.setattr(sys, "argv", [
-        "ask_hybrid_code.py",
+        "ask_fuzz_coder.py",
         "--index_dir", str(index_dir),
         "--model", "dummy-model",
     ])

@@ -36,7 +36,7 @@ TYPE_KEYWORDS = {
     "reference": ["reference", "ссылка"],
 }
 
-# Canonical names used by index_hybrid_code.py -> special_indices["by_type"]
+# Canonical names used by index_fuzz_coder.py -> special_indices["by_type"]
 TYPE_ALIASES = {
     "int": "integer",
     "vector": "template",

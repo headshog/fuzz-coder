@@ -1,4 +1,4 @@
-from hybrid_code.ask import core
+from fuzz_coder.ask import core
 
 
 def _chunk(

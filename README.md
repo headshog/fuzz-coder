@@ -74,12 +74,12 @@ pip install sentence-transformers faiss-cpu tree-sitter tree-sitter-cpp requests
 ### Шаг 1: Индексация кодовой базы
 
 ```bash
-python index_hybrid_code.py --src /path/to/code.zip --out ./index_data
+python index_fuzz_coder.py --src /path/to/code.zip --out ./index_data
 ```
 
 Или для распакованной директории:
 ```bash
-python index_hybrid_code.py --src /path/to/code_dir --out ./index_data
+python index_fuzz_coder.py --src /path/to/code_dir --out ./index_data
 ```
 
 Что индексируется:
@@ -92,7 +92,7 @@ python index_hybrid_code.py --src /path/to/code_dir --out ./index_data
 ### Шаг 2: Запуск интерактивного режима
 
 ```bash
-python ask_hybrid_code.py \
+python ask_fuzz_coder.py \
     --index_dir ./index_data \
     --model qwen2.5-coder:32b \
     --verbose
