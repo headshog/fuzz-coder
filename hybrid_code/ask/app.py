@@ -12,6 +12,52 @@ from hybrid_code.embeddings.registry import get_embedding_backend
 from . import core
 
 
+HELP_QUERIES = {
+    "help",
+    "h",
+    "?",
+    "what can you do",
+    "what can you do?",
+    "help me",
+    "помощь",
+    "справка",
+    "что ты умеешь",
+    "что умеешь",
+}
+
+
+def is_help_query(q: str) -> bool:
+    qn = q.lower().strip()
+    if qn in HELP_QUERIES:
+        return True
+    return any(p in qn for p in [
+        "what can you do",
+        "show examples",
+        "как пользоваться",
+        "покажи примеры",
+        "что ты умеешь",
+    ])
+
+
+def render_help_text() -> str:
+    return (
+        "I can analyze indexed code and answer questions about functions, types, call flows, and fuzz targets.\n\n"
+        "What I can do:\n"
+        "1. List functions by criteria (stdin/file/API/types/parse/fuzz).\n"
+        "2. Filter by module/subdirectory (path filter).\n"
+        "3. Give examples of function usage.\n"
+        "4. Explain implementation details from indexed code.\n"
+        "5. Handle follow-ups (including 'other functions' without repeats).\n\n"
+        "Example queries:\n"
+        "- List functions good for fuzzing from module src/parsers\n"
+        "- Какие функции читают из stdin?\n"
+        "- Покажи функции с параметром std::string\n"
+        "- Дай список других функций для фаззинга из директории src/parsers\n"
+        "- Explain how decode_binary_blob works\n"
+        "- Give an example calling parse_json_payload\n"
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--index_dir", required=True)
@@ -19,7 +65,7 @@ def main():
     ap.add_argument("--model", default="qwen2.5-coder:32b")
     ap.add_argument("--top_k", type=int, default=10)
     ap.add_argument("--rerank_top_k", type=int, default=5)
-    ap.add_argument("--max_prompt_chars", type=int, default=25000)
+    ap.add_argument("--max_prompt_chars", type=int, default=20000)
     ap.add_argument("--embedding_backend", default="sentence_transformers")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -56,7 +102,7 @@ def main():
 
     print(f"\nReady! Using model: {args.model}")
     print(f"Index contains {len(meta)} functions")
-    print("Type 'quit' to exit\n")
+    print("Type 'quit' to exit, or 'help' to see examples\n")
 
     while True:
         try:
@@ -68,6 +114,10 @@ def main():
             break
 
         if not q:
+            continue
+
+        if is_help_query(q):
+            print("\n" + render_help_text())
             continue
 
         start_time = time.time()

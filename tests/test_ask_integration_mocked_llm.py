@@ -277,3 +277,44 @@ def test_ask_cycle_other_functions_excludes_previously_listed(tmp_path, monkeypa
     # Second prompt excludes already-listed function parse_json_payload.
     assert "/repo/src/parsers/json_parser.cpp" not in prompts[1]
     assert "/repo/src/parsers/binary_decoder.cpp" in prompts[1]
+
+
+def test_help_command_prints_capabilities_without_llm_call(tmp_path, monkeypatch, capsys):
+    index_dir = tmp_path / "index_data"
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    # Minimal index artifacts required at startup.
+    with open(index_dir / "meta.jsonl", "w", encoding="utf-8") as f:
+        f.write("")
+    _write_json(index_dir / "lexical_index.json", {})
+    _write_json(index_dir / "special_indices.json", {})
+    _write_json(index_dir / "symbols.json", {})
+    _write_json(index_dir / "call_graph.json", {})
+    _write_json(index_dir / "called_by.json", {})
+
+    monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(1))
+    monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
+    monkeypatch.setattr(ask_app, "CrossEncoder", _DummyCrossEncoder)
+
+    def _should_not_be_called(*_a, **_k):
+        raise AssertionError("LLM must not be called for help command")
+
+    monkeypatch.setattr("hybrid_code.ask.llm.requests.post", _should_not_be_called)
+
+    inputs = iter([
+        "help",
+        "quit",
+    ])
+    monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
+    monkeypatch.setattr(sys, "argv", [
+        "ask_hybrid_code.py",
+        "--index_dir", str(index_dir),
+        "--model", "dummy-model",
+    ])
+
+    ask_app.main()
+    out = capsys.readouterr().out
+
+    assert "or 'help' to see examples" in out
+    assert "What I can do:" in out
+    assert "Example queries:" in out

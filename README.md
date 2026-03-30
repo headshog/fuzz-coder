@@ -94,7 +94,7 @@ python index_hybrid_code.py --src /path/to/code_dir --out ./index_data
 ```bash
 python ask_hybrid_code.py \
     --index_dir ./index_data \
-    --model qwen2.5-coder:7b \
+    --model qwen2.5-coder:32b \
     --verbose
 ```
 
@@ -147,17 +147,6 @@ python ask_hybrid_code.py \
 > Объясни алгоритм функции parseHeader
 > Что делает функция validateInput?
 ```
-
-## 🎯 Рекомендации по моделям
-
-### Для 24GB VRAM:
-- **qwen2.5-coder:7b** - отлично подходит для C/C++ кода
-- **codellama:7b** - хорошая альтернатива
-- **deepseek-coder:6.7b** - сильный конкурент
-
-### Если есть больше памяти:
-- **qwen2.5-coder:14b** - лучшее качество
-- **codellama:13b** - хороший баланс
 
 ### Embedding модель:
 - `intfloat/multilingual-e5-base` - поддерживает русский и английский
