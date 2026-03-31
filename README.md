@@ -50,6 +50,7 @@
 - Точное извлечение функций с параметрами
 - Правильное определение сигнатур
 - Call graph для отслеживания вызовов
+- Поддержка профилей языков: `c_cpp`, `java`
 
 ### 8. **Расширенная индексация кода** 📊
 Новые возможности индексации:
@@ -66,7 +67,9 @@
 bash install.sh
 
 # Или вручную:
-pip install sentence-transformers faiss-cpu tree-sitter tree-sitter-cpp requests tqdm numpy
+pip install sentence-transformers faiss-cpu tree_sitter tree_sitter_cpp requests tqdm numpy
+# Для Java AST-парсинга:
+pip install tree_sitter_java
 ```
 
 ## 🔧 Использование
@@ -75,6 +78,9 @@ pip install sentence-transformers faiss-cpu tree-sitter tree-sitter-cpp requests
 
 ```bash
 python index_fuzz_coder.py --src /path/to/code.zip --out ./index_data
+
+# Для Java:
+python index_fuzz_coder.py --src /path/to/java_project --out ./index_data_java --language java
 ```
 
 Или для распакованной директории:
@@ -102,6 +108,7 @@ python ask_fuzz_coder.py \
 - `--index_dir`: директория с индексом
 - `--model`: модель Ollama (по умолчанию qwen2.5-coder)
 - `--embed_model`: embedding модель (по умолчанию multilingual-e5-base)
+- `--language`: профиль языка индексатора (`c_cpp` или `java`)
 - `--top_k`: сколько кандидатов искать (по умолчанию 10)
 - `--rerank_top_k`: сколько топ результатов вернуть (по умолчанию 5)
 - `--verbose`: показывать детали анализа

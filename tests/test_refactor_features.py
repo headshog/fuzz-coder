@@ -1,5 +1,6 @@
 from fuzz_coder.ask import core as ask_core
 from fuzz_coder.index import core as index_core
+from fuzz_coder.languages.registry import get_language_profile, get_supported_language_names
 
 
 def test_call_llm_returns_structured_status(monkeypatch):
@@ -180,3 +181,11 @@ def test_regex_extractor_skips_prototypes_and_uses_local_body_brace():
     assert "real_fuzz_target" in names
     assert "llama_sampler_init_penalties" not in names
     assert "llama_sampler_init_infill" not in names
+
+def test_language_registry_includes_java_profile():
+    names = get_supported_language_names()
+    assert "c_cpp" in names
+    assert "java" in names
+
+    java_profile = get_language_profile("java")
+    assert ".java" in java_profile.supported_ext

@@ -37,6 +37,7 @@ jobs:
             pytest \
             tree_sitter \
             tree_sitter_cpp \
+            tree_sitter_java \
             faiss-cpu \
             numpy
 
