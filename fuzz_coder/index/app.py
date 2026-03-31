@@ -9,7 +9,7 @@ import faiss
 from tqdm import tqdm
 
 from fuzz_coder.embeddings.registry import get_embedding_backend
-from fuzz_coder.languages.registry import get_language_profile
+from fuzz_coder.languages.registry import get_language_profile, get_supported_language_names
 
 from . import core
 
@@ -33,7 +33,7 @@ def main():
     ap.add_argument("--src", required=True)
     ap.add_argument("--out", default="index_data")
     ap.add_argument("--embed_model", default="intfloat/multilingual-e5-base")
-    ap.add_argument("--language", default="c_cpp")
+    ap.add_argument("--language", default="c_cpp", choices=get_supported_language_names())
     ap.add_argument("--embedding_backend", default="sentence_transformers")
     args = ap.parse_args()
 
@@ -48,7 +48,7 @@ def main():
     print(f"Found {len(files)} source files")
 
     chunks = []
-    parser = core.TreeSitterParser()
+    parser = core.TreeSitterParser(language_name=args.language)
 
     for f in tqdm(files, desc="Parsing files"):
         txt = core.read_text(f)
@@ -56,7 +56,7 @@ def main():
         if core.HAS_TREE_SITTER and parser.parser:
             funcs = parser.parse_functions(str(f), txt)
         else:
-            funcs = core.extract_functions_regex(str(f), txt)
+            funcs = core.extract_functions_regex(str(f), txt, language_name=args.language)
 
         for fn in funcs:
             fn["file"] = str(f)

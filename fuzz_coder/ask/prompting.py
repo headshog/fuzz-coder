@@ -188,7 +188,7 @@ Think through the task step-by-step internally.
 Do NOT output the phase-by-phase reasoning.
 Return only the final answer with concise evidence (function name, file, signature, why it matches)."""
 
-    return f"""You are an expert C/C++ code analyst with deep understanding of codebases.
+    return f"""You are an expert code analyst with deep understanding of codebases.
 
 {history_ctx}
 ### Current Question: {q}

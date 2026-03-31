@@ -15,7 +15,7 @@
 pip install sentence-transformers transformers torch tqdm python-magic regex requests pytest
 
 # Tree-sitter for accurate AST parsing (highly recommended)
-pip install tree_sitter tree_sitter_cpp
+pip install tree_sitter tree_sitter_cpp tree_sitter_java
 
 # FAISS for semantic search
 # For GPU support (recommended if you have CUDA):

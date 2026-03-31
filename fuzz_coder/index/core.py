@@ -23,10 +23,25 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 try:
     from tree_sitter import Language, Parser
-    import tree_sitter_cpp
     HAS_TREE_SITTER = True
 except ImportError:
     HAS_TREE_SITTER = False
+
+if HAS_TREE_SITTER:
+    try:
+        import tree_sitter_cpp
+        HAS_TREE_SITTER_CPP = True
+    except ImportError:
+        HAS_TREE_SITTER_CPP = False
+
+    try:
+        import tree_sitter_java
+        HAS_TREE_SITTER_JAVA = True
+    except ImportError:
+        HAS_TREE_SITTER_JAVA = False
+else:
+    HAS_TREE_SITTER_CPP = False
+    HAS_TREE_SITTER_JAVA = False
 
 SUPPORTED_EXT = {
     ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh"
@@ -207,13 +222,19 @@ def detect_code_features(code):
 class TreeSitterParser:
     """Parse code using tree-sitter for accurate AST extraction"""
 
-    def __init__(self):
+    def __init__(self, language_name="c_cpp"):
+        self.language_name = language_name
         if not HAS_TREE_SITTER:
             self.parser = None
             return
 
         try:
-            raw_language = tree_sitter_cpp.language()
+            raw_language = self._get_raw_language(language_name)
+            if raw_language is None:
+                print(f"Warning: Tree-sitter grammar for language '{language_name}' is not available")
+                self.parser = None
+                return
+
             try:
                 # tree-sitter API variant where Language(...) accepts capsule/ptr.
                 self.language = Language(raw_language)
@@ -235,15 +256,92 @@ class TreeSitterParser:
     def parse_functions(self, filepath, code):
         """Extract functions with parameters using tree-sitter"""
         if not self.parser:
-            return extract_functions_regex(filepath, code)
+            return extract_functions_regex(filepath, code, language_name=self.language_name)
 
         functions = []
         try:
             source_bytes = code.encode("utf-8", errors="ignore")
             tree = self.parser.parse(source_bytes)
             root = tree.root_node
-            for func_node in self._iter_nodes_by_type(root, "function_definition"):
-                name_node = self._extract_function_name_node(func_node)
+            if self.language_name == "java":
+                functions = self._parse_java_functions(source_bytes, root)
+            else:
+                functions = self._parse_c_cpp_functions(source_bytes, root)
+
+        except Exception as e:
+            print(f"Tree-sitter error for {filepath}: {e}")
+            # Fallback to regex
+            functions = extract_functions_regex(filepath, code, language_name=self.language_name)
+
+        if not functions:
+            functions = extract_functions_regex(filepath, code, language_name=self.language_name)
+
+        return functions
+
+    def _get_raw_language(self, language_name):
+        if language_name == "c_cpp" and HAS_TREE_SITTER_CPP:
+            return tree_sitter_cpp.language()
+        if language_name == "java" and HAS_TREE_SITTER_JAVA:
+            return tree_sitter_java.language()
+        return None
+
+    def _parse_c_cpp_functions(self, source_bytes, root):
+        functions = []
+        for func_node in self._iter_nodes_by_type(root, "function_definition"):
+            name_node = self._extract_function_name_node(func_node)
+            if name_node is None:
+                continue
+
+            func_name = source_bytes[name_node.start_byte:name_node.end_byte].decode(
+                "utf-8", errors="ignore"
+            )
+
+            if func_name in CONTROL_KEYWORDS:
+                continue
+
+            # Extract parameters
+            params = []
+            params_node = self._extract_function_params_node(func_node)
+            if params_node:
+                params_text = source_bytes[params_node.start_byte:params_node.end_byte].decode(
+                    "utf-8", errors="ignore"
+                )
+                params = self._parse_parameters(params_text)
+
+            body_node = func_node.child_by_field_name("body")
+            if not body_node:
+                continue
+
+            func_code = source_bytes[func_node.start_byte:func_node.end_byte].decode(
+                "utf-8", errors="ignore"
+            )
+
+            start_line = source_bytes[:func_node.start_byte].count(b"\n") + 1
+            end_line = source_bytes[:func_node.end_byte].count(b"\n") + 1
+
+            functions.append({
+                "name": func_name,
+                "signature": self._build_signature(func_name, params),
+                "parameters": params,
+                "code": func_code,
+                "body": func_code,
+                "start_line": start_line,
+                "end_line": end_line,
+                "parser": "tree-sitter"
+            })
+
+        return functions
+
+    def _parse_java_functions(self, source_bytes, root):
+        functions = []
+        for node_type in ("method_declaration", "constructor_declaration"):
+            for func_node in self._iter_nodes_by_type(root, node_type):
+                body_node = func_node.child_by_field_name("body")
+                if not body_node:
+                    # Interface/abstract declarations without body are not embeddable targets.
+                    continue
+
+                name_node = func_node.child_by_field_name("name")
                 if name_node is None:
                     continue
 
@@ -251,28 +349,21 @@ class TreeSitterParser:
                     "utf-8", errors="ignore"
                 )
 
-                if func_name in CONTROL_KEYWORDS:
+                if not func_name or func_name in CONTROL_KEYWORDS:
                     continue
 
-                # Extract parameters
                 params = []
-                params_node = self._extract_function_params_node(func_node)
+                params_node = func_node.child_by_field_name("parameters")
                 if params_node:
                     params_text = source_bytes[params_node.start_byte:params_node.end_byte].decode(
                         "utf-8", errors="ignore"
                     )
                     params = self._parse_parameters(params_text)
 
-                # Get function body
-                body_node = func_node.child_by_field_name("body")
-                if not body_node:
-                    continue
-
                 func_code = source_bytes[func_node.start_byte:func_node.end_byte].decode(
                     "utf-8", errors="ignore"
                 )
 
-                # Calculate line numbers
                 start_line = source_bytes[:func_node.start_byte].count(b"\n") + 1
                 end_line = source_bytes[:func_node.end_byte].count(b"\n") + 1
 
@@ -286,14 +377,6 @@ class TreeSitterParser:
                     "end_line": end_line,
                     "parser": "tree-sitter"
                 })
-
-        except Exception as e:
-            print(f"Tree-sitter error for {filepath}: {e}")
-            # Fallback to regex
-            functions = extract_functions_regex(filepath, code)
-
-        if not functions:
-            functions = extract_functions_regex(filepath, code)
 
         return functions
 
@@ -418,7 +501,7 @@ class TreeSitterParser:
         return f"{name}({', '.join(param_strs)})"
 
 
-def extract_functions_regex(filepath, text):
+def extract_functions_regex(filepath, text, language_name="c_cpp"):
     """Fallback regex-based function extraction"""
     res = []
     lines = text.splitlines()
@@ -473,8 +556,14 @@ def extract_functions_regex(filepath, text):
 
         compact = " ".join(signature.split())
 
+        # Drop leading Java annotations in regex mode fallback.
+        if language_name == "java":
+            compact = re.sub(r"^(@[A-Za-z_]\w*(?:\([^)]*\))?\s+)+", "", compact)
+
         bad_prefixes = ("if ", "for ", "while ", "switch ",
                         "catch ", "#", "typedef ", "return ", "class ", "struct ")
+        if language_name == "java":
+            bad_prefixes = bad_prefixes + ("interface ", "enum ", "record ", "package ", "import ")
         if compact.startswith(bad_prefixes):
             i += 1
             continue
