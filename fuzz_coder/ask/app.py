@@ -261,11 +261,12 @@ def main():
 
         # Step 5: Build context and generate answer
         frags = [meta[i] for i in ranked_ids]
+        prompt_history = conversation_history if (conversation_history and analysis.get("follow_up")) else None
         prompt = core.build_prompt(
             frags,
             q,
             analysis,
-            conversation_history if conversation_history else None,
+            prompt_history,
             max_prompt_chars=args.max_prompt_chars,
         )
 
@@ -284,21 +285,31 @@ def main():
                 print(f"  {llm_result.get('error', 'unknown error')}")
 
         # Step 6: Verify answer for hallucinations
-        verification = {"is_valid": True, "hallucinated": set()}
+        verification = {"is_valid": True, "hallucinated": set(), "out_of_context": set()}
         if args.verbose and llm_result.get("ok"):
-            verification = core.verify_answer_with_context(ans, frags)
-            if not verification["is_valid"]:
+            verification = core.verify_answer_with_context(
+                ans,
+                frags,
+                known_functions=set(symbols.keys()),
+            )
+            if verification.get("hallucinated") or verification.get("out_of_context"):
                 print(f"\n[⚠️  VERIFICATION WARNING]")
-                print(f"  Potentially hallucinated functions: {verification['hallucinated']}")
-                print(f"  Consider asking for clarification or re-querying with more context")
+                if verification.get("hallucinated"):
+                    print(f"  Unknown functions (not found in index): {verification['hallucinated']}")
+                if verification.get("out_of_context"):
+                    print(f"  Mentioned but not in current context: {verification['out_of_context']}")
+                print(f"  Consider re-querying with path/module filter or increasing context")
 
         elapsed = time.time() - start_time
         print(f"\n{ans}")
         print(f"\n[Response time: {elapsed:.2f}s]")
 
         # Add verification note to conversation history if hallucinations detected
-        if not verification.get("is_valid", True):
-            ans += f"\n\n[Note: Answer may contain unverified function names: {verification['hallucinated']}]"
+        if verification.get("hallucinated") or verification.get("out_of_context"):
+            ans += (
+                f"\n\n[Note: Verification flags -> unknown: {verification.get('hallucinated', set())}; "
+                f"out_of_context: {verification.get('out_of_context', set())}]"
+            )
 
         # Update conversation history
         conversation_history.append((q, ans))

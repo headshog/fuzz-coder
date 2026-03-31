@@ -440,20 +440,21 @@ def extract_functions_regex(filepath, text):
         start_i = i
         sig_lines = []
         found_body = False
+        body_brace_pos = -1
         j = i
 
         while j < n and j < i + 20:
             sig_lines.append(lines[j])
             joined = "\n".join(sig_lines)
 
-            semi_pos = joined.find(";")
-            brace_pos = joined.find("{")
+            brace_pos, terminated_decl = scan_signature_for_body(joined)
 
-            if brace_pos != -1 and (semi_pos == -1 or brace_pos < semi_pos):
+            if brace_pos != -1:
                 found_body = True
+                body_brace_pos = brace_pos
                 break
 
-            if semi_pos != -1:
+            if terminated_decl:
                 break
 
             j += 1
@@ -463,7 +464,7 @@ def extract_functions_regex(filepath, text):
             continue
 
         joined = "\n".join(sig_lines)
-        brace_pos = joined.find("{")
+        brace_pos = body_brace_pos
         signature = joined[:brace_pos].strip()
 
         if not signature or ")" not in signature:
@@ -503,7 +504,12 @@ def extract_functions_regex(filepath, text):
             params = []
 
         start_offset = offsets[start_i]
-        open_brace = text.find("{", start_offset)
+        # Important: bind to brace detected inside this exact signature window.
+        open_brace = start_offset + brace_pos
+        if open_brace >= len(text) or text[open_brace] != "{":
+            # Fallback for uncommon newline encodings.
+            window_end = min(len(text), start_offset + len(joined) + 4)
+            open_brace = text.find("{", start_offset, window_end)
         if open_brace == -1:
             i += 1
             continue
@@ -527,6 +533,100 @@ def extract_functions_regex(filepath, text):
         i = text.count("\n", 0, end) + 1
 
     return res
+
+
+def scan_signature_for_body(signature_text):
+    """Find top-level body brace in a function signature window.
+
+    Returns (brace_pos, terminated_decl):
+      - brace_pos >= 0: opening "{" of function body found
+      - terminated_decl True: declaration ended with ";" before any body
+    """
+    in_str = False
+    in_char = False
+    in_line_comment = False
+    in_block_comment = False
+    escape = False
+
+    seen_lparen = False
+    paren_depth = 0
+
+    i = 0
+    n = len(signature_text)
+    while i < n:
+        ch = signature_text[i]
+        nxt = signature_text[i + 1] if i + 1 < n else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if in_str:
+            if not escape and ch == '"':
+                in_str = False
+            escape = (ch == "\\" and not escape)
+            i += 1
+            continue
+
+        if in_char:
+            if not escape and ch == "'":
+                in_char = False
+            escape = (ch == "\\" and not escape)
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+
+        if ch == '"':
+            in_str = True
+            escape = False
+            i += 1
+            continue
+
+        if ch == "'":
+            in_char = True
+            escape = False
+            i += 1
+            continue
+
+        if ch == "(":
+            seen_lparen = True
+            paren_depth += 1
+            i += 1
+            continue
+
+        if ch == ")" and paren_depth > 0:
+            paren_depth -= 1
+            i += 1
+            continue
+
+        if seen_lparen and paren_depth == 0:
+            if ch == "{":
+                return i, False
+            if ch == ";":
+                return -1, True
+
+        i += 1
+
+    return -1, False
 
 
 def parse_parameters_simple(params_text):

@@ -7,6 +7,7 @@ DEFAULT_MAX_PROMPT_CHARS = 20000
 
 
 def _build_thinking_prompt_with_limit(frags, q, analysis=None, conversation_history=None, code_char_limit=1500):
+    max_items = len(frags)
     ctx = ""
     for i, f in enumerate(frags, 1):
         param_info = ""
@@ -73,10 +74,30 @@ def _build_thinking_prompt_with_limit(frags, q, analysis=None, conversation_hist
                 step3_text = "Create a numbered list of the BEST fuzzing-target candidates (rank strongest to weaker)"
                 step4_extra = "\n   - Why it is fuzzable (input surface, parser/state complexity, memory/bounds risk)"
                 step7_text = "If strict matches are unclear, still return best candidates by fuzzing potential; avoid empty output unless context is empty"
+                strict_output_format = f"""
+10. Output format is STRICT. Use this exact per-item schema:
+   1. **`function_name`**
+      - File: `path`
+      - Signature: `full signature`
+      - Why it matches: one concise reason tied to the query
+      - Fuzzable: `High|Medium|Low` - short risk rationale
+11. Return at most {max_items} functions (never more than available context functions)
+12. End with a short ranking summary paragraph:
+   - "Functions like A, B are ranked highest due to ..."
+   - "Others such as C are lower due to ..."
+"""
             else:
                 step3_text = "Create a numbered list of matching functions"
                 step4_extra = ""
                 step7_text = 'If no functions match, explicitly state "No matching functions found in the codebase"'
+                strict_output_format = f"""
+10. Output format is STRICT. Use this exact per-item schema:
+   1. **`function_name`**
+      - File: `path`
+      - Signature: `full signature`
+      - Why it matches: one concise reason tied to the query
+11. Return at most {max_items} functions (never more than available context functions)
+"""
 
             instructions = f"""
 ### Instructions for Listing Queries:
@@ -94,7 +115,8 @@ def _build_thinking_prompt_with_limit(frags, q, analysis=None, conversation_hist
    - Re-check each listed function against the original criteria
    - Confirm the function signature matches the requirements
    - Mark any uncertain entries with [NEEDS REVIEW]
-9. Respect negative constraints (e.g. "not write-like") strictly{listing_constraints_text}"""
+9. Respect negative constraints (e.g. "not write-like") strictly{listing_constraints_text}
+{strict_output_format}"""
 
         elif analysis["query_type"] == "example_generation":
             instructions = """

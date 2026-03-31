@@ -51,3 +51,24 @@ def test_analyze_query_detects_exclude_previously_listed():
 
     assert analysis["exclude_previously_listed"] is True
     assert analysis["follow_up"] is True
+
+
+def test_analyze_query_does_not_mark_relative_that_clause_as_follow_up():
+    planner = QueryPlanner(special_indices={}, symbols={}, call_graph={}, called_by={}, meta=[])
+    q = "Write a list of functions that can be used for fuzzing"
+
+    analysis = planner.analyze_query(q, context_history=[("Q1", "A1")])
+
+    assert analysis["is_listing"] is True
+    assert analysis["needs_fuzz_targets"] is True
+    assert analysis["follow_up"] is False
+
+
+def test_analyze_query_marks_that_list_as_follow_up():
+    planner = QueryPlanner(special_indices={}, symbols={}, call_graph={}, called_by={}, meta=[])
+    q = "Give me other functions from that list"
+
+    analysis = planner.analyze_query(q, context_history=[("Q1", "A1")])
+
+    assert analysis["exclude_previously_listed"] is True
+    assert analysis["follow_up"] is True

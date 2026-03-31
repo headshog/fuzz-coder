@@ -277,6 +277,8 @@ def test_ask_cycle_other_functions_excludes_previously_listed(tmp_path, monkeypa
     # Second prompt excludes already-listed function parse_json_payload.
     assert "/repo/src/parsers/json_parser.cpp" not in prompts[1]
     assert "/repo/src/parsers/binary_decoder.cpp" in prompts[1]
+    assert "### Conversation History:" not in prompts[0]
+    assert "### Conversation History:" in prompts[1]
 
 
 def test_help_command_prints_capabilities_without_llm_call(tmp_path, monkeypatch, capsys):

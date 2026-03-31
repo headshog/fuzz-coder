@@ -759,11 +759,23 @@ class QueryPlanner:
 
         # Check for follow-up questions
         if context_history:
-            if any(w in query_lower for w in ["this", "that", "these", "those", "эти", "этот", "такой", "так", "далее", "дальше", "продолж"]):
+            # Use phrase-level references instead of raw tokens like "that":
+            # "that" is common in English relative clauses ("functions that parse...").
+            follow_up_patterns = [
+                r"\b(these|those)\b",
+                r"\b(this|that)\s+(one|ones|function|functions|list|result|results|candidate|candidates|answer)\b",
+                r"\b(from|in)\s+(the\s+)?(list|previous|above|earlier)\b",
+                r"\b(previous|above|earlier)\s+(list|answer|results?)\b",
+                r"\bиз\s+(этого|того|предыдущего)?\s*списк",
+                r"\b(эт(и|от|у)|тот)\s+(функц|спис)",
+                r"\b(предыдущ|выше|ранее)\s+(ответ|спис|результ)",
+                r"\b(далее|дальше|продолж)\b",
+                r"\bfunction\s+[abc]\b",
+            ]
+
+            if any(re.search(p, query_lower) for p in follow_up_patterns):
                 analysis["follow_up"] = True
-            # Check if referencing previous answer
-            if any(w in query_lower for w in ["from the list", "из списка", "функци", "function a", "function b", "function c"]):
-                analysis["follow_up"] = True
+
             if analysis["exclude_previously_listed"]:
                 analysis["follow_up"] = True
 
@@ -894,6 +906,6 @@ def call_llm(prompt, model, temperature=0.1):
     return _call_llm_impl(prompt, model, OLLAMA_URL, temperature=temperature)
 
 
-def verify_answer_with_context(answer, context_frags):
+def verify_answer_with_context(answer, context_frags, known_functions=None):
     """Verify that functions mentioned in answer exist in provided context."""
-    return _verify_answer_with_context_impl(answer, context_frags)
+    return _verify_answer_with_context_impl(answer, context_frags, known_functions=known_functions)
