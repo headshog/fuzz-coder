@@ -43,6 +43,26 @@ def _write_json(path, data):
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
+def test_ask_reports_missing_index_directory_and_exits_early(tmp_path, monkeypatch, capsys):
+    missing_dir = tmp_path / "no_such_index_dir"
+
+    def _should_not_read_index(_path):
+        raise AssertionError("faiss.read_index must not be called when index_dir is missing")
+
+    monkeypatch.setattr(ask_app.faiss, "read_index", _should_not_read_index)
+    monkeypatch.setattr(sys, "argv", [
+        "ask_fuzz_coder.py",
+        "--index_dir", str(missing_dir),
+        "--model", "dummy-model",
+    ])
+
+    ask_app.main()
+    out = capsys.readouterr().out
+
+    assert "Error: index directory does not exist:" in out
+    assert "Run index_fuzz_coder.py first to build the project index." in out
+
+
 def test_ask_cycle_with_mocked_requests_and_path_filter(tmp_path, monkeypatch, capsys):
     index_dir = tmp_path / "index_data"
     index_dir.mkdir(parents=True, exist_ok=True)
@@ -324,6 +344,183 @@ def test_help_command_prints_capabilities_without_llm_call(tmp_path, monkeypatch
     assert "what i can do" in out_lower
     assert "example quer" in out_lower
     assert "list functions" in out_lower
+    assert "chat aliases" in out_lower
+    assert "fuzz ->" in out_lower
+    assert "more fuzz ->" in out_lower
+    assert "example function_name ->" in out_lower
+
+
+def test_alias_fuzz_and_more_fuzz_expand_to_canonical_queries(tmp_path, monkeypatch, capsys):
+    index_dir = tmp_path / "index_data"
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = [
+        {
+            "id": 0,
+            "name": "parse_json_payload",
+            "file": "/repo/src/parsers/json_parser.cpp",
+            "start_line": 10,
+            "end_line": 40,
+            "signature": "parse_json_payload(const std::string & s)",
+            "parameters": [{"name": "s", "type": "const std::string &", "raw": "const std::string & s"}],
+            "code": "bool parse_json_payload(const std::string & s){ parse(s); return true; }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": True,
+            "has_error_handling": False,
+        },
+    ]
+
+    with open(index_dir / "meta.jsonl", "w", encoding="utf-8") as f:
+        for row in meta:
+            f.write(json.dumps(row) + "\n")
+
+    _write_json(index_dir / "lexical_index.json", {})
+    _write_json(index_dir / "special_indices.json", {
+        "stdin": [],
+        "file_input": [0],
+        "api_calls": [],
+        "output": [],
+        "memory_management": [0],
+        "error_handling": [],
+        "by_type": {"string": [0], "byte_array": [], "integer": []},
+    })
+    _write_json(index_dir / "symbols.json", {"parse_json_payload": [0]})
+    _write_json(index_dir / "call_graph.json", {})
+    _write_json(index_dir / "called_by.json", {})
+
+    prompts = []
+
+    def _fake_post(_url, **kwargs):
+        payload = kwargs.get("json") or {}
+        prompts.append(payload.get("prompt", ""))
+        return _Resp({"response": "alias ok"})
+
+    monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(len(meta)))
+    monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
+    monkeypatch.setattr(ask_app, "CrossEncoder", _DummyCrossEncoder)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _fake_post)
+
+    inputs = iter([
+        "fuzz",
+        "more fuzz",
+        "quit",
+    ])
+    monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
+    monkeypatch.setattr(sys, "argv", [
+        "ask_fuzz_coder.py",
+        "--index_dir", str(index_dir),
+        "--model", "dummy-model",
+    ])
+
+    ask_app.main()
+    _ = capsys.readouterr().out
+
+    assert len(prompts) == 2
+    assert "### Current Question: Write a list of functions that can be used for fuzzing" in prompts[0]
+    assert "### Current Question: Write other functions that are good for fuzzing" in prompts[1]
+
+
+def test_alias_example_function_name_expands_to_example_query(tmp_path, monkeypatch, capsys):
+    index_dir = tmp_path / "index_data"
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = [
+        {
+            "id": 0,
+            "name": "decode_binary_blob",
+            "file": "/repo/src/parsers/binary_decoder.cpp",
+            "start_line": 5,
+            "end_line": 50,
+            "signature": "decode_binary_blob(const uint8_t * buf, size_t n)",
+            "parameters": [
+                {"name": "buf", "type": "const uint8_t *", "raw": "const uint8_t * buf"},
+                {"name": "n", "type": "size_t", "raw": "size_t n"},
+            ],
+            "code": "int decode_binary_blob(const uint8_t * buf, size_t n){ return (int)n; }",
+            "has_stdin": False,
+            "has_file_input": False,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": True,
+            "has_error_handling": False,
+        },
+        {
+            "id": 1,
+            "name": "main",
+            "file": "/repo/tools/main.cpp",
+            "start_line": 1,
+            "end_line": 30,
+            "signature": "main(int argc, char ** argv)",
+            "parameters": [
+                {"name": "argc", "type": "int", "raw": "int argc"},
+                {"name": "argv", "type": "char **", "raw": "char ** argv"},
+            ],
+            "code": "int main(int argc, char ** argv){ decode_binary_blob(nullptr, 0); return 0; }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": False,
+            "has_error_handling": True,
+        },
+    ]
+
+    with open(index_dir / "meta.jsonl", "w", encoding="utf-8") as f:
+        for row in meta:
+            f.write(json.dumps(row) + "\n")
+
+    _write_json(index_dir / "lexical_index.json", {})
+    _write_json(index_dir / "special_indices.json", {
+        "stdin": [],
+        "file_input": [1],
+        "api_calls": [],
+        "output": [],
+        "memory_management": [0],
+        "error_handling": [1],
+        "by_type": {"string": [], "byte_array": [0], "integer": [0]},
+    })
+    _write_json(index_dir / "symbols.json", {"decode_binary_blob": [0], "main": [1]})
+    _write_json(index_dir / "call_graph.json", {"1": {"called_by": [], "resolved_calls": [0]}, "0": {"called_by": [1], "resolved_calls": []}})
+    _write_json(index_dir / "called_by.json", {"0": [1], "1": [], "decode_binary_blob": [1], "main": []})
+
+    captured_prompt = {}
+
+    def _fake_post(_url, **kwargs):
+        payload = kwargs.get("json") or {}
+        captured_prompt["prompt"] = payload.get("prompt", "")
+        return _Resp({
+            "response": (
+                "```cpp\nint main(){return 0;}\n```\n"
+                "Evidence from codebase:\n"
+                "- File: `/repo/src/parsers/binary_decoder.cpp:5-50`\n"
+                "- Signature: `decode_binary_blob(const uint8_t * buf, size_t n)`\n"
+            )
+        })
+
+    monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(len(meta)))
+    monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
+    monkeypatch.setattr(ask_app, "CrossEncoder", _DummyCrossEncoder)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _fake_post)
+
+    inputs = iter([
+        "example decode_binary_blob",
+        "quit",
+    ])
+    monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
+    monkeypatch.setattr(sys, "argv", [
+        "ask_fuzz_coder.py",
+        "--index_dir", str(index_dir),
+        "--model", "dummy-model",
+    ])
+
+    ask_app.main()
+    out = capsys.readouterr().out
+
+    assert "Target function(s) not found in index" not in out
+    assert "### Current Question: Write an example of decode_binary_blob function that is called from main function and its parameters are constructed from data given from file in argv[1]" in captured_prompt["prompt"]
 
 
 def test_example_generation_does_not_emit_listing_verification_warning(tmp_path, monkeypatch, capsys):

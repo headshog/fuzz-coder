@@ -26,6 +26,12 @@ HELP_QUERIES = {
 }
 
 MAX_HISTORY = 5
+ALIAS_FUZZ = "Write a list of functions that can be used for fuzzing"
+ALIAS_MORE_FUZZ = "Write other functions that are good for fuzzing"
+ALIAS_EXAMPLE_TEMPLATE = (
+    "Write an example of {function_name} function that is called from main function "
+    "and its parameters are constructed from data given from file in argv[1]"
+)
 
 
 def is_help_query(q: str) -> bool:
@@ -41,6 +47,26 @@ def is_help_query(q: str) -> bool:
     ])
 
 
+def expand_chat_alias(q: str):
+    """Expand short chat aliases into full natural-language queries."""
+    raw = (q or "").strip()
+    if not raw:
+        return raw, False
+
+    normalized = " ".join(raw.split()).lower()
+    if normalized == "fuzz":
+        return ALIAS_FUZZ, True
+    if normalized == "more fuzz":
+        return ALIAS_MORE_FUZZ, True
+    if normalized.startswith("example "):
+        parts = raw.split(None, 1)
+        if len(parts) == 2:
+            fn = parts[1].strip().strip("`'\"")
+            if fn:
+                return ALIAS_EXAMPLE_TEMPLATE.format(function_name=fn), True
+    return raw, False
+
+
 def render_help_text() -> str:
     return (
         "I can analyze indexed code and answer questions about functions, types, call flows, and fuzz targets.\n\n"
@@ -50,6 +76,10 @@ def render_help_text() -> str:
         "3. Give examples of function usage.\n"
         "4. Explain implementation details from indexed code.\n"
         "5. Handle follow-ups (including 'other functions' without repeats).\n\n"
+        "Chat aliases:\n"
+        "- fuzz -> Write a list of functions that can be used for fuzzing\n"
+        "- more fuzz -> Write other functions that are good for fuzzing\n"
+        "- example FUNCTION_NAME -> Write an example of FUNCTION_NAME function called from main using argv[1] file data\n\n"
         "Example queries:\n"
         "- List functions good for fuzzing from module src/parsers\n"
         "- Какие функции читают из stdin?\n"
@@ -421,6 +451,10 @@ def _append_verification_note(ans, verification):
 def main():
     args = _parse_args()
     index_dir = Path(args.index_dir)
+    if not index_dir.exists() or not index_dir.is_dir():
+        print(f"Error: index directory does not exist: {index_dir}")
+        print("Run index_fuzz_coder.py first to build the project index.")
+        return
 
     idx, meta, lex, special_indices, symbols, call_graph, called_by = _load_indices(index_dir)
     embed_model, reranker = _load_models(args)
@@ -430,7 +464,7 @@ def main():
 
     print(f"\nReady! Using model: {args.model}")
     print(f"Index contains {len(meta)} functions")
-    print("Type 'quit' to exit, or 'help' to see examples\n")
+    print("Type 'quit' to exit, or 'help' to see examples and aliases\n")
 
     while True:
         try:
@@ -445,6 +479,10 @@ def main():
         if is_help_query(q):
             print("\n" + render_help_text())
             continue
+        q, alias_used = expand_chat_alias(q)
+        if alias_used and args.verbose:
+            print(f"\n[Alias]")
+            print(f"  Expanded query: {q}")
 
         start_time = time.time()
         analysis = planner.analyze_query(q, conversation_history if conversation_history else None)
