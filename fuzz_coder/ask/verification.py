@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Set
+from typing import Set
 
 
 COMMON_NON_FUNCTION_TOKENS = {

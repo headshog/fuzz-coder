@@ -10,7 +10,7 @@ class _DeterministicEmbeddingBackend:
     def __init__(self, dim=16):
         self.dim = dim
 
-    def encode(self, texts, convert_to_numpy=True, **kwargs):
+    def encode(self, texts, _convert_to_numpy=True, **_kwargs):
         if isinstance(texts, str):
             texts = [texts]
         out = np.zeros((len(texts), self.dim), dtype="float32")

@@ -113,7 +113,7 @@ def test_golden_retrieval_rerank_with_path_filter():
         "src": [0, 1, 3],
         "parsers": [0, 1, 3],
     }
-    lex_ids, _ = core.lexical_search(query, lex, meta)
+    lex_ids, _ = core.lexical_search(query, lex)
     fused_ids, _ = core.reciprocal_rank_fusion([candidate_ids, lex_ids], rrf_k=50)
 
     reranked = core.rerank_chunks(query, fused_ids[:20], meta, analysis=analysis)

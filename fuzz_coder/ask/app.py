@@ -128,6 +128,21 @@ def main():
         if analysis.get("exclude_previously_listed"):
             excluded_prev_ids = planner.collect_previously_listed_ids(conversation_history)
 
+        # If user asked for a concrete function example/inspection but symbol is absent in index,
+        # fail fast deterministically instead of sending a hallucination-prone prompt.
+        if (
+            analysis.get("query_type") in {"example_generation", "function_specific", "implementation_explanation"}
+            and analysis.get("query_function_candidates")
+            and not analysis.get("function_names")
+        ):
+            missing = ", ".join(analysis["query_function_candidates"][:5])
+            ans = f"Target function(s) not found in index: {missing}"
+            print(f"\n{ans}")
+            conversation_history.append((q, ans))
+            if len(conversation_history) > 5:
+                conversation_history.pop(0)
+            continue
+
         if args.verbose:
             print(f"\n[Query Analysis]")
             print(f"  Type: {analysis['query_type']}")
@@ -143,6 +158,7 @@ def main():
             print(f"  Constraint mode: {analysis['constraint_mode']}")
             print(f"  Exclude output/write-like: {analysis['exclude_output']}")
             print(f"  Requested types: {analysis['requested_types']}")
+            print(f"  Mentioned functions: {analysis['function_names']}")
             print(f"  Keywords: {analysis['keywords'][:5]}...")
 
         # Step 2: Get candidates
@@ -151,7 +167,7 @@ def main():
             candidate_ids = [cid for cid in candidate_ids if cid not in excluded_prev_ids]
 
         # Step 3: Semantic + lexical retrieval with RRF fusion
-        is_listing = analysis.get("is_listing", False)
+        is_listing = analysis.get("query_type") == "listing"
         semantic_k = args.top_k * (4 if is_listing else 2)
         lexical_k = args.top_k * (6 if is_listing else 3)
         retrieval_budget = max(args.top_k * (12 if is_listing else 6), args.rerank_top_k * 4)
@@ -161,7 +177,7 @@ def main():
 
         emb = core.embed(q, embed_model)
         sem_ids, sem_scores = core.semantic_search(idx, emb, semantic_k)
-        lex_ids, lex_scores = core.lexical_search(q, lex, meta)
+        lex_ids, lex_scores = core.lexical_search(q, lex)
         lex_ranked_ids = lex_ids[:lexical_k]
 
         fused_ids, fused_scores = core.reciprocal_rank_fusion(
@@ -182,9 +198,12 @@ def main():
 
         # Step 4: Rerank
         effective_rerank_top_k = args.rerank_top_k
-        if analysis.get("is_listing"):
+        if analysis.get("query_type") == "listing":
             # Keep listing prompts compact to reduce context bloat.
             effective_rerank_top_k = 10
+        elif analysis.get("query_type") == "example_generation":
+            # Keep a bit more room for real call-site snippets.
+            effective_rerank_top_k = max(args.rerank_top_k, 8)
         rerank_pool_size = max(effective_rerank_top_k * 4, effective_rerank_top_k + 10)
 
         if reranker and all_candidates:
@@ -204,7 +223,7 @@ def main():
             )
             cross_ranked_ids = [x[0] for x in cross_sorted]
 
-            heuristic_ranked = core.rerank_chunks(q, all_candidates, meta, call_graph, analysis)
+            heuristic_ranked = core.rerank_chunks(q, all_candidates, meta, analysis=analysis)
             heuristic_ranked_ids = [x["idx"] for x in heuristic_ranked]
 
             rerank_fused_ids, _ = core.reciprocal_rank_fusion(
@@ -214,14 +233,30 @@ def main():
             ranked_pool_ids = rerank_fused_ids[:rerank_pool_size]
         else:
             # Use heuristic reranking
-            reranked = core.rerank_chunks(q, all_candidates, meta, call_graph, analysis)
+            reranked = core.rerank_chunks(q, all_candidates, meta, analysis=analysis)
             ranked_pool_ids = [x["idx"] for x in reranked[:rerank_pool_size]]
         if excluded_prev_ids:
             ranked_pool_ids = [cid for cid in ranked_pool_ids if cid not in excluded_prev_ids]
 
         # Step 4.1: strict listing pre-filter before LLM
         fuzz_fallback_applied = False
-        if analysis.get("is_listing"):
+        if analysis.get("query_type") in {"example_generation", "function_specific", "implementation_explanation"}:
+            mentioned_ids = []
+            for fn in analysis.get("function_names", []):
+                mentioned_ids.extend(symbols.get(fn, []))
+
+            related_ids = []
+            for mid in mentioned_ids:
+                cg = call_graph.get(str(mid), {})
+                related_ids.extend(cg.get("called_by", []))
+                related_ids.extend(cg.get("resolved_calls", []))
+
+            ranked_ids = []
+            for cid in mentioned_ids + related_ids + ranked_pool_ids:
+                if cid not in ranked_ids:
+                    ranked_ids.append(cid)
+            ranked_ids = ranked_ids[:effective_rerank_top_k]
+        elif analysis.get("query_type") == "listing":
             ranked_ids = core.prefilter_listing_candidates(ranked_pool_ids, meta, analysis)[:effective_rerank_top_k]
             if not ranked_ids and analysis.get("needs_fuzz_targets") and ranked_pool_ids:
                 fuzz_fallback_applied = True
@@ -233,6 +268,9 @@ def main():
         else:
             ranked_ids = ranked_pool_ids[:effective_rerank_top_k]
 
+        # Drop parser artifacts from any stage (important for old/stale indices).
+        ranked_ids = [cid for cid in ranked_ids if core.is_valid_function_chunk(meta[cid])]
+
         if args.verbose:
             print(f"\n[Reranking]")
             print(f"  Effective rerank_top_k: {effective_rerank_top_k}")
@@ -240,13 +278,13 @@ def main():
             print(f"  Selected top {len(ranked_ids)} chunks")
             if excluded_prev_ids:
                 print(f"  Excluded previously listed ids: {len(excluded_prev_ids)}")
-            if analysis.get("is_listing"):
+            if analysis.get("query_type") == "listing":
                 print(f"  Strict pre-filter applied: yes")
             if fuzz_fallback_applied:
                 print(f"  Fuzz-target fallback applied: yes")
 
         # If strict listing constraints removed everything, return deterministic answer
-        if analysis.get("is_listing") and not ranked_ids:
+        if analysis.get("query_type") == "listing" and not ranked_ids:
             elapsed = time.time() - start_time
             if analysis.get("exclude_previously_listed"):
                 ans = "No additional matching functions found beyond those already listed."
@@ -286,19 +324,23 @@ def main():
 
         # Step 6: Verify answer for hallucinations
         verification = {"is_valid": True, "hallucinated": set(), "out_of_context": set()}
-        if args.verbose and llm_result.get("ok"):
+        if llm_result.get("ok") and analysis.get("query_type") == "listing":
             verification = core.verify_answer_with_context(
                 ans,
                 frags,
                 known_functions=set(symbols.keys()),
             )
             if verification.get("hallucinated") or verification.get("out_of_context"):
-                print(f"\n[⚠️  VERIFICATION WARNING]")
-                if verification.get("hallucinated"):
-                    print(f"  Unknown functions (not found in index): {verification['hallucinated']}")
-                if verification.get("out_of_context"):
-                    print(f"  Mentioned but not in current context: {verification['out_of_context']}")
-                print(f"  Consider re-querying with path/module filter or increasing context")
+                if args.verbose:
+                    print(f"\n[⚠️  VERIFICATION WARNING]")
+                    if verification.get("hallucinated"):
+                        print(f"  Unknown functions (not found in index): {verification['hallucinated']}")
+                    if verification.get("out_of_context"):
+                        print(f"  Mentioned but not in current context: {verification['out_of_context']}")
+                    print(f"  Consider re-querying with path/module filter or increasing context")
+                ans = core.build_listing_answer_from_context(frags, analysis=analysis)
+                if args.verbose:
+                    print("  Replaced model output with deterministic context-based listing")
 
         elapsed = time.time() - start_time
         print(f"\n{ans}")

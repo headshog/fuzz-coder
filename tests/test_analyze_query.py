@@ -72,3 +72,27 @@ def test_analyze_query_marks_that_list_as_follow_up():
 
     assert analysis["exclude_previously_listed"] is True
     assert analysis["follow_up"] is True
+
+
+def test_analyze_query_example_generation_is_not_listing_and_not_broad_fuzz():
+    planner = QueryPlanner(
+        special_indices={},
+        symbols={
+            "llama_sampler_init_grammar_lazy_patterns": [1],
+            "main": [2],
+        },
+        call_graph={},
+        called_by={},
+        meta=[],
+    )
+    q = "Give an example calling llama_sampler_init_grammar_lazy_patterns from main function that is best for fuzzing"
+
+    analysis = planner.analyze_query(q, context_history=[("Q1", "A1")])
+
+    assert analysis["query_type"] == "example_generation"
+    assert analysis["is_listing"] is False
+    assert analysis["exclude_previously_listed"] is False
+    assert analysis["needs_fuzz_targets"] is False
+    assert analysis["follow_up"] is False
+    assert "llama_sampler_init_grammar_lazy_patterns" in analysis["query_function_candidates"]
+    assert "llama_sampler_init_grammar_lazy_patterns" in analysis["function_names"]

@@ -15,7 +15,7 @@ class _DeterministicEmbeddingBackend:
     def __init__(self, dim=24):
         self.dim = dim
 
-    def encode(self, texts, convert_to_numpy=True, **kwargs):
+    def encode(self, texts, _convert_to_numpy=True, **_kwargs):
         if isinstance(texts, str):
             texts = [texts]
         out = np.zeros((len(texts), self.dim), dtype="float32")
@@ -27,7 +27,7 @@ class _DeterministicEmbeddingBackend:
 
 
 class _DummyCrossEncoder:
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *_args, **_kwargs):
         pass
 
     def predict(self, pairs):
@@ -90,8 +90,9 @@ def test_e2e_llama_cpp_clone_index_and_ask(tmp_path, monkeypatch, capsys):
 
     captured_prompt = {}
 
-    def _fake_post(_url, json=None, timeout=None):
-        captured_prompt["prompt"] = json["prompt"]
+    def _fake_post(_url, **kwargs):
+        payload = kwargs.get("json") or {}
+        captured_prompt["prompt"] = payload["prompt"]
         return _Resp({"response": "LLM_E2E_OK"})
 
     monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _fake_post)

@@ -4,17 +4,13 @@ Hybrid Code Indexer with Tree-sitter AST, Call Graph, and Semantic Search
 """
 
 from sentence_transformers import SentenceTransformer
-from tqdm import tqdm
-import faiss
 import numpy as np
 from collections import defaultdict
 from pathlib import Path
 import zipfile
 import re
-import json
-import argparse
 import os
-import hashlib
+from bisect import bisect_right
 from .call_graph import detect_calls as _detect_calls_impl
 from .call_graph import build_call_graph as _build_call_graph_impl
 
@@ -501,16 +497,17 @@ class TreeSitterParser:
         return f"{name}({', '.join(param_strs)})"
 
 
-def extract_functions_regex(filepath, text, language_name="c_cpp"):
+def extract_functions_regex(_filepath, text, language_name="c_cpp"):
     """Fallback regex-based function extraction"""
     res = []
-    lines = text.splitlines()
+    lines_with_end = text.splitlines(keepends=True)
+    lines = [ln.rstrip("\r\n") for ln in lines_with_end]
 
     offsets = []
     cur = 0
-    for line in lines:
+    for line in lines_with_end:
         offsets.append(cur)
-        cur += len(line) + 1
+        cur += len(line)
 
     i = 0
     n = len(lines)
@@ -556,6 +553,14 @@ def extract_functions_regex(filepath, text, language_name="c_cpp"):
 
         compact = " ".join(signature.split())
 
+        # Regex fallback must only index function definitions, not declaration/macro blobs.
+        if ";" in compact:
+            i += 1
+            continue
+        if any(tok in compact for tok in ["///", "/*", "*/", "DEPRECATED("]):
+            i += 1
+            continue
+
         # Drop leading Java annotations in regex mode fallback.
         if language_name == "java":
             compact = re.sub(r"^(@[A-Za-z_]\w*(?:\([^)]*\))?\s+)+", "", compact)
@@ -580,6 +585,11 @@ def extract_functions_regex(filepath, text, language_name="c_cpp"):
             continue
 
         name = m.group(1)
+        # Guard against macro invocations accidentally captured as "functions",
+        # e.g. DEPRECATED(...), likely when fallback parser spans declaration blocks.
+        if head == name and re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
+            i += 1
+            continue
         if name in CONTROL_KEYWORDS:
             i += 1
             continue
@@ -609,17 +619,20 @@ def extract_functions_regex(filepath, text, language_name="c_cpp"):
             continue
 
         code = text[start_offset:end + 1]
+        start_line = bisect_right(offsets, start_offset)
+        end_line_idx = max(0, bisect_right(offsets, end) - 1)
+        end_line = end_line_idx + 1
         res.append({
             "name": name,
             "signature": compact,
             "parameters": params,
             "code": code,
             "body": code,
-            "start_line": start_i + 1,
-            "end_line": text.count("\n", 0, end) + 1,
+            "start_line": start_line,
+            "end_line": end_line,
             "parser": "regex"
         })
-        i = text.count("\n", 0, end) + 1
+        i = end_line_idx + 1
 
     return res
 

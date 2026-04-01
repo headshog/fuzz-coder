@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
-
-
 DEFAULT_MAX_PROMPT_CHARS = 20000
 
 
@@ -122,17 +119,20 @@ def _build_thinking_prompt_with_limit(frags, q, analysis=None, conversation_hist
             instructions = """
 ### Instructions for Example Generation:
 1. Identify the specific function(s) mentioned or implied
-2. Write a complete, compilable code example showing how to call this function
-3. Include:
+2. Prioritize REAL usage patterns from the provided context (call sites, argument preparation, ordering)
+3. Write a complete, compilable code example showing how to call this function
+4. Include:
    - Necessary #include statements
    - Proper variable declarations with correct types
    - The function call with appropriate arguments
    - Error handling if relevant
-4. Add comments explaining key parts
-5. Make sure the example is realistic and follows the codebase patterns
-6. CRITICAL: Use ONLY the parameter types and names from the actual function signature
-7. DO NOT invent parameters or change types
-8. After generating, perform SELF-VERIFICATION:
+5. Add comments explaining key parts
+6. Make sure the example is realistic and follows the codebase patterns
+7. CRITICAL: Use ONLY the parameter types and names from the actual function signature
+8. DO NOT invent parameters or change types
+9. If context lacks real call-site details, explicitly state what is missing and provide the minimal safe scaffold
+10. DO NOT instantiate opaque internal structs with fake placeholders unless such pattern exists in context
+11. After generating, perform SELF-VERIFICATION:
    - Check that all parameter types match the function signature exactly
    - Verify the function name is correct
    - Ensure the example would compile with the given signature"""

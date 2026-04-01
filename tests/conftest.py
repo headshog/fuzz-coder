@@ -9,10 +9,10 @@ if "sentence_transformers" not in sys.modules:
     st = types.ModuleType("sentence_transformers")
 
     class _SentenceTransformer:
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *_args, **_kwargs):
             pass
 
-        def encode(self, texts, convert_to_numpy=True, **kwargs):
+        def encode(self, texts, _convert_to_numpy=True, **_kwargs):
             if isinstance(texts, str):
                 texts = [texts]
             # deterministic tiny embeddings
@@ -20,7 +20,7 @@ if "sentence_transformers" not in sys.modules:
             return arr
 
     class _CrossEncoder:
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *_args, **_kwargs):
             pass
 
         def predict(self, pairs):

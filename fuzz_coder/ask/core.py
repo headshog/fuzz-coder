@@ -4,18 +4,11 @@ Advanced Code Query System with Thinking Mode, Context Memory, and Multi-Step Re
 Supports follow-up questions, code generation examples, and deep codebase understanding
 """
 
-from sentence_transformers import SentenceTransformer, CrossEncoder
-import faiss
 import numpy as np
-from pathlib import Path
-import requests
 import re
 import json
-import argparse
 import os
 from collections import defaultdict
-import time
-from typing import List, Dict, Any, Optional
 from .llm import call_llm as _call_llm_impl
 from .prompting import build_prompt as _build_prompt_impl
 from .prompting import _build_thinking_prompt_with_limit as _build_thinking_prompt_impl
@@ -81,6 +74,12 @@ PATH_FILTER_PATTERNS = [
     r"\bв\s+(?:модуле|директории|поддиректории|папке)\s+([`\"']?)([^`\"'\n,;]+)\1",
 ]
 
+COMMON_QUERY_WORDS = {
+    "write", "list", "of", "functions", "that", "can", "be", "used", "for", "fuzzing",
+    "give", "an", "example", "from", "main", "function", "called", "call", "how",
+    "to", "is", "in", "codebase", "show", "me", "the", "a", "and", "or", "with",
+}
+
 
 def query_contains_keyword(query_lower, keyword):
     """Match keywords safely; short alpha keywords use token boundaries."""
@@ -123,7 +122,7 @@ def clean_path_candidate(raw):
     return p.strip(" \t\r\n.,:;!?")
 
 
-def extract_path_filters_from_query(query, query_lower):
+def extract_path_filters_from_query(query):
     """Extract module/directory constraints from query."""
     filters = []
 
@@ -162,6 +161,38 @@ def chunk_matches_path_filters(chunk, path_filters):
     return any(f in file_path for f in path_filters)
 
 
+def is_valid_function_chunk(chunk):
+    """Drop obvious parser artifacts (macros/comment blobs) from retrieval/output."""
+    name = str(chunk.get("name", "")).strip()
+    if not name:
+        return False
+
+    # Macro-like symbols (e.g. DEPRECATED) are not callable functions.
+    if re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
+        return False
+
+    sig = str(chunk.get("signature", "")).strip()
+    if not sig:
+        return False
+
+    if name not in sig:
+        return False
+
+    # A definition signature should not contain declaration separators or comment blobs.
+    if ";" in sig:
+        return False
+    if any(tok in sig for tok in ["///", "/*", "*/", "DEPRECATED("]):
+        return False
+    if "{" in sig or "}" in sig:
+        return False
+
+    # Long signatures are usually malformed merged blocks from regex fallback.
+    if len(sig) > 500:
+        return False
+
+    return True
+
+
 def extract_function_names_from_text(text, symbols):
     """Extract known function names mentioned in free text."""
     if not text or not symbols:
@@ -172,6 +203,42 @@ def extract_function_names_from_text(text, symbols):
         if re.search(rf"(?<![A-Za-z0-9_]){re.escape(fn)}(?![A-Za-z0-9_])", text):
             found.add(fn)
     return found
+
+
+def extract_function_like_candidates(query):
+    """Extract function-like identifiers from user query."""
+    candidates = []
+
+    # Prefer explicit code-style references.
+    candidates.extend(re.findall(r"`([^`]+)`", query))
+    candidates.extend(re.findall(r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*(?=\()", query))
+    candidates.extend(re.findall(r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b", query))
+
+    out = []
+    seen = set()
+    for raw in candidates:
+        token = (raw or "").strip().strip("`'\".,:;!?()[]{}")
+        if not token:
+            continue
+
+        token_lower = token.lower()
+        if token_lower in COMMON_QUERY_WORDS:
+            continue
+
+        # Keep identifiers that look like actual symbols, avoid plain prose.
+        looks_like_symbol = (
+            "_" in token or
+            "::" in token or
+            (any(ch.isupper() for ch in token[1:]) and any(ch.islower() for ch in token))
+        )
+        if not looks_like_symbol:
+            continue
+
+        if token_lower not in seen:
+            seen.add(token_lower)
+            out.append(token)
+
+    return out
 
 
 def normalize_type_name(type_name):
@@ -346,6 +413,8 @@ def collect_positive_constraint_matches(chunk, analysis):
 
 def chunk_matches_constraints(chunk, analysis):
     """Hard constraints matcher used for strict listing pre-filter."""
+    if not is_valid_function_chunk(chunk):
+        return False
     if analysis.get("needs_params") and not chunk.get("parameters"):
         return False
     if analysis.get("exclude_output") and is_write_like_chunk(chunk):
@@ -441,7 +510,7 @@ def semantic_search(idx, emb, k):
     return I[0], D[0]
 
 
-def lexical_search(q, lex, meta):
+def lexical_search(q, lex):
     """Keyword-based search with scoring"""
     tokens = re.findall(r"[A-Za-z_]\w+", q.lower())
     scores = defaultdict(float)
@@ -544,7 +613,7 @@ def type_match_score(query, chunk):
     return min(1.0, overlap / max(len(matched_types), 1))
 
 
-def rerank_chunks(query, chunks, meta, call_graph=None, analysis=None):
+def rerank_chunks(query, chunks, meta, analysis=None):
     """Rerank chunks using multiple signals"""
     if not chunks:
         return []
@@ -553,6 +622,8 @@ def rerank_chunks(query, chunks, meta, call_graph=None, analysis=None):
 
     for idx in chunks:
         chunk = meta[idx]
+        if not is_valid_function_chunk(chunk):
+            continue
 
         # Multiple scoring signals
         kw_score = keyword_match_score(query, chunk)
@@ -618,6 +689,68 @@ def rerank_chunks(query, chunks, meta, call_graph=None, analysis=None):
     return scored_chunks
 
 
+def fuzzable_level(score):
+    if score >= 0.65:
+        return "High"
+    if score >= 0.40:
+        return "Medium"
+    return "Low"
+
+
+def listing_match_reason(chunk, analysis):
+    reasons = []
+    if analysis.get("needs_parse_like") and is_parse_like_chunk(chunk):
+        reasons.append("parse/input-processing logic")
+    if chunk.get("has_stdin"):
+        reasons.append("reads from stdin")
+    if chunk.get("has_file_input"):
+        reasons.append("reads from files")
+    if chunk.get("has_api_call"):
+        reasons.append("handles API/network input")
+    if chunk.get("uses_memory_management"):
+        reasons.append("memory/buffer handling")
+    if chunk.get("has_error_handling"):
+        reasons.append("error-handling paths")
+    if not reasons:
+        reasons.append("matches retrieval constraints from indexed context")
+    return ", ".join(reasons[:2])
+
+
+def build_listing_answer_from_context(frags, analysis=None):
+    """Deterministic listing fallback when model output fails verification."""
+    analysis = analysis or {}
+    clean_frags = [f for f in frags if is_valid_function_chunk(f)]
+    if not clean_frags:
+        return "No matching functions found in the indexed codebase for the specified constraints."
+
+    lines = []
+    for i, f in enumerate(clean_frags, 1):
+        score = fuzz_target_score(f)
+        level = fuzzable_level(score)
+        reason = listing_match_reason(f, analysis)
+        sig = f.get("signature") or f"{f.get('name', '')}()"
+        file_loc = f"{f.get('file', '')}:{f.get('start_line', '?')}-{f.get('end_line', '?')}"
+        lines.append(
+            f"{i}. **`{f.get('name', '')}`**\n"
+            f"   - File: `{file_loc}`\n"
+            f"   - Signature: `{sig}`\n"
+            f"   - Why it matches: {reason}\n"
+            f"   - Fuzzable: {level} - score={score:.2f}"
+        )
+
+    if analysis.get("needs_fuzz_targets") and len(clean_frags) >= 2:
+        top_names = [f.get("name", "") for f in clean_frags[:2] if f.get("name")]
+        lower_names = [f.get("name", "") for f in clean_frags[2:4] if f.get("name")]
+        if top_names:
+            summary = f"Functions like {', '.join(top_names)} are ranked highest due to broader input/memory surfaces."
+            if lower_names:
+                summary += f" Others such as {', '.join(lower_names)} are lower due to narrower input complexity."
+            lines.append("")
+            lines.append(summary)
+
+    return "\n".join(lines)
+
+
 class QueryPlanner:
     """Advanced query planner with thinking mode support"""
 
@@ -627,6 +760,9 @@ class QueryPlanner:
         self.call_graph = call_graph
         self.called_by = called_by
         self.meta = meta or []
+        self.symbols_by_lower = defaultdict(list)
+        for fn in self.symbols.keys():
+            self.symbols_by_lower[fn.lower()].append(fn)
 
     def analyze_query(self, query, context_history=None):
         """Analyze query to determine search strategy with thinking mode"""
@@ -657,7 +793,8 @@ class QueryPlanner:
             "needs_example": False,
             "needs_implementation": False,
             "follow_up": False,
-            "referenced_functions": []
+            "referenced_functions": [],
+            "query_function_candidates": [],
         }
 
         # Detect input type requirements
@@ -693,12 +830,13 @@ class QueryPlanner:
             # Fuzzing asks are effectively listing/ranking asks even without explicit "list".
             analysis["is_listing"] = True
 
-        # Detect function name mentions
-        if self.symbols:
-            for func_name in self.symbols.keys():
-                if func_name.lower() in query_lower or func_name in query:
-                    analysis["function_names"].append(func_name)
-                    analysis["referenced_functions"].append(func_name)
+        # Detect explicit function-like mentions from query text.
+        analysis["query_function_candidates"] = extract_function_like_candidates(query)
+        for cand in analysis["query_function_candidates"]:
+            for resolved in self.symbols_by_lower.get(cand.lower(), []):
+                if resolved not in analysis["function_names"]:
+                    analysis["function_names"].append(resolved)
+                    analysis["referenced_functions"].append(resolved)
 
         # Detect call graph expansion needs
         if any(w in query_lower for w in ["call", "invoke", "use", "caller", "callee", "called by", "вызыва", "использу"]):
@@ -717,13 +855,16 @@ class QueryPlanner:
             analysis["exclude_output"] = True
 
         # Detect path/module filters
-        analysis["path_filters"] = extract_path_filters_from_query(query, query_lower)
+        analysis["path_filters"] = extract_path_filters_from_query(query)
 
         # Detect novelty requests: "other/different/new functions"
-        if any(w in query_lower for w in [
+        novelty_requested = any(w in query_lower for w in [
             "other", "another", "different", "new", "remaining", "else",
             "друг", "еще", "ещё", "остальн", "дополнительно"
-        ]):
+        ])
+        if novelty_requested and (
+            analysis["is_listing"] or "function" in query_lower or "функц" in query_lower
+        ):
             analysis["exclude_previously_listed"] = True
 
         # Decide whether positive constraints are all-required or any-of
@@ -751,6 +892,12 @@ class QueryPlanner:
         if any(w in query_lower for w in ["example", "пример", "как вызвать", "как использовать", "usage", "использовани"]):
             analysis["needs_example"] = True
             analysis["query_type"] = "example_generation"
+            # Example generation should not be treated as listing/ranking query.
+            analysis["is_listing"] = False
+            analysis["exclude_previously_listed"] = False
+            # If user named concrete functions, focus retrieval on those instead of broad fuzz-target discovery.
+            if analysis["function_names"]:
+                analysis["needs_fuzz_targets"] = False
 
         # Detect implementation questions
         if any(w in query_lower for w in ["implement", "реализ", "как работает", "how does", "algorithm", "алгоритм"]):
@@ -810,6 +957,20 @@ class QueryPlanner:
 
     def get_search_candidates(self, analysis, k=20):
         """Get candidate indices based on query analysis"""
+        if analysis.get("query_type") in {"example_generation", "function_specific", "implementation_explanation"} and analysis.get("function_names"):
+            focused = set()
+            for func_name in analysis["function_names"]:
+                focused.update(self.symbols.get(func_name, []))
+
+            # Bring immediate call-graph neighborhood for realistic usage examples.
+            expanded = set(focused)
+            for idx in list(focused):
+                cg = self.call_graph.get(str(idx), {})
+                expanded.update(cg.get("called_by", []))
+                expanded.update(cg.get("resolved_calls", []))
+
+            return sorted(expanded)[: max(k * 3, 30)]
+
         candidates = set()
 
         # Use special indices for input-specific queries
