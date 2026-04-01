@@ -46,6 +46,12 @@ def _build_thinking_prompt_with_limit(frags, q, analysis=None, conversation_hist
             listing_constraints.append("must read from files")
         if analysis.get("needs_api"):
             listing_constraints.append("must make API/network calls")
+        if analysis.get("needs_output"):
+            listing_constraints.append("must perform output/logging operations")
+        if analysis.get("needs_memory_mgmt"):
+            listing_constraints.append("must involve memory/buffer management")
+        if analysis.get("needs_error_handling"):
+            listing_constraints.append("must include error-handling paths")
         if analysis.get("needs_params"):
             listing_constraints.append("must have input parameters")
         if analysis.get("requested_types"):
@@ -120,22 +126,31 @@ def _build_thinking_prompt_with_limit(frags, q, analysis=None, conversation_hist
 ### Instructions for Example Generation:
 1. Identify the specific function(s) mentioned or implied
 2. Prioritize REAL usage patterns from the provided context (call sites, argument preparation, ordering)
-3. Write a complete, compilable code example showing how to call this function
-4. Include:
+3. Use the real function signature from context exactly (name, arity, types)
+4. Write a complete, compilable code example showing how to call this function
+5. Include:
    - Necessary #include statements
    - Proper variable declarations with correct types
    - The function call with appropriate arguments
    - Error handling if relevant
-5. Add comments explaining key parts
-6. Make sure the example is realistic and follows the codebase patterns
-7. CRITICAL: Use ONLY the parameter types and names from the actual function signature
-8. DO NOT invent parameters or change types
-9. If context lacks real call-site details, explicitly state what is missing and provide the minimal safe scaffold
-10. DO NOT instantiate opaque internal structs with fake placeholders unless such pattern exists in context
-11. After generating, perform SELF-VERIFICATION:
+6. Add comments explaining key parts
+7. Make sure the example is realistic and follows the codebase patterns
+8. CRITICAL: Use ONLY the parameter types and names from the actual function signature
+9. DO NOT invent parameters or change types
+10. If context includes caller functions, explicitly ground the example in those call-sites
+11. For parameters, derive initialization strategy from real call-sites when available
+12. If query asks for file/argv bytes, construct arguments from `argv[1]` bytes in code
+13. Include a short "Evidence from codebase" note with concrete `File:start-end` references
+14. Evidence is mandatory and must contain BOTH:
+   - `File: path:start-end`
+   - `Signature: full signature`
+15. If context lacks real call-site details, explicitly state what is missing and provide the minimal safe scaffold
+16. DO NOT instantiate opaque internal structs with fake placeholders unless such pattern exists in context
+17. After generating, perform SELF-VERIFICATION:
    - Check that all parameter types match the function signature exactly
    - Verify the function name is correct
-   - Ensure the example would compile with the given signature"""
+   - Ensure the example would compile with the given signature
+18. Never claim a call-site if it is not present in the provided context"""
 
         elif analysis["query_type"] == "implementation_explanation":
             instructions = """

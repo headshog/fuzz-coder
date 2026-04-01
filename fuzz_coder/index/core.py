@@ -502,6 +502,8 @@ def extract_functions_regex(_filepath, text, language_name="c_cpp"):
     res = []
     lines_with_end = text.splitlines(keepends=True)
     lines = [ln.rstrip("\r\n") for ln in lines_with_end]
+    max_signature_scan_lines = 80
+    max_signature_scan_chars = 12000
 
     offsets = []
     cur = 0
@@ -522,9 +524,12 @@ def extract_functions_regex(_filepath, text, language_name="c_cpp"):
         found_body = False
         body_brace_pos = -1
         j = i
+        scanned_chars = 0
 
-        while j < n and j < i + 20:
-            sig_lines.append(lines[j])
+        while j < n and (j - i) < max_signature_scan_lines and scanned_chars < max_signature_scan_chars:
+            line = lines[j]
+            sig_lines.append(line)
+            scanned_chars += len(line) + 1
             joined = "\n".join(sig_lines)
 
             brace_pos, terminated_decl = scan_signature_for_body(joined)
@@ -595,7 +600,7 @@ def extract_functions_regex(_filepath, text, language_name="c_cpp"):
             continue
 
         # Extract parameters
-        rp = compact.find(")", lp)
+        rp = find_matching_paren(compact, lp)
         if rp != -1:
             params_text = compact[lp+1:rp]
             params = parse_parameters_simple(params_text)
@@ -738,35 +743,162 @@ def parse_parameters_simple(params_text):
     if not params_text:
         return params
 
-    # Split by comma
-    for param in params_text.split(","):
+    for param in split_top_level_params(params_text):
         param = param.strip()
         if not param:
             continue
 
-        parts = param.split()
-        if len(parts) >= 2:
-            name = parts[-1].split("&")[-1].split("*")[-1].strip()
-            param_type = " ".join(parts[:-1])
-            params.append({
-                "name": name,
-                "type": param_type,
-                "is_reference": "&" in param,
-                "is_pointer": "*" in param,
-                "is_const": "const" in param.lower(),
-                "raw": param
-            })
-        else:
-            params.append({
-                "name": param,
-                "type": "unknown",
-                "is_reference": False,
-                "is_pointer": False,
-                "is_const": False,
-                "raw": param
-            })
+        name, param_type = parse_single_parameter_simple(param)
+        params.append({
+            "name": name,
+            "type": param_type,
+            "is_reference": "&" in param,
+            "is_pointer": "*" in param,
+            "is_const": "const" in param.lower(),
+            "raw": param
+        })
 
     return params
+
+
+def split_top_level_params(params_text):
+    """Split C/C++ parameter list by top-level commas."""
+    out = []
+    cur = []
+
+    depth_angle = 0
+    depth_paren = 0
+    depth_brace = 0
+    depth_bracket = 0
+
+    in_str = False
+    in_char = False
+    escape = False
+
+    i = 0
+    n = len(params_text)
+    while i < n:
+        ch = params_text[i]
+
+        if in_str:
+            cur.append(ch)
+            if not escape and ch == '"':
+                in_str = False
+            escape = (ch == "\\" and not escape)
+            i += 1
+            continue
+
+        if in_char:
+            cur.append(ch)
+            if not escape and ch == "'":
+                in_char = False
+            escape = (ch == "\\" and not escape)
+            i += 1
+            continue
+
+        if ch == '"':
+            in_str = True
+            escape = False
+            cur.append(ch)
+            i += 1
+            continue
+
+        if ch == "'":
+            in_char = True
+            escape = False
+            cur.append(ch)
+            i += 1
+            continue
+
+        if ch == "<":
+            depth_angle += 1
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == ">":
+            depth_angle = max(0, depth_angle - 1)
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth_paren += 1
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == ")":
+            depth_paren = max(0, depth_paren - 1)
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == "{":
+            depth_brace += 1
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == "}":
+            depth_brace = max(0, depth_brace - 1)
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == "[":
+            depth_bracket += 1
+            cur.append(ch)
+            i += 1
+            continue
+        if ch == "]":
+            depth_bracket = max(0, depth_bracket - 1)
+            cur.append(ch)
+            i += 1
+            continue
+
+        if ch == "," and depth_angle == 0 and depth_paren == 0 and depth_brace == 0 and depth_bracket == 0:
+            part = "".join(cur).strip()
+            if part:
+                out.append(part)
+            cur = []
+            i += 1
+            continue
+
+        cur.append(ch)
+        i += 1
+
+    tail = "".join(cur).strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
+def parse_single_parameter_simple(param_text):
+    """Best-effort parsing of a single C/C++ parameter."""
+    raw = param_text.strip()
+    if not raw:
+        return "unknown", "unknown"
+
+    no_default = raw
+    if "=" in raw:
+        no_default = raw.split("=", 1)[0].rstrip()
+
+    # Function pointer param: void (*cb)(int)
+    fp = re.search(r"\(\s*[*&]\s*([A-Za-z_]\w*)\s*\)", no_default)
+    if fp:
+        name = fp.group(1)
+        return name, no_default
+
+    # Array-style parameter: int data[4]
+    arr = re.search(r"([A-Za-z_]\w*)\s*(\[[^\]]*\])\s*$", no_default)
+    if arr:
+        name = arr.group(1)
+        ptype = no_default[:arr.start(1)].strip()
+        return name, ptype or "unknown"
+
+    # Generic trailing identifier.
+    m = re.search(r"([A-Za-z_]\w*)\s*$", no_default)
+    if m:
+        name = m.group(1)
+        ptype = no_default[:m.start(1)].strip()
+        return name, ptype or "unknown"
+
+    return raw, "unknown"
 
 
 def find_matching_brace(text, pos):
@@ -840,6 +972,91 @@ def find_matching_brace(text, pos):
             depth -= 1
             if depth == 0:
                 return i
+
+        i += 1
+
+    return -1
+
+
+def find_matching_paren(text, pos):
+    """Find matching ')' for '(' at position pos, honoring nested parens and literals/comments."""
+    if pos < 0 or pos >= len(text) or text[pos] != "(":
+        return -1
+
+    depth = 0
+    i = pos
+    n = len(text)
+
+    in_str = False
+    in_char = False
+    in_line_comment = False
+    in_block_comment = False
+    escape = False
+
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if in_str:
+            if not escape and ch == '"':
+                in_str = False
+            escape = (ch == "\\" and not escape)
+            i += 1
+            continue
+
+        if in_char:
+            if not escape and ch == "'":
+                in_char = False
+            escape = (ch == "\\" and not escape)
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+
+        if ch == '"':
+            in_str = True
+            escape = False
+            i += 1
+            continue
+
+        if ch == "'":
+            in_char = True
+            escape = False
+            i += 1
+            continue
+
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+            i += 1
+            continue
 
         i += 1
 

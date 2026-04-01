@@ -319,9 +319,11 @@ def test_help_command_prints_capabilities_without_llm_call(tmp_path, monkeypatch
     ask_app.main()
     out = capsys.readouterr().out
 
-    assert "or 'help' to see examples" in out
-    assert "What I can do:" in out
-    assert "Example queries:" in out
+    out_lower = out.lower()
+    assert "quit" in out_lower and "help" in out_lower
+    assert "what i can do" in out_lower
+    assert "example quer" in out_lower
+    assert "list functions" in out_lower
 
 
 def test_example_generation_does_not_emit_listing_verification_warning(tmp_path, monkeypatch, capsys):
@@ -369,7 +371,19 @@ def test_example_generation_does_not_emit_listing_verification_warning(tmp_path,
     _write_json(index_dir / "called_by.json", {})
 
     def _fake_post(_url, **_kwargs):
-        return _Resp({"response": "fprintf(stderr, \"demo\");"})
+        return _Resp({
+            "response": (
+                "```cpp\n"
+                "int main() {\n"
+                "    // demo call\n"
+                "    return 0;\n"
+                "}\n"
+                "```\n"
+                "Evidence from codebase:\n"
+                "- File: `/repo/src/llama.cpp:100-180`\n"
+                "- Signature: `llama_sampler_init_grammar_lazy_patterns(const struct llama_vocab * vocab, const char * grammar_str)`\n"
+            )
+        })
 
     monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(len(meta)))
     monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
@@ -393,7 +407,210 @@ def test_example_generation_does_not_emit_listing_verification_warning(tmp_path,
 
     assert "Type: example_generation" in out
     assert "[⚠️  VERIFICATION WARNING]" not in out
+    assert "[⚠️  EXAMPLE VERIFICATION WARNING]" not in out
     assert "Unknown functions (not found in index)" not in out
+
+
+def test_example_generation_prompt_contains_real_target_and_caller_locations(tmp_path, monkeypatch, capsys):
+    index_dir = tmp_path / "index_data"
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = [
+        {
+            "id": 0,
+            "name": "main",
+            "file": "/repo/tools/player/main.cpp",
+            "start_line": 10,
+            "end_line": 80,
+            "signature": "main(int argc, char ** argv)",
+            "parameters": [
+                {"name": "argc", "type": "int", "raw": "int argc"},
+                {"name": "argv", "type": "char **", "raw": "char ** argv"},
+            ],
+            "code": "int main(int argc, char ** argv) { ma_device_init__dsound(&device, &cfg, &pb, &cp); return 0; }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": False,
+            "has_error_handling": True,
+        },
+        {
+            "id": 1,
+            "name": "ma_device_init__dsound",
+            "file": "/repo/vendor/miniaudio/miniaudio.h",
+            "start_line": 26135,
+            "end_line": 26407,
+            "signature": "ma_device_init__dsound(ma_device* pDevice, const ma_device_config* pConfig, ma_device_descriptor* pDescriptorPlayback, ma_device_descriptor* pDescriptorCapture)",
+            "parameters": [
+                {"name": "pDevice", "type": "ma_device*", "raw": "ma_device* pDevice"},
+                {"name": "pConfig", "type": "const ma_device_config*", "raw": "const ma_device_config* pConfig"},
+            ],
+            "code": "ma_result ma_device_init__dsound(ma_device* pDevice, const ma_device_config* pConfig, ma_device_descriptor* pDescriptorPlayback, ma_device_descriptor* pDescriptorCapture) { return MA_SUCCESS; }",
+            "has_stdin": False,
+            "has_file_input": False,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": True,
+            "has_error_handling": True,
+        },
+    ]
+
+    with open(index_dir / "meta.jsonl", "w", encoding="utf-8") as f:
+        for row in meta:
+            f.write(json.dumps(row) + "\n")
+
+    _write_json(index_dir / "lexical_index.json", {})
+    _write_json(index_dir / "special_indices.json", {
+        "stdin": [],
+        "file_input": [0],
+        "api_calls": [],
+        "output": [],
+        "memory_management": [1],
+        "error_handling": [0, 1],
+        "by_type": {"byte_array": [], "string": [], "integer": []},
+    })
+    _write_json(index_dir / "symbols.json", {"main": [0], "ma_device_init__dsound": [1]})
+    _write_json(index_dir / "call_graph.json", {
+        "0": {"called_by": [], "resolved_calls": [1]},
+        "1": {"called_by": [0], "resolved_calls": []},
+    })
+    _write_json(index_dir / "called_by.json", {"0": [], "1": [0], "main": [], "ma_device_init__dsound": [0]})
+
+    captured_prompt = {}
+
+    def _fake_post(_url, **kwargs):
+        payload = kwargs.get("json") or {}
+        captured_prompt["prompt"] = payload["prompt"]
+        return _Resp({"response": "OK"})
+
+    monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(len(meta)))
+    monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
+    monkeypatch.setattr(ask_app, "CrossEncoder", _DummyCrossEncoder)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _fake_post)
+
+    inputs = iter([
+        "Write an example of ma_device_init__dsound function that is called from main function and its parameters are constructed from file bytes given in argv[1]",
+        "quit",
+    ])
+    monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
+    monkeypatch.setattr(sys, "argv", [
+        "ask_fuzz_coder.py",
+        "--index_dir", str(index_dir),
+        "--model", "dummy-model",
+        "--verbose",
+    ])
+
+    ask_app.main()
+    out = capsys.readouterr().out
+    assert "Type: example_generation" in out
+
+    prompt = captured_prompt["prompt"]
+    assert "Include a short \"Evidence from codebase\" note" in prompt
+    assert "File: /repo/tools/player/main.cpp:10-80" in prompt
+    assert "File: /repo/vendor/miniaudio/miniaudio.h:26135-26407" in prompt
+    assert "main(int argc, char ** argv)" in prompt
+    assert "ma_device_init__dsound(ma_device* pDevice" in prompt
+
+
+def test_example_generation_invalid_response_is_replaced_with_context_grounded_fallback(tmp_path, monkeypatch, capsys):
+    index_dir = tmp_path / "index_data"
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = [
+        {
+            "id": 0,
+            "name": "main",
+            "file": "/repo/tools/player/main.cpp",
+            "start_line": 10,
+            "end_line": 80,
+            "signature": "main(int argc, char ** argv)",
+            "parameters": [
+                {"name": "argc", "type": "int", "raw": "int argc"},
+                {"name": "argv", "type": "char **", "raw": "char ** argv"},
+            ],
+            "code": "int main(int argc, char ** argv) { ma_device_init__dsound(&device, &cfg, &pb, &cp); return 0; }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": False,
+            "has_error_handling": True,
+        },
+        {
+            "id": 1,
+            "name": "ma_device_init__dsound",
+            "file": "/repo/vendor/miniaudio/miniaudio.h",
+            "start_line": 26135,
+            "end_line": 26407,
+            "signature": "ma_device_init__dsound(ma_device* pDevice, const ma_device_config* pConfig, ma_device_descriptor* pDescriptorPlayback, ma_device_descriptor* pDescriptorCapture)",
+            "parameters": [
+                {"name": "pDevice", "type": "ma_device*", "raw": "ma_device* pDevice"},
+                {"name": "pConfig", "type": "const ma_device_config*", "raw": "const ma_device_config* pConfig"},
+                {"name": "pDescriptorPlayback", "type": "ma_device_descriptor*", "raw": "ma_device_descriptor* pDescriptorPlayback"},
+                {"name": "pDescriptorCapture", "type": "ma_device_descriptor*", "raw": "ma_device_descriptor* pDescriptorCapture"},
+            ],
+            "code": "ma_result ma_device_init__dsound(ma_device* pDevice, const ma_device_config* pConfig, ma_device_descriptor* pDescriptorPlayback, ma_device_descriptor* pDescriptorCapture) { return MA_SUCCESS; }",
+            "has_stdin": False,
+            "has_file_input": False,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": True,
+            "has_error_handling": True,
+        },
+    ]
+
+    with open(index_dir / "meta.jsonl", "w", encoding="utf-8") as f:
+        for row in meta:
+            f.write(json.dumps(row) + "\n")
+
+    _write_json(index_dir / "lexical_index.json", {})
+    _write_json(index_dir / "special_indices.json", {
+        "stdin": [],
+        "file_input": [0],
+        "api_calls": [],
+        "output": [],
+        "memory_management": [1],
+        "error_handling": [0, 1],
+        "by_type": {"byte_array": [0], "string": [], "integer": []},
+    })
+    _write_json(index_dir / "symbols.json", {"main": [0], "ma_device_init__dsound": [1]})
+    _write_json(index_dir / "call_graph.json", {
+        "0": {"called_by": [], "resolved_calls": [1]},
+        "1": {"called_by": [0], "resolved_calls": []},
+    })
+    _write_json(index_dir / "called_by.json", {"0": [], "1": [0], "main": [], "ma_device_init__dsound": [0]})
+
+    def _fake_post(_url, **_kwargs):
+        # Deliberately ungrounded response: no File/Signature evidence.
+        return _Resp({"response": "Use some fake function style example without evidence."})
+
+    monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(len(meta)))
+    monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
+    monkeypatch.setattr(ask_app, "CrossEncoder", _DummyCrossEncoder)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _fake_post)
+
+    inputs = iter([
+        "Write an example of ma_device_init__dsound function that is called from main function and its parameters are constructed from file bytes given in argv[1]",
+        "quit",
+    ])
+    monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
+    monkeypatch.setattr(sys, "argv", [
+        "ask_fuzz_coder.py",
+        "--index_dir", str(index_dir),
+        "--model", "dummy-model",
+        "--verbose",
+    ])
+
+    ask_app.main()
+    out = capsys.readouterr().out
+
+    assert "[⚠️  EXAMPLE VERIFICATION WARNING]" in out
+    assert "Replaced model output with deterministic context-based example" in out
+    assert "Example Code (deterministic context-grounded fallback)" in out
+    assert "Evidence from codebase:" in out
+    assert "File: `/repo/vendor/miniaudio/miniaudio.h:26135-26407`" in out
+    assert "Signature: `ma_device_init__dsound(" in out
 
 
 def test_example_generation_missing_target_function_fails_fast_without_llm(tmp_path, monkeypatch, capsys):

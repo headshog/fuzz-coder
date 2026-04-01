@@ -1,6 +1,9 @@
+import pytest
+
 from fuzz_coder.ask import core as ask_core
+from fuzz_coder.index import app as index_app
 from fuzz_coder.index import core as index_core
-from fuzz_coder.languages.registry import get_language_profile, get_supported_language_names
+from fuzz_coder.languages.registry import get_language_profile
 
 
 def test_call_llm_returns_structured_status(monkeypatch):
@@ -99,7 +102,140 @@ def test_build_call_graph_prefers_same_file_and_avoids_ambiguous_cross_file():
 
     assert call_graph[2]["resolved_calls"] == [0]
     assert call_graph[3]["resolved_calls"] == []
+    assert call_graph[0]["called_by"] == [2]
+    assert call_graph[1]["called_by"] == []
+    assert called_by["0"] == [2]
     assert 2 in called_by["foo"]
+
+
+def test_build_call_graph_skips_ambiguous_cross_file_even_if_signature_matches():
+    chunks = [
+        {
+            "id": 0,
+            "name": "foo",
+            "signature": "foo(int x)",
+            "file": "/repo/a.cpp",
+            "body": "return x;",
+        },
+        {
+            "id": 1,
+            "name": "foo",
+            "signature": "foo(int x)",
+            "file": "/repo/b.cpp",
+            "body": "return x + 1;",
+        },
+        {
+            "id": 2,
+            "name": "caller",
+            "signature": "caller()",
+            "file": "/repo/c.cpp",
+            "body": "return foo(1);",
+        },
+    ]
+
+    call_graph, called_by = index_core.build_call_graph(chunks)
+
+    assert call_graph[2]["resolved_calls"] == []
+    assert call_graph[0]["called_by"] == []
+    assert call_graph[1]["called_by"] == []
+    assert called_by["0"] == []
+    assert called_by["1"] == []
+
+
+def test_build_call_graph_uses_namespace_and_arity_for_overload_resolution():
+    chunks = [
+        {
+            "id": 0,
+            "name": "target",
+            "signature": "target(int x)",
+            "file": "/repo/mod/a.cpp",
+            "body": "return x;",
+        },
+        {
+            "id": 1,
+            "name": "target",
+            "signature": "target(const uint8_t * data, size_t n)",
+            "file": "/repo/mod/a.cpp",
+            "body": "return (int)n;",
+        },
+        {
+            "id": 2,
+            "name": "caller_one",
+            "signature": "caller_one()",
+            "file": "/repo/mod/a.cpp",
+            "body": "return ns::target(123);",
+        },
+        {
+            "id": 3,
+            "name": "caller_two",
+            "signature": "caller_two(const uint8_t * data, size_t n)",
+            "file": "/repo/mod/a.cpp",
+            "body": "return ns::target(data, n);",
+        },
+    ]
+
+    call_graph, called_by = index_core.build_call_graph(chunks)
+
+    assert call_graph[2]["resolved_calls"] == [0]
+    assert call_graph[3]["resolved_calls"] == [1]
+    assert any(d["qualified"] == "ns::target" and d["arity"] == 1 for d in call_graph[2]["call_details"])
+    assert any(d["qualified"] == "ns::target" and d["arity"] == 2 for d in call_graph[3]["call_details"])
+    assert 2 in called_by["0"]
+    assert 3 in called_by["1"]
+
+
+def test_build_call_graph_called_by_is_correct_for_same_name_same_arity_in_different_files():
+    chunks = [
+        {
+            "id": 0,
+            "name": "foo",
+            "signature": "foo(int x)",
+            "file": "/repo/a.cpp",
+            "body": "return x;",
+        },
+        {
+            "id": 1,
+            "name": "foo",
+            "signature": "foo(int x)",
+            "file": "/repo/b.cpp",
+            "body": "return x + 1;",
+        },
+        {
+            "id": 2,
+            "name": "caller_a",
+            "signature": "caller_a()",
+            "file": "/repo/a.cpp",
+            "body": "return foo(1);",
+        },
+        {
+            "id": 3,
+            "name": "caller_b",
+            "signature": "caller_b()",
+            "file": "/repo/b.cpp",
+            "body": "return foo(2);",
+        },
+        {
+            "id": 4,
+            "name": "caller_ambiguous",
+            "signature": "caller_ambiguous()",
+            "file": "/repo/c.cpp",
+            "body": "return foo(3);",
+        },
+    ]
+
+    call_graph, called_by = index_core.build_call_graph(chunks)
+
+    assert call_graph[2]["resolved_calls"] == [0]
+    assert call_graph[3]["resolved_calls"] == [1]
+    assert call_graph[4]["resolved_calls"] == []
+
+    assert call_graph[0]["called_by"] == [2]
+    assert call_graph[1]["called_by"] == [3]
+
+    # Name-based reverse index remains legacy aggregate, id-based data stays precise.
+    assert called_by["foo"] == [2, 3]
+    assert called_by["0"] == [2]
+    assert called_by["1"] == [3]
 
 
 def test_regex_extractor_skips_prototypes_and_uses_local_body_brace():
@@ -196,6 +332,38 @@ def test_example_generation_candidates_focus_on_named_function_and_neighbors():
     assert 2 in candidates
 
 
+def test_example_generation_primary_function_has_priority_over_secondary_mentions():
+    planner = ask_core.QueryPlanner(
+        special_indices={},
+        symbols={"target_fn": [10], "main": [1, 2, 3]},
+        call_graph={"10": {"called_by": [20], "resolved_calls": [30]}},
+        called_by={},
+        meta=[],
+    )
+    analysis = {
+        "query_type": "example_generation",
+        "function_names": ["target_fn", "main"],
+        "primary_function_name": "target_fn",
+        "needs_stdin": False,
+        "needs_file": False,
+        "needs_api": False,
+        "needs_output": False,
+        "needs_memory_mgmt": False,
+        "needs_error_handling": False,
+        "path_filters": [],
+        "needs_fuzz_targets": False,
+        "requested_types": [],
+        "expand_callers": False,
+        "expand_callees": False,
+        "exclude_output": False,
+    }
+
+    candidates = planner.get_search_candidates(analysis, k=10)
+    assert candidates[0] == 10
+    assert 20 in candidates
+    assert 30 in candidates
+
+
 def test_regex_extractor_line_range_uses_real_matching_brace():
     text = (
         "int foo(int x) {\n"
@@ -222,10 +390,94 @@ def test_regex_extractor_line_range_uses_real_matching_brace():
     assert by_name["bar"]["start_line"] == 10
     assert by_name["bar"]["end_line"] == 12
 
-def test_language_registry_includes_java_profile():
-    names = get_supported_language_names()
-    assert "c_cpp" in names
-    assert "java" in names
 
+def test_regex_extractor_handles_long_multiline_signature():
+    params = ",\n".join([f"    int p{i}" for i in range(1, 31)])
+    text = (
+        "int very_long_signature(\n"
+        f"{params}\n"
+        ") {\n"
+        "    return p1;\n"
+        "}\n"
+    )
+
+    funcs = index_core.extract_functions_regex("sample.cpp", text)
+    by_name = {f["name"]: f for f in funcs}
+
+    assert "very_long_signature" in by_name
+    assert len(by_name["very_long_signature"]["parameters"]) == 30
+
+
+def test_regex_parameter_parser_handles_templates_function_pointers_and_defaults():
+    text = (
+        "int complex_params(\n"
+        "    std::map<std::string, std::vector<int>> data,\n"
+        "    void (*cb)(int, int),\n"
+        "    std::array<int, 3> arr = {1, 2, 3}\n"
+        ") {\n"
+        "    return 0;\n"
+        "}\n"
+    )
+
+    funcs = index_core.extract_functions_regex("sample.cpp", text)
+    by_name = {f["name"]: f for f in funcs}
+    assert "complex_params" in by_name
+    params = by_name["complex_params"]["parameters"]
+    assert len(params) == 3
+    assert params[0]["name"] == "data"
+    assert params[1]["name"] == "cb"
+    assert params[2]["name"] == "arr"
+
+
+@pytest.mark.parametrize(
+    "params_text, expected_count, expected_names",
+    [
+        (
+            "const std::function<void(int, int)> & cb, std::vector<std::pair<int, int>> xs = {{1, 2}}",
+            2,
+            ["cb", "xs"],
+        ),
+        (
+            "int (*fn)(int, int), std::array<int, 3> arr = {1, 2, 3}, const char * label = \"x,y\"",
+            3,
+            ["fn", "arr", "label"],
+        ),
+        (
+            "const char * s = \"a,b\", int values[4], std::vector<int> v = std::vector<int>{1,2,3}",
+            3,
+            ["s", "values", "v"],
+        ),
+    ],
+)
+def test_split_top_level_params_handles_edge_cases(params_text, expected_count, expected_names):
+    parts = index_core.split_top_level_params(params_text)
+    assert len(parts) == expected_count
+    parsed = index_core.parse_parameters_simple(params_text)
+    assert [p["name"] for p in parsed] == expected_names
+
+
+def test_apply_language_profile_java_changes_detection_behavior():
+    try:
+        index_app.apply_language_profile("java")
+
+        assert index_core.SUPPORTED_EXT == {".java"}
+        input_info = index_core.detect_input_type(
+            "byte[] data = Files.readAllBytes(Path.of(argv[0]));"
+        )
+        features = index_core.detect_code_features(
+            "ByteBuffer bb = ByteBuffer.allocateDirect(16); try { System.out.println(bb); } catch (Exception e) {}"
+        )
+        assert input_info["has_file_input"] is True
+        assert "byte_array" in features["types_used"]
+        assert features["uses_memory_management"] is True
+        assert features["has_error_handling"] is True
+    finally:
+        # Keep global parser/search patterns deterministic for other tests.
+        index_app.apply_language_profile("c_cpp")
+
+
+def test_language_registry_returns_java_profile_with_expected_surface():
     java_profile = get_language_profile("java")
     assert ".java" in java_profile.supported_ext
+    assert "class" in java_profile.control_keywords
+    assert any("readAllBytes" in p for p in java_profile.file_input_patterns)

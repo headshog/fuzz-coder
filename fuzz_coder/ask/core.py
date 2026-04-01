@@ -13,6 +13,7 @@ from .llm import call_llm as _call_llm_impl
 from .prompting import build_prompt as _build_prompt_impl
 from .prompting import _build_thinking_prompt_with_limit as _build_thinking_prompt_impl
 from .verification import verify_answer_with_context as _verify_answer_with_context_impl
+from .verification import verify_example_answer_with_context as _verify_example_answer_with_context_impl
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -78,6 +79,15 @@ COMMON_QUERY_WORDS = {
     "write", "list", "of", "functions", "that", "can", "be", "used", "for", "fuzzing",
     "give", "an", "example", "from", "main", "function", "called", "call", "how",
     "to", "is", "in", "codebase", "show", "me", "the", "a", "and", "or", "with",
+}
+
+# Words that should not become function targets when seen as plain tokens,
+# even if such symbols exist somewhere in the index.
+QUERY_SYMBOL_BLACKLIST = {
+    "write", "list", "show", "find", "give", "make", "need", "example",
+    "function", "functions", "called", "calling", "from", "for", "with",
+    "that", "this", "these", "those", "can", "used", "use", "is", "are",
+    "of", "in", "on", "to", "an", "a", "the",
 }
 
 
@@ -205,25 +215,43 @@ def extract_function_names_from_text(text, symbols):
     return found
 
 
-def extract_function_like_candidates(query):
-    """Extract function-like identifiers from user query."""
+def extract_function_like_candidates(query, known_symbols_by_lower=None):
+    """Extract function-like identifiers from user query.
+
+    Keeps explicit symbol-like tokens and also plain identifiers that are
+    present in the known symbol table (e.g. "split", "main").
+    """
     candidates = []
+    known_symbols_by_lower = known_symbols_by_lower or {}
 
     # Prefer explicit code-style references.
-    candidates.extend(re.findall(r"`([^`]+)`", query))
-    candidates.extend(re.findall(r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*(?=\()", query))
-    candidates.extend(re.findall(r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b", query))
+    for t in re.findall(r"`([^`]+)`", query):
+        candidates.append((t, "explicit"))
+    for t in re.findall(r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*(?=\()", query):
+        candidates.append((t, "call_like"))
+
+    # Function-focused phrase patterns (captures plain names like "split" or "main").
+    phrase_patterns = [
+        r"\b(?:of|for|from|in|using|use|invoke|invoking|calling|call)\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+(?:function|method)\b",
+        r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+(?:function|method)\b",
+    ]
+    for pat in phrase_patterns:
+        for t in re.findall(pat, query, flags=re.IGNORECASE):
+            candidates.append((t, "phrase"))
+
+    # Fallback: generic identifier scan.
+    for t in re.findall(r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b", query):
+        candidates.append((t, "token"))
 
     out = []
     seen = set()
-    for raw in candidates:
+    for raw, source in candidates:
         token = (raw or "").strip().strip("`'\".,:;!?()[]{}")
         if not token:
             continue
 
         token_lower = token.lower()
-        if token_lower in COMMON_QUERY_WORDS:
-            continue
+        known_symbol_match = token_lower in known_symbols_by_lower
 
         # Keep identifiers that look like actual symbols, avoid plain prose.
         looks_like_symbol = (
@@ -231,14 +259,74 @@ def extract_function_like_candidates(query):
             "::" in token or
             (any(ch.isupper() for ch in token[1:]) and any(ch.islower() for ch in token))
         )
-        if not looks_like_symbol:
-            continue
+
+        if source == "token":
+            if token_lower in QUERY_SYMBOL_BLACKLIST:
+                continue
+            if token_lower in COMMON_QUERY_WORDS and token_lower != "main":
+                continue
+            if len(token) < 3 and not known_symbol_match:
+                continue
+            if not (looks_like_symbol or known_symbol_match):
+                continue
+        else:
+            # For explicit/call-like/phrase sources keep strong mentions,
+            # but still drop obvious language words.
+            if token_lower in QUERY_SYMBOL_BLACKLIST and token_lower != "main":
+                continue
 
         if token_lower not in seen:
             seen.add(token_lower)
             out.append(token)
 
     return out
+
+
+def choose_primary_example_function(query, resolved_function_names):
+    """Pick primary target function for example-generation queries.
+
+    Heuristics:
+    - Prefer symbol after calling/invoke/use/example-of phrases.
+    - Treat "from <fn> function" as context function, not primary target.
+    - If ambiguous and `main` is present with others, prefer non-main.
+    """
+    if not resolved_function_names:
+        return None
+    if len(resolved_function_names) == 1:
+        return resolved_function_names[0]
+
+    q = query or ""
+    patterns = [
+        r"\b(?:calling|call|invoke|invoking|using|use)\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b",
+        r"\b(?:example|пример)\s+(?:of\s+)?([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b",
+        r"\b(?:пример)\s+(?:вызова|использования)\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b",
+    ]
+    lowered_map = {fn.lower(): fn for fn in resolved_function_names}
+    for pat in patterns:
+        for m in re.finditer(pat, q, flags=re.IGNORECASE):
+            cand = (m.group(1) or "").strip().lower()
+            if cand in lowered_map:
+                return lowered_map[cand]
+
+    helper_context = set()
+    for m in re.finditer(
+        r"\bfrom\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+function\b",
+        q,
+        flags=re.IGNORECASE,
+    ):
+        helper_context.add((m.group(1) or "").strip().lower())
+
+    if helper_context:
+        for fn in resolved_function_names:
+            if fn.lower() not in helper_context:
+                return fn
+
+    if any(fn.lower() == "main" for fn in resolved_function_names):
+        for fn in resolved_function_names:
+            if fn.lower() != "main":
+                return fn
+
+    return resolved_function_names[0]
 
 
 def normalize_type_name(type_name):
@@ -401,6 +489,12 @@ def collect_positive_constraint_matches(chunk, analysis):
         matches["file"] = bool(chunk.get("has_file_input"))
     if analysis.get("needs_api"):
         matches["api"] = bool(chunk.get("has_api_call"))
+    if analysis.get("needs_output"):
+        matches["output"] = bool(chunk.get("has_output"))
+    if analysis.get("needs_memory_mgmt"):
+        matches["memory_mgmt"] = bool(chunk.get("uses_memory_management"))
+    if analysis.get("needs_error_handling"):
+        matches["error_handling"] = bool(chunk.get("has_error_handling"))
     if analysis.get("requested_types"):
         matches["types"] = chunk_matches_requested_types(chunk, analysis["requested_types"])
     if analysis.get("needs_parse_like"):
@@ -751,6 +845,483 @@ def build_listing_answer_from_context(frags, analysis=None):
     return "\n".join(lines)
 
 
+def _find_matching_paren_text(text, open_idx):
+    """Find matching ')' for '(' with nested bracket and literal awareness."""
+    if open_idx < 0 or open_idx >= len(text) or text[open_idx] != "(":
+        return -1
+
+    depth = 0
+    i = open_idx
+    n = len(text)
+    in_str = False
+    in_char = False
+    in_line_comment = False
+    in_block_comment = False
+    escape = False
+
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if in_str:
+            if not escape and ch == '"':
+                in_str = False
+            escape = (ch == "\\" and not escape)
+            i += 1
+            continue
+
+        if in_char:
+            if not escape and ch == "'":
+                in_char = False
+            escape = (ch == "\\" and not escape)
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == '"':
+            in_str = True
+            escape = False
+            i += 1
+            continue
+        if ch == "'":
+            in_char = True
+            escape = False
+            i += 1
+            continue
+
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+
+        i += 1
+
+    return -1
+
+
+def _split_top_level_arguments(args_text):
+    out = []
+    cur = []
+    depth_angle = 0
+    depth_paren = 0
+    depth_brace = 0
+    depth_bracket = 0
+    in_str = False
+    in_char = False
+    escape = False
+
+    for ch in args_text:
+        if in_str:
+            cur.append(ch)
+            if not escape and ch == '"':
+                in_str = False
+            escape = (ch == "\\" and not escape)
+            continue
+
+        if in_char:
+            cur.append(ch)
+            if not escape and ch == "'":
+                in_char = False
+            escape = (ch == "\\" and not escape)
+            continue
+
+        if ch == '"':
+            in_str = True
+            escape = False
+            cur.append(ch)
+            continue
+        if ch == "'":
+            in_char = True
+            escape = False
+            cur.append(ch)
+            continue
+
+        if ch == "<":
+            depth_angle += 1
+            cur.append(ch)
+            continue
+        if ch == ">":
+            depth_angle = max(0, depth_angle - 1)
+            cur.append(ch)
+            continue
+        if ch == "(":
+            depth_paren += 1
+            cur.append(ch)
+            continue
+        if ch == ")":
+            depth_paren = max(0, depth_paren - 1)
+            cur.append(ch)
+            continue
+        if ch == "{":
+            depth_brace += 1
+            cur.append(ch)
+            continue
+        if ch == "}":
+            depth_brace = max(0, depth_brace - 1)
+            cur.append(ch)
+            continue
+        if ch == "[":
+            depth_bracket += 1
+            cur.append(ch)
+            continue
+        if ch == "]":
+            depth_bracket = max(0, depth_bracket - 1)
+            cur.append(ch)
+            continue
+
+        if ch == "," and depth_angle == 0 and depth_paren == 0 and depth_brace == 0 and depth_bracket == 0:
+            part = "".join(cur).strip()
+            if part:
+                out.append(part)
+            cur = []
+            continue
+
+        cur.append(ch)
+
+    tail = "".join(cur).strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
+def _extract_call_argument_lists(code, target_name, limit=3):
+    if not code or not target_name:
+        return []
+
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9_~])(?:[A-Za-z_]\w*::)*{re.escape(target_name)}\s*\("
+    )
+    out = []
+    seen = set()
+    for m in pattern.finditer(code):
+        open_idx = code.find("(", m.start())
+        if open_idx == -1:
+            continue
+        close_idx = _find_matching_paren_text(code, open_idx)
+        if close_idx == -1:
+            continue
+
+        args_text = code[open_idx + 1:close_idx]
+        args = _split_top_level_arguments(args_text)
+        expr = code[m.start():close_idx + 1].strip()
+
+        key = (expr, tuple(args))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"expr": expr, "args": args})
+        if len(out) >= limit:
+            break
+
+    return out
+
+
+def _base_decl_type(type_text):
+    t = re.sub(r"\bconst\b", " ", type_text or "")
+    t = t.replace("*", " ").replace("&", " ")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t or "int"
+
+
+def _next_unique_name(base, used):
+    name = re.sub(r"\W+", "_", base or "").strip("_")
+    if not name:
+        name = "arg"
+    if name[0].isdigit():
+        name = f"v_{name}"
+    candidate = name
+    idx = 2
+    while candidate in used:
+        candidate = f"{name}_{idx}"
+        idx += 1
+    used.add(candidate)
+    return candidate
+
+
+def _is_simple_literal(expr):
+    if not expr:
+        return False
+    return re.fullmatch(
+        r"(?:[-+]?\d+(?:\.\d+)?(?:[uUlLfF]*)|nullptr|NULL|true|false|'.*'|\".*\")",
+        expr.strip(),
+    ) is not None
+
+
+def _is_simple_identifier(expr):
+    return re.fullmatch(r"[A-Za-z_]\w*", (expr or "").strip()) is not None
+
+
+def _is_file_size_param(type_text, name):
+    t = (type_text or "").lower()
+    n = (name or "").lower()
+    if any(k in n for k in ["size", "len", "length", "count", "bytes", "n"]):
+        return any(k in t for k in [
+            "size_t", "ssize_t", "int", "long", "uint", "int32", "int64", "uint32", "uint64",
+        ])
+    return False
+
+
+def _format_file_loc(chunk):
+    return f"{chunk.get('file', '')}:{chunk.get('start_line', '?')}-{chunk.get('end_line', '?')}"
+
+
+def _build_param_binding(param, analysis, arg_hint, used_names):
+    ptype = re.sub(r"\s+", " ", str(param.get("type", "")).strip())
+    pname = str(param.get("name", "")).strip() or "arg"
+    ptype_lower = ptype.lower()
+    needs_file = bool((analysis or {}).get("needs_file"))
+
+    is_pointer = "*" in ptype
+    is_ref = "&" in ptype
+    is_std_string = ("std::string" in ptype) or ("string" in ptype_lower)
+    is_char_or_byte_ptr = any(x in ptype_lower for x in [
+        "char *", "char*", "uint8_t *", "uint8_t*", "unsigned char *", "unsigned char*",
+        "std::byte *", "std::byte*", "void *", "void*",
+    ])
+
+    value_type = ptype.replace("&", "").strip() or _base_decl_type(ptype)
+    decls = []
+
+    hint = (arg_hint or "").strip()
+    if hint:
+        if hint.startswith("&") and _is_simple_identifier(hint[1:]):
+            var = _next_unique_name(hint[1:], used_names)
+            decls.append(f"{_base_decl_type(ptype)} {var}{{}};")
+            return decls, f"&{var}"
+
+        if _is_simple_literal(hint):
+            return decls, hint
+
+        if _is_simple_identifier(hint):
+            if is_pointer:
+                storage = _next_unique_name(f"{hint}_obj", used_names)
+                ptr_name = _next_unique_name(hint, used_names)
+                decls.append(f"{_base_decl_type(ptype)} {storage}{{}};")
+                decls.append(f"{ptype} {ptr_name} = &{storage};")
+                return decls, ptr_name
+            if is_std_string and needs_file:
+                var = _next_unique_name(hint, used_names)
+                decls.append(f"std::string {var}(input_bytes.begin(), input_bytes.end());")
+                return decls, var
+            var = _next_unique_name(hint, used_names)
+            decls.append(f"{value_type} {var}{{}};")
+            return decls, var
+
+    if needs_file and is_char_or_byte_ptr and is_pointer:
+        return decls, f"reinterpret_cast<{ptype}>(input_bytes.data())"
+
+    if needs_file and _is_file_size_param(ptype, pname):
+        cast_type = value_type or "size_t"
+        return decls, f"static_cast<{cast_type}>(input_bytes.size())"
+
+    if is_std_string and needs_file:
+        var = _next_unique_name(f"{pname}_str", used_names)
+        decls.append(f"std::string {var}(input_bytes.begin(), input_bytes.end());")
+        return decls, var
+
+    if is_pointer:
+        storage = _next_unique_name(f"{pname}_obj", used_names)
+        ptr_name = _next_unique_name(pname, used_names)
+        decls.append(f"{_base_decl_type(ptype)} {storage}{{}};")
+        decls.append(f"{ptype} {ptr_name} = &{storage};")
+        return decls, ptr_name
+
+    if is_ref:
+        var = _next_unique_name(pname, used_names)
+        decls.append(f"{_base_decl_type(ptype)} {var}{{}};")
+        return decls, var
+
+    if "bool" in ptype_lower:
+        var = _next_unique_name(pname, used_names)
+        decls.append(f"{value_type} {var} = false;")
+        return decls, var
+
+    if any(t in ptype_lower for t in ["float", "double"]):
+        var = _next_unique_name(pname, used_names)
+        decls.append(f"{value_type} {var} = 0;")
+        return decls, var
+
+    if any(t in ptype_lower for t in ["int", "long", "short", "size_t", "uint"]):
+        var = _next_unique_name(pname, used_names)
+        decls.append(f"{value_type} {var} = 0;")
+        return decls, var
+
+    var = _next_unique_name(pname, used_names)
+    decls.append(f"{value_type} {var}{{}};")
+    return decls, var
+
+
+def build_example_answer_from_context(frags, analysis=None):
+    """Deterministic fallback for grounded example-generation answers."""
+    analysis = analysis or {}
+    clean_frags = [f for f in frags if is_valid_function_chunk(f)]
+    if not clean_frags:
+        return "Not enough verified context to build a reliable example."
+
+    primary_name = analysis.get("primary_function_name")
+    target = None
+    if primary_name:
+        for f in clean_frags:
+            if f.get("name") == primary_name:
+                target = f
+                break
+    if target is None:
+        target = clean_frags[0]
+
+    target_name = str(target.get("name", "")).strip() or "target_function"
+    target_sig = target.get("signature") or f"{target_name}()"
+    params = list(target.get("parameters") or [])
+
+    caller_candidates = []
+    for f in clean_frags:
+        if f.get("name") == target_name:
+            continue
+        calls = _extract_call_argument_lists(str(f.get("code", "")), target_name, limit=3)
+        if calls:
+            caller_candidates.append((f, calls))
+
+    secondary_names = [n for n in analysis.get("function_names", []) if n != target_name]
+    caller = None
+    caller_calls = []
+    for wanted in secondary_names:
+        for c, calls in caller_candidates:
+            if c.get("name") == wanted:
+                caller = c
+                caller_calls = calls
+                break
+        if caller is not None:
+            break
+    if caller is None and caller_candidates:
+        caller, caller_calls = caller_candidates[0]
+
+    call_hint_args = []
+    observed_call = None
+    if caller_calls:
+        preferred = None
+        for c in caller_calls:
+            if len(c.get("args", [])) == len(params):
+                preferred = c
+                break
+        if preferred is None:
+            preferred = caller_calls[0]
+        call_hint_args = preferred.get("args", [])
+        observed_call = preferred.get("expr")
+
+    header_name = os.path.basename(str(target.get("file", "")))
+    include_target_header = bool(re.search(r"\.(h|hpp|hh|hxx)$", header_name))
+    needs_file_bytes = bool(analysis.get("needs_file"))
+
+    include_lines = [
+        "#include <cstdint>",
+        "#include <cstddef>",
+        "#include <vector>",
+        "#include <string>",
+        "#include <fstream>",
+        "#include <iterator>",
+        "#include <iostream>",
+    ]
+    if include_target_header:
+        include_lines.append(f"#include \"{header_name}\"")
+
+    body_lines = []
+    if needs_file_bytes:
+        body_lines.extend([
+            "if (argc < 2) {",
+            "    std::cerr << \"Usage: \" << argv[0] << \" <input_file>\\n\";",
+            "    return 1;",
+            "}",
+            "",
+            "std::vector<uint8_t> input_bytes;",
+            "std::ifstream in(argv[1], std::ios::binary);",
+            "if (!in) {",
+            "    std::cerr << \"Failed to open input file\\n\";",
+            "    return 1;",
+            "}",
+            "input_bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());",
+            "",
+        ])
+    else:
+        body_lines.append("std::vector<uint8_t> input_bytes;")
+        body_lines.append("")
+
+    used_names = set()
+    decl_lines = []
+    arg_exprs = []
+    for i, p in enumerate(params):
+        hint = call_hint_args[i] if i < len(call_hint_args) else None
+        d, arg = _build_param_binding(p, analysis, hint, used_names)
+        decl_lines.extend(d)
+        arg_exprs.append(arg)
+    body_lines.extend(decl_lines)
+    if decl_lines:
+        body_lines.append("")
+
+    args_joined = ", ".join(arg_exprs)
+    sig_head = target_sig.split(target_name, 1)[0]
+    is_void_return = re.search(r"\bvoid\s*$", sig_head.strip()) is not None
+    if is_void_return:
+        body_lines.append(f"{target_name}({args_joined});")
+    else:
+        body_lines.append(f"auto result = {target_name}({args_joined});")
+        body_lines.append("(void)result;")
+    body_lines.append("return 0;")
+
+    code_lines = []
+    code_lines.extend(include_lines)
+    code_lines.append("")
+    code_lines.append(f"// Target signature (from indexed code): {target_sig}")
+    if observed_call:
+        code_lines.append(f"// Observed call pattern in codebase: {observed_call}")
+    code_lines.append("int main(int argc, char ** argv) {")
+    code_lines.extend([f"    {ln}" if ln else "" for ln in body_lines])
+    code_lines.append("}")
+
+    lines = [
+        "### Example Code (deterministic context-grounded fallback)",
+        "```cpp",
+        "\n".join(code_lines),
+        "```",
+        "",
+        f"Target function: `{target_name}`",
+        "Evidence from codebase:",
+        f"- File: `{_format_file_loc(target)}`",
+        f"- Signature: `{target_sig}`",
+    ]
+    if caller is not None:
+        caller_sig = caller.get("signature") or f"{caller.get('name', 'caller')}()"
+        lines.append(f"- File: `{_format_file_loc(caller)}`")
+        lines.append(f"- Signature: `{caller_sig}`")
+        if observed_call:
+            lines.append(f"- Observed call: `{observed_call}`")
+    else:
+        lines.append("- Note: direct caller context for target function was not found in selected fragments.")
+
+    return "\n".join(lines)
+
+
 class QueryPlanner:
     """Advanced query planner with thinking mode support"""
 
@@ -775,6 +1346,9 @@ class QueryPlanner:
             "needs_stdin": False,
             "needs_file": False,
             "needs_api": False,
+            "needs_output": False,
+            "needs_memory_mgmt": False,
+            "needs_error_handling": False,
             "needs_params": False,
             "needs_types": False,
             "needs_parse_like": False,
@@ -788,6 +1362,7 @@ class QueryPlanner:
             "path_filters": [],
             "exclude_previously_listed": False,
             "function_names": [],
+            "primary_function_name": None,
             "expand_callers": False,
             "expand_callees": False,
             "needs_example": False,
@@ -806,6 +1381,28 @@ class QueryPlanner:
 
         if any(w in query_lower for w in ["api", "http", "request", "network", "curl", "socket", "сеть"]):
             analysis["needs_api"] = True
+
+        # Detect output/error/memory focused queries (kept conservative to avoid
+        # matching imperative phrases like "write a list ...").
+        if any(w in query_lower for w in [
+            "stdout", "stderr", "output", "print", "printf", "fprintf", "cout", "cerr",
+            "clog", "logging", "logger", "log ", "log-", "вывод", "печать", "логг",
+        ]) or re.search(r"\bwrite(s|d|ing)?\s+(to|into)\b", query_lower):
+            analysis["needs_output"] = True
+
+        if any(w in query_lower for w in [
+            "memory", "buffer", "malloc", "calloc", "realloc", "free",
+            "new/delete", "memcpy", "memmove", "heap", "stack",
+            "памят", "буфер", "переполн",
+        ]):
+            analysis["needs_memory_mgmt"] = True
+
+        if any(w in query_lower for w in [
+            "error handling", "error", "errors", "exception", "exceptions",
+            "throw", "catch", "assert", "errno", "validation",
+            "ошиб", "исключен", "валидац",
+        ]):
+            analysis["needs_error_handling"] = True
 
         # Detect parameter-related queries
         if any(w in query_lower for w in ["param", "argument", "arg", "input", "receive", "accept", "take", "переда", "вход", "параметр"]):
@@ -831,7 +1428,10 @@ class QueryPlanner:
             analysis["is_listing"] = True
 
         # Detect explicit function-like mentions from query text.
-        analysis["query_function_candidates"] = extract_function_like_candidates(query)
+        analysis["query_function_candidates"] = extract_function_like_candidates(
+            query,
+            known_symbols_by_lower=self.symbols_by_lower,
+        )
         for cand in analysis["query_function_candidates"]:
             for resolved in self.symbols_by_lower.get(cand.lower(), []):
                 if resolved not in analysis["function_names"]:
@@ -853,6 +1453,8 @@ class QueryPlanner:
         # Detect exclusion constraints
         if query_excludes_output(query_lower):
             analysis["exclude_output"] = True
+            # Negative output constraint overrides positive output intent.
+            analysis["needs_output"] = False
 
         # Detect path/module filters
         analysis["path_filters"] = extract_path_filters_from_query(query)
@@ -872,6 +1474,9 @@ class QueryPlanner:
         positive_signals += int(analysis["needs_stdin"])
         positive_signals += int(analysis["needs_file"])
         positive_signals += int(analysis["needs_api"])
+        positive_signals += int(analysis["needs_output"])
+        positive_signals += int(analysis["needs_memory_mgmt"])
+        positive_signals += int(analysis["needs_error_handling"])
         positive_signals += int(bool(analysis["requested_types"]))
         positive_signals += int(analysis["needs_parse_like"])
         positive_signals += int(analysis["needs_fuzz_targets"])
@@ -898,6 +1503,10 @@ class QueryPlanner:
             # If user named concrete functions, focus retrieval on those instead of broad fuzz-target discovery.
             if analysis["function_names"]:
                 analysis["needs_fuzz_targets"] = False
+                analysis["primary_function_name"] = choose_primary_example_function(
+                    query,
+                    analysis["function_names"],
+                )
 
         # Detect implementation questions
         if any(w in query_lower for w in ["implement", "реализ", "как работает", "how does", "algorithm", "алгоритм"]):
@@ -958,18 +1567,45 @@ class QueryPlanner:
     def get_search_candidates(self, analysis, k=20):
         """Get candidate indices based on query analysis"""
         if analysis.get("query_type") in {"example_generation", "function_specific", "implementation_explanation"} and analysis.get("function_names"):
-            focused = set()
-            for func_name in analysis["function_names"]:
-                focused.update(self.symbols.get(func_name, []))
+            focused = []
+            primary_name = analysis.get("primary_function_name")
+            if analysis.get("query_type") == "example_generation" and primary_name:
+                focus_names = [primary_name]
+            else:
+                focus_names = list(analysis["function_names"])
+
+            for func_name in focus_names:
+                for idx in self.symbols.get(func_name, []):
+                    if idx not in focused:
+                        focused.append(idx)
 
             # Bring immediate call-graph neighborhood for realistic usage examples.
-            expanded = set(focused)
-            for idx in list(focused):
-                cg = self.call_graph.get(str(idx), {})
-                expanded.update(cg.get("called_by", []))
-                expanded.update(cg.get("resolved_calls", []))
+            # Keep deterministic priority: target -> callers -> callees.
+            ordered = []
+            seen = set()
 
-            return sorted(expanded)[: max(k * 3, 30)]
+            def _add_id(x):
+                if x not in seen:
+                    seen.add(x)
+                    ordered.append(x)
+
+            for idx in focused:
+                _add_id(idx)
+            for func_name in analysis.get("function_names", []):
+                if func_name in focus_names:
+                    continue
+                for idx in self.symbols.get(func_name, []):
+                    _add_id(idx)
+            for idx in focused:
+                cg = self.call_graph.get(str(idx), {})
+                for caller in cg.get("called_by", []):
+                    _add_id(caller)
+            for idx in focused:
+                cg = self.call_graph.get(str(idx), {})
+                for callee in cg.get("resolved_calls", []):
+                    _add_id(callee)
+
+            return ordered[: max(k * 3, 30)]
 
         candidates = set()
 
@@ -1070,3 +1706,13 @@ def call_llm(prompt, model, temperature=0.1):
 def verify_answer_with_context(answer, context_frags, known_functions=None):
     """Verify that functions mentioned in answer exist in provided context."""
     return _verify_answer_with_context_impl(answer, context_frags, known_functions=known_functions)
+
+
+def verify_example_answer_with_context(answer, context_frags, target_function=None, known_functions=None):
+    """Verify example-generation answer against file/signature/line evidence and context."""
+    return _verify_example_answer_with_context_impl(
+        answer,
+        context_frags,
+        target_function=target_function,
+        known_functions=known_functions,
+    )
