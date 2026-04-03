@@ -12,6 +12,10 @@ from collections import defaultdict
 from .llm import call_llm as _call_llm_impl
 from .prompting import build_prompt as _build_prompt_impl
 from .prompting import _build_thinking_prompt_with_limit as _build_thinking_prompt_impl
+from .query_analysis import analyze_query_v2 as _analyze_query_v2_impl
+from .query_analysis import compare_analysis as _compare_analysis_impl
+from .example_context import build_example_context as _build_example_context_impl
+from .example_grounding import build_example_context_grounded as _build_example_context_grounded_impl
 from .verification import verify_answer_with_context as _verify_answer_with_context_impl
 from .verification import verify_example_answer_with_context as _verify_example_answer_with_context_impl
 
@@ -68,11 +72,15 @@ FUZZ_TARGET_KEYWORDS = [
 
 PATH_FILTER_PATTERNS = [
     # English: from/in module|directory|subdirectory|folder|path <value>
-    r"\b(?:from|in)\s+(?:the\s+)?(?:module|directory|subdirectory|folder|path)\s+([`\"']?)([^`\"'\n,;]+)\1",
-    r"\bunder\s+([`\"']?)([^`\"'\n,;]+)\1",
+    r"\b(?:from|in)\s+(?:the\s+)?(?:module|directory|subdirectory|folder|path)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1",
+    # English: from/in <value> module|directory|...
+    r"\b(?:from|in)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1\s+(?:module|directory|subdirectory|folder|path)\b",
+    r"\bunder\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1",
     # Russian: из/в модуля|директории|поддиректории|папки <value>
-    r"\bиз\s+(?:модуля|директории|поддиректории|папки)\s+([`\"']?)([^`\"'\n,;]+)\1",
-    r"\bв\s+(?:модуле|директории|поддиректории|папке)\s+([`\"']?)([^`\"'\n,;]+)\1",
+    r"\bиз\s+(?:модуля|директории|поддиректории|папки)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1",
+    r"\bв\s+(?:модуле|директории|поддиректории|папке)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1",
+    # Russian: из/в <value> модуле|директории|...
+    r"\b(?:из|в)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1\s+(?:модуле|модуля|директории|поддиректории|папке)\b",
 ]
 
 COMMON_QUERY_WORDS = {
@@ -88,6 +96,7 @@ QUERY_SYMBOL_BLACKLIST = {
     "function", "functions", "called", "calling", "from", "for", "with",
     "that", "this", "these", "those", "can", "used", "use", "is", "are",
     "of", "in", "on", "to", "an", "a", "the",
+    "construct", "constructed", "build", "built", "define", "generated", "snippet",
 }
 
 
@@ -123,7 +132,7 @@ def clean_path_candidate(raw):
 
     # Stop at common relative clauses/conjunctions after path mention.
     p = re.split(
-        r"\s+(?:that|which|where|with|and|or|who|whose|котор(?:ый|ая|ые|ого|ому|ых)?|где|и|или|с)\b",
+        r"\s+(?:that|which|where|with|and|or|who|whose|function|functions|method|methods|котор(?:ый|ая|ые|ого|ому|ых)?|где|и|или|с|функц(?:ия|ии|ий|ию|иями)?)\b",
         p,
         maxsplit=1,
         flags=re.IGNORECASE,
@@ -135,22 +144,23 @@ def clean_path_candidate(raw):
 def extract_path_filters_from_query(query):
     """Extract module/directory constraints from query."""
     filters = []
+    invalid_filters = {"main", "main()", "function", "functions", "module", "directory"}
 
     for pattern in PATH_FILTER_PATTERNS:
         for m in re.finditer(pattern, query, flags=re.IGNORECASE):
             raw = m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(1)
             norm = normalize_path_filter(clean_path_candidate(raw))
-            if norm:
+            if norm and norm not in invalid_filters:
                 filters.append(norm)
 
     # Additional explicit path-like hints in backticks or quotes.
     for p in re.findall(r"`([^`]+[/\\][^`]+)`", query):
         norm = normalize_path_filter(p)
-        if norm:
+        if norm and norm not in invalid_filters:
             filters.append(norm)
     for p in re.findall(r"['\"]([^'\"]+[/\\][^'\"]+)['\"]", query):
         norm = normalize_path_filter(p)
-        if norm:
+        if norm and norm not in invalid_filters:
             filters.append(norm)
 
     # Deduplicate while preserving order
@@ -1046,6 +1056,41 @@ def _base_decl_type(type_text):
     return t or "int"
 
 
+def _strip_angle_template_content(type_text):
+    s = type_text or ""
+    out = []
+    depth = 0
+    for ch in s:
+        if ch == "<":
+            depth += 1
+            continue
+        if ch == ">":
+            depth = max(0, depth - 1)
+            continue
+        if depth == 0:
+            out.append(ch)
+    return "".join(out)
+
+
+def _infer_effective_param_type(param, pname):
+    ptype = re.sub(r"\s+", " ", str(param.get("type", "")).strip())
+    raw = re.sub(r"\s+", " ", str(param.get("raw", "")).strip())
+    if not raw:
+        return ptype
+
+    raw = raw.split("=", 1)[0].strip()
+    if pname:
+        raw = re.sub(rf"\b{re.escape(pname)}\b\s*$", "", raw).strip()
+
+    if not ptype:
+        return raw
+    if ("*" in raw and "*" not in ptype) or ("&" in raw and "&" not in ptype):
+        return raw
+    if len(raw) > len(ptype):
+        return raw
+    return ptype
+
+
 def _next_unique_name(base, used):
     name = re.sub(r"\W+", "_", base or "").strip("_")
     if not name:
@@ -1084,20 +1129,28 @@ def _is_file_size_param(type_text, name):
     return False
 
 
+def _is_size_type(type_text):
+    t = (type_text or "").lower()
+    return "size_t" in t or "ssize_t" in t
+
+
 def _format_file_loc(chunk):
     return f"{chunk.get('file', '')}:{chunk.get('start_line', '?')}-{chunk.get('end_line', '?')}"
 
 
 def _build_param_binding(param, analysis, arg_hint, used_names):
-    ptype = re.sub(r"\s+", " ", str(param.get("type", "")).strip())
     pname = str(param.get("name", "")).strip() or "arg"
+    ptype = _infer_effective_param_type(param, pname)
     ptype_lower = ptype.lower()
     needs_file = bool((analysis or {}).get("needs_file"))
+    ptype_top = _strip_angle_template_content(ptype)
+    ptype_top_lower = ptype_top.lower()
 
-    is_pointer = "*" in ptype
-    is_ref = "&" in ptype
+    is_pointer = "*" in ptype_top
+    is_ref = "&" in ptype_top
     is_std_string = ("std::string" in ptype) or ("string" in ptype_lower)
-    is_char_or_byte_ptr = any(x in ptype_lower for x in [
+    is_std_function = "std::function" in ptype_lower
+    is_char_or_byte_ptr = is_pointer and not is_std_function and any(x in ptype_top_lower for x in [
         "char *", "char*", "uint8_t *", "uint8_t*", "unsigned char *", "unsigned char*",
         "std::byte *", "std::byte*", "void *", "void*",
     ])
@@ -1131,9 +1184,15 @@ def _build_param_binding(param, analysis, arg_hint, used_names):
             return decls, var
 
     if needs_file and is_char_or_byte_ptr and is_pointer:
+        n = (pname or "").lower()
+        if any(k in n for k in ["e", "end", "last", "finish", "to"]):
+            return decls, f"reinterpret_cast<{ptype}>(input_bytes.data() + input_bytes.size())"
         return decls, f"reinterpret_cast<{ptype}>(input_bytes.data())"
 
     if needs_file and _is_file_size_param(ptype, pname):
+        cast_type = value_type or "size_t"
+        return decls, f"static_cast<{cast_type}>(input_bytes.size())"
+    if needs_file and _is_size_type(ptype):
         cast_type = value_type or "size_t"
         return decls, f"static_cast<{cast_type}>(input_bytes.size())"
 
@@ -1141,6 +1200,13 @@ def _build_param_binding(param, analysis, arg_hint, used_names):
         var = _next_unique_name(f"{pname}_str", used_names)
         decls.append(f"std::string {var}(input_bytes.begin(), input_bytes.end());")
         return decls, var
+
+    if needs_file and not is_pointer and not is_ref and "char" in ptype_lower:
+        n = (pname or "").lower()
+        if any(k in n for k in ["d", "delim", "delimiter", "sep", "separator"]):
+            var = _next_unique_name(pname, used_names)
+            decls.append(f"{value_type} {var} = '\\n';")
+            return decls, var
 
     if is_pointer:
         storage = _next_unique_name(f"{pname}_obj", used_names)
@@ -1174,61 +1240,31 @@ def _build_param_binding(param, analysis, arg_hint, used_names):
     return decls, var
 
 
-def build_example_answer_from_context(frags, analysis=None):
+def build_example_answer_from_context(frags, analysis=None, example_context=None):
     """Deterministic fallback for grounded example-generation answers."""
     analysis = analysis or {}
     clean_frags = [f for f in frags if is_valid_function_chunk(f)]
     if not clean_frags:
         return "Not enough verified context to build a reliable example."
 
-    primary_name = analysis.get("primary_function_name")
-    target = None
-    if primary_name:
-        for f in clean_frags:
-            if f.get("name") == primary_name:
-                target = f
-                break
-    if target is None:
-        target = clean_frags[0]
+    if example_context is None:
+        example_context = _build_example_context_impl(clean_frags, analysis=analysis)
 
+    target = example_context.get("target")
+    if target is None or target not in clean_frags:
+        target = clean_frags[0]
     target_name = str(target.get("name", "")).strip() or "target_function"
     target_sig = target.get("signature") or f"{target_name}()"
     params = list(target.get("parameters") or [])
 
-    caller_candidates = []
-    for f in clean_frags:
-        if f.get("name") == target_name:
-            continue
-        calls = _extract_call_argument_lists(str(f.get("code", "")), target_name, limit=3)
-        if calls:
-            caller_candidates.append((f, calls))
-
-    secondary_names = [n for n in analysis.get("function_names", []) if n != target_name]
-    caller = None
-    caller_calls = []
-    for wanted in secondary_names:
-        for c, calls in caller_candidates:
-            if c.get("name") == wanted:
-                caller = c
-                caller_calls = calls
-                break
-        if caller is not None:
-            break
-    if caller is None and caller_candidates:
-        caller, caller_calls = caller_candidates[0]
-
     call_hint_args = []
-    observed_call = None
-    if caller_calls:
-        preferred = None
-        for c in caller_calls:
-            if len(c.get("args", [])) == len(params):
-                preferred = c
-                break
-        if preferred is None:
-            preferred = caller_calls[0]
-        call_hint_args = preferred.get("args", [])
-        observed_call = preferred.get("expr")
+    caller = example_context.get("caller")
+    if caller is not None and caller not in clean_frags:
+        caller = None
+    observed_call_obj = example_context.get("observed_call") or {}
+    observed_call = observed_call_obj.get("expr")
+    if isinstance(observed_call_obj.get("args"), list):
+        call_hint_args = observed_call_obj.get("args", [])
 
     header_name = os.path.basename(str(target.get("file", "")))
     include_target_header = bool(re.search(r"\.(h|hpp|hh|hxx)$", header_name))
@@ -1336,6 +1372,38 @@ class QueryPlanner:
             self.symbols_by_lower[fn.lower()].append(fn)
 
     def analyze_query(self, query, context_history=None):
+        """Analyze query with v2-by-default analyzer and optional shadow diff."""
+        legacy_mode = os.getenv("FC_QUERY_ANALYZER_LEGACY", "0") == "1"
+        use_v2 = not legacy_mode
+        shadow = os.getenv("FC_QUERY_ANALYZER_SHADOW", "0") == "1"
+
+        legacy = None
+        if not use_v2 or shadow:
+            legacy = self._analyze_query_legacy(query, context_history=context_history)
+        if use_v2:
+            v2 = _analyze_query_v2_impl(
+                query,
+                context_history=context_history,
+                symbols_by_lower=self.symbols_by_lower,
+            )
+            if shadow and legacy is not None:
+                diff = _compare_analysis_impl(legacy, v2)
+                if diff:
+                    v2["_shadow_diff"] = diff
+            return v2
+
+        if shadow and legacy is not None:
+            v2 = _analyze_query_v2_impl(
+                query,
+                context_history=context_history,
+                symbols_by_lower=self.symbols_by_lower,
+            )
+            diff = _compare_analysis_impl(legacy, v2)
+            if diff:
+                legacy["_shadow_diff"] = diff
+        return legacy
+
+    def _analyze_query_legacy(self, query, context_history=None):
         """Analyze query to determine search strategy with thinking mode"""
         query_lower = query.lower()
 
@@ -1437,6 +1505,13 @@ class QueryPlanner:
                 if resolved not in analysis["function_names"]:
                     analysis["function_names"].append(resolved)
                     analysis["referenced_functions"].append(resolved)
+
+        # Alias-friendly behavior: in prompts like
+        # "define a standalone main() and call X from it", "main" is snippet context,
+        # not a target function to retrieve from codebase.
+        if ("standalone main" in query_lower or "define a standalone main" in query_lower) and len(analysis["function_names"]) > 1:
+            analysis["function_names"] = [fn for fn in analysis["function_names"] if fn.lower() != "main"]
+            analysis["referenced_functions"] = [fn for fn in analysis["referenced_functions"] if fn.lower() != "main"]
 
         # Detect call graph expansion needs
         if any(w in query_lower for w in ["call", "invoke", "use", "caller", "callee", "called by", "вызыва", "использу"]):
@@ -1687,7 +1762,43 @@ def build_thinking_prompt(frags, q, analysis=None, conversation_history=None):
     return _build_thinking_prompt_impl(frags, q, analysis=analysis, conversation_history=conversation_history)
 
 
-def build_prompt(frags, q, analysis=None, conversation_history=None, max_prompt_chars=20000):
+def build_example_context(frags, analysis=None):
+    """Build structured context facts for example-generation."""
+    return _build_example_context_impl(frags, analysis=analysis)
+
+
+def build_example_context_grounded(
+    *,
+    frags,
+    analysis=None,
+    meta=None,
+    symbols=None,
+    call_graph=None,
+    called_by=None,
+    candidate_ids=None,
+    top_k=40,
+):
+    """Build richer example grounding using expanded retrieval/call-graph evidence."""
+    return _build_example_context_grounded_impl(
+        frags=frags,
+        analysis=analysis,
+        meta=meta or [],
+        symbols=symbols or {},
+        call_graph=call_graph or {},
+        called_by=called_by or {},
+        candidate_ids=candidate_ids or [],
+        top_k=top_k,
+    )
+
+
+def build_prompt(
+    frags,
+    q,
+    analysis=None,
+    conversation_history=None,
+    max_prompt_chars=20000,
+    example_context=None,
+):
     """Main prompt builder with total-character budget."""
     return _build_prompt_impl(
         frags,
@@ -1695,6 +1806,7 @@ def build_prompt(frags, q, analysis=None, conversation_history=None, max_prompt_
         analysis=analysis,
         conversation_history=conversation_history,
         max_prompt_chars=max_prompt_chars,
+        example_context=example_context,
     )
 
 
@@ -1708,11 +1820,18 @@ def verify_answer_with_context(answer, context_frags, known_functions=None):
     return _verify_answer_with_context_impl(answer, context_frags, known_functions=known_functions)
 
 
-def verify_example_answer_with_context(answer, context_frags, target_function=None, known_functions=None):
+def verify_example_answer_with_context(
+    answer,
+    context_frags,
+    target_function=None,
+    known_functions=None,
+    example_context=None,
+):
     """Verify example-generation answer against file/signature/line evidence and context."""
     return _verify_example_answer_with_context_impl(
         answer,
         context_frags,
         target_function=target_function,
         known_functions=known_functions,
+        example_context=example_context,
     )

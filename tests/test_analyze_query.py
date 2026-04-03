@@ -216,3 +216,177 @@ def test_analyze_query_example_primary_prefers_call_target_over_main_context():
     assert "main" in analysis["function_names"]
     assert "llama_sampler_init_grammar_lazy_patterns" in analysis["function_names"]
     assert analysis["primary_function_name"] == "llama_sampler_init_grammar_lazy_patterns"
+
+
+def test_analyze_query_default_v2_filters_generic_symbol_like_data(monkeypatch):
+    planner = QueryPlanner(
+        special_indices={},
+        symbols={
+            "process_request": [1],
+            "main": [2],
+            "data": [3],
+        },
+        call_graph={},
+        called_by={},
+        meta=[],
+    )
+    q = "Write an example of process_request function that is called from main function and its parameters are constructed from data given from file in argv[1]"
+
+    monkeypatch.delenv("FC_QUERY_ANALYZER_LEGACY", raising=False)
+    monkeypatch.delenv("FC_QUERY_ANALYZER_SHADOW", raising=False)
+    analysis = planner.analyze_query(q)
+
+    assert analysis["query_type"] == "example_generation"
+    assert "process_request" in analysis["function_names"]
+    assert "main" in analysis["function_names"]
+    assert "data" not in analysis["function_names"]
+
+
+def test_analyze_query_shadow_mode_attaches_diff_without_switching_result(monkeypatch):
+    planner = QueryPlanner(
+        special_indices={},
+        symbols={
+            "process_request": [1],
+            "main": [2],
+            "data": [3],
+        },
+        call_graph={},
+        called_by={},
+        meta=[],
+    )
+    q = "Write an example of process_request function that is called from main function and its parameters are constructed from data given from file in argv[1]"
+
+    monkeypatch.setenv("FC_QUERY_ANALYZER_LEGACY", "1")
+    monkeypatch.setenv("FC_QUERY_ANALYZER_SHADOW", "1")
+    analysis = planner.analyze_query(q)
+
+    assert "data" in analysis["function_names"]
+    assert "_shadow_diff" in analysis
+    assert "function_names" in analysis["_shadow_diff"]
+    assert "data" not in analysis["_shadow_diff"]["function_names"]["v2"]
+
+
+def test_analyze_query_default_v2_keeps_explicit_symbol_even_if_common_word(monkeypatch):
+    planner = QueryPlanner(
+        special_indices={},
+        symbols={
+            "write": [1],
+        },
+        call_graph={},
+        called_by={},
+        meta=[],
+    )
+    q = "Give an example of `write` function"
+
+    monkeypatch.delenv("FC_QUERY_ANALYZER_LEGACY", raising=False)
+    monkeypatch.delenv("FC_QUERY_ANALYZER_SHADOW", raising=False)
+    analysis = planner.analyze_query(q)
+
+    assert analysis["query_type"] == "example_generation"
+    assert "write" in analysis["query_function_candidates"]
+    assert "write" in analysis["function_names"]
+
+
+def test_analyze_query_path_filter_trims_trailing_function_word():
+    planner = QueryPlanner(
+        special_indices={},
+        symbols={"split": [1], "main": [2]},
+        call_graph={},
+        called_by={},
+        meta=[],
+    )
+    q = (
+        "Write an example of split from module vendor/cpp-httplib function "
+        "that is called from main function and its parameters are constructed "
+        "from data given from file in argv[1]"
+    )
+
+    analysis = planner.analyze_query(q)
+
+    assert analysis["query_type"] == "example_generation"
+    assert analysis["path_filters"] == ["vendor/cpp-httplib"]
+
+
+def test_analyze_query_path_filter_supports_from_path_then_module_order():
+    planner = QueryPlanner(
+        special_indices={},
+        symbols={"split": [1], "main": [2]},
+        call_graph={},
+        called_by={},
+        meta=[],
+    )
+    q = (
+        "Write an example of split function that is called from main function "
+        "and its parameters are constructed from data given from file in argv[1] "
+        "from vendor/cpp-httplib/httplib.cpp module"
+    )
+
+    analysis = planner.analyze_query(q)
+
+    assert analysis["query_type"] == "example_generation"
+    assert analysis["path_filters"] == ["vendor/cpp-httplib/httplib.cpp"]
+
+
+def test_analyze_query_path_filters_do_not_include_main_from_main_function_phrase():
+    planner = QueryPlanner(
+        special_indices={},
+        symbols={"split": [1], "main": [2]},
+        call_graph={},
+        called_by={},
+        meta=[],
+    )
+    q = (
+        "Write an example of split function. In the generated snippet, define a standalone main() "
+        "and call split from it. Construct parameters from file argv[1] from module vendor/cpp-httplib/httplib.cpp"
+    )
+
+    analysis = planner.analyze_query(q)
+
+    assert analysis["query_type"] == "example_generation"
+    assert "main" not in analysis["path_filters"]
+
+
+def test_analyze_query_alias_standalone_main_does_not_treat_main_or_construct_as_target():
+    planner = QueryPlanner(
+        special_indices={},
+        symbols={
+            "process_request": [1],
+            "main": [2],
+            "construct": [3],
+        },
+        call_graph={},
+        called_by={},
+        meta=[],
+    )
+    q = (
+        "Write an example of process_request function. "
+        "In the generated snippet, define a standalone main() and call process_request from it. "
+        "Construct its parameters from data given from file in argv[1]"
+    )
+
+    analysis = planner.analyze_query(q)
+
+    assert analysis["query_type"] == "example_generation"
+    assert "process_request" in analysis["function_names"]
+    assert "main" not in analysis["function_names"]
+    assert "construct" not in analysis["function_names"]
+
+
+def test_analyze_query_path_filter_ignores_alias_sentence_fragment_between_from_and_module():
+    planner = QueryPlanner(
+        special_indices={},
+        symbols={"split": [1], "main": [2]},
+        call_graph={},
+        called_by={},
+        meta=[],
+    )
+    q = (
+        "Write an example of split function. In the generated snippet, define a standalone main() "
+        "and call split from it. Construct its parameters from data given from file in argv[1] "
+        "from module vendor/cpp-httplib/httplib.cpp"
+    )
+
+    analysis = planner.analyze_query(q)
+
+    assert analysis["query_type"] == "example_generation"
+    assert analysis["path_filters"] == ["vendor/cpp-httplib/httplib.cpp"]
