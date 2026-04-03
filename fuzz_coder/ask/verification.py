@@ -22,6 +22,8 @@ ENTRY_HEADER_RE = re.compile(
 
 EVIDENCE_FILE_RE = re.compile(r"^\s*(?:[-*]\s*)?File:\s*(.+)$", flags=re.MULTILINE)
 EVIDENCE_SIGNATURE_RE = re.compile(r"^\s*(?:[-*]\s*)?Signature:\s*(.+)$", flags=re.MULTILINE)
+EVIDENCE_OBSERVED_CALL_RE = re.compile(r"^\s*(?:[-*]\s*)?Observed call:\s*(.+)$", flags=re.MULTILINE)
+CODE_BLOCK_RE = re.compile(r"```(?:[A-Za-z0-9_+\-]*)\n(.*?)```", flags=re.DOTALL)
 
 
 def _extract_name_from_signature(signature_line: str) -> str | None:
@@ -79,6 +81,224 @@ def _extract_arity(signature: str) -> int | None:
         elif ch == "," and depth == 0:
             arity += 1
     return arity
+
+
+def _count_top_level_args(params_text: str) -> int:
+    params = (params_text or "").strip()
+    if not params or params == "void":
+        return 0
+
+    depth = 0
+    in_str = False
+    in_char = False
+    escape = False
+    count = 1
+
+    for ch in params:
+        if in_str:
+            if not escape and ch == '"':
+                in_str = False
+            escape = (ch == "\\" and not escape)
+            continue
+        if in_char:
+            if not escape and ch == "'":
+                in_char = False
+            escape = (ch == "\\" and not escape)
+            continue
+
+        if ch == '"':
+            in_str = True
+            escape = False
+            continue
+        if ch == "'":
+            in_char = True
+            escape = False
+            continue
+
+        if ch in "<({[":
+            depth += 1
+            continue
+        if ch in ">)}]":
+            depth = max(0, depth - 1)
+            continue
+        if ch == "," and depth == 0:
+            count += 1
+
+    return count
+
+
+def _find_matching_paren(text: str, open_idx: int) -> int:
+    if open_idx < 0 or open_idx >= len(text) or text[open_idx] != "(":
+        return -1
+
+    depth = 0
+    in_str = False
+    in_char = False
+    escape = False
+    for i in range(open_idx, len(text)):
+        ch = text[i]
+        if in_str:
+            if not escape and ch == '"':
+                in_str = False
+            escape = (ch == "\\" and not escape)
+            continue
+        if in_char:
+            if not escape and ch == "'":
+                in_char = False
+            escape = (ch == "\\" and not escape)
+            continue
+
+        if ch == '"':
+            in_str = True
+            escape = False
+            continue
+        if ch == "'":
+            in_char = True
+            escape = False
+            continue
+
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _extract_call_arities(text: str, target_function: str) -> List[int]:
+    if not text or not target_function:
+        return []
+
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9_~])(?:[A-Za-z_]\w*::)*{re.escape(target_function)}\s*\("
+    )
+    arities: List[int] = []
+    for m in pattern.finditer(text):
+        open_idx = text.find("(", m.start())
+        if open_idx == -1:
+            continue
+        close_idx = _find_matching_paren(text, open_idx)
+        if close_idx == -1:
+            continue
+        args_text = text[open_idx + 1:close_idx]
+        arities.append(_count_top_level_args(args_text))
+    return arities
+
+
+def _extract_call_arg_lists(text: str, target_function: str) -> List[List[str]]:
+    if not text or not target_function:
+        return []
+
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9_~])(?:[A-Za-z_]\w*::)*{re.escape(target_function)}\s*\("
+    )
+    out: List[List[str]] = []
+    for m in pattern.finditer(text):
+        open_idx = text.find("(", m.start())
+        if open_idx == -1:
+            continue
+        close_idx = _find_matching_paren(text, open_idx)
+        if close_idx == -1:
+            continue
+        args = text[open_idx + 1:close_idx].strip()
+        out.append(_split_top_level_args(args))
+    return out
+
+
+def _split_top_level_args(args_text: str) -> List[str]:
+    if not args_text:
+        return []
+    params = args_text.strip()
+    if not params or params == "void":
+        return []
+
+    out: List[str] = []
+    cur: List[str] = []
+    depth = 0
+    in_str = False
+    in_char = False
+    escape = False
+    for ch in params:
+        if in_str:
+            cur.append(ch)
+            if not escape and ch == '"':
+                in_str = False
+            escape = (ch == "\\" and not escape)
+            continue
+        if in_char:
+            cur.append(ch)
+            if not escape and ch == "'":
+                in_char = False
+            escape = (ch == "\\" and not escape)
+            continue
+
+        if ch == '"':
+            in_str = True
+            escape = False
+            cur.append(ch)
+            continue
+        if ch == "'":
+            in_char = True
+            escape = False
+            cur.append(ch)
+            continue
+
+        if ch in "<({[":
+            depth += 1
+            cur.append(ch)
+            continue
+        if ch in ">)}]":
+            depth = max(0, depth - 1)
+            cur.append(ch)
+            continue
+        if ch == "," and depth == 0:
+            part = "".join(cur).strip()
+            if part:
+                out.append(part)
+            cur = []
+            continue
+        cur.append(ch)
+
+    tail = "".join(cur).strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
+def _extract_file_source_vars(code_text: str) -> List[str]:
+    code = code_text or ""
+    out: List[str] = []
+    patterns = [
+        r"\bstd::ifstream\s+([A-Za-z_]\w*)\s*\(\s*argv\s*\[\s*1\s*\]",
+        r"\bauto\s+([A-Za-z_]\w*)\s*=\s*[^;\n]*argv\s*\[\s*1\s*\]",
+        r"\b(?:std::string|std::vector<[^>]+>|std::vector<\s*uint8_t\s*>)\s+([A-Za-z_]\w*)\s*\([^;\n]*argv\s*\[\s*1\s*\]",
+        r"\bstd::getline\s*\([^,\n]+,\s*([A-Za-z_]\w+)\s*\)",
+        r"\b([A-Za-z_]\w+)\s*\.assign\s*\(\s*std::istreambuf_iterator<",
+        r"\bfread\s*\(\s*([A-Za-z_]\w+)\s*,",
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, code):
+            name = (m.group(1) or "").strip()
+            if name and name not in out:
+                out.append(name)
+    return out
+
+
+def _arg_uses_any_var(arg_expr: str, names: List[str]) -> bool:
+    expr = arg_expr or ""
+    for name in names:
+        if re.search(rf"\b{re.escape(name)}\b", expr):
+            return True
+    return False
+
+
+def _confidence_level(score: float) -> str:
+    if score >= 0.80:
+        return "high"
+    if score >= 0.55:
+        return "medium"
+    return "low"
 
 
 def _parse_file_ref(file_ref: str):
@@ -243,6 +463,7 @@ def verify_answer_with_context(answer, context_frags, known_functions=None):
     file_mismatches = set()
     signature_mismatches = set()
     context_mismatches = set()
+    consistency_issues = set()
 
     for entry in structured_entries:
         fn = entry.get("name")
@@ -278,6 +499,29 @@ def verify_answer_with_context(answer, context_frags, known_functions=None):
             if not pair_match_any:
                 context_mismatches.add(fn)
 
+    duplicate_names = set()
+    seen_names = set()
+    for e in structured_entries:
+        n = e.get("name")
+        if not n:
+            continue
+        if n in seen_names:
+            duplicate_names.add(n)
+        seen_names.add(n)
+    if duplicate_names:
+        consistency_issues.add("duplicate_structured_entries")
+
+    score = 1.0
+    score -= 0.30 * len(hallucinated)
+    score -= 0.22 * len(out_of_context)
+    score -= 0.18 * len(context_mismatches)
+    score -= 0.12 * len(file_mismatches)
+    score -= 0.12 * len(signature_mismatches)
+    score -= 0.08 * len(consistency_issues)
+    if structured_entries and not (hallucinated or out_of_context or context_mismatches):
+        score += 0.05
+    score = max(0.0, min(1.0, score))
+
     return {
         "mentioned": mentioned_candidates,
         "structured_mentions": structured_candidates,
@@ -289,6 +533,9 @@ def verify_answer_with_context(answer, context_frags, known_functions=None):
         "file_mismatches": file_mismatches,
         "signature_mismatches": signature_mismatches,
         "context_mismatches": context_mismatches,
+        "consistency_issues": consistency_issues,
+        "confidence_score": score,
+        "confidence_level": _confidence_level(score),
         "is_valid": (
             len(hallucinated) == 0
             and len(out_of_context) == 0
@@ -304,6 +551,7 @@ def verify_example_answer_with_context(
     context_frags,
     target_function=None,
     known_functions=None,
+    example_context=None,
 ):
     """Verify example-generation answer against current context.
 
@@ -312,6 +560,8 @@ def verify_example_answer_with_context(
     - Must provide at least one `File:` reference with line information.
     - Must provide at least one `Signature:` reference.
     - File/signature references must match current context.
+    - If structured example_context contains caller/call-site facts, caller evidence is required.
+    - If structured example_context requires file-based data flow, target call must use data derived from argv[1].
     """
     base = verify_answer_with_context(
         answer,
@@ -321,6 +571,15 @@ def verify_example_answer_with_context(
 
     file_refs = [m.strip() for m in EVIDENCE_FILE_RE.findall(answer or "")]
     signature_refs = [m.strip() for m in EVIDENCE_SIGNATURE_RE.findall(answer or "")]
+    observed_call_refs = [m.strip() for m in EVIDENCE_OBSERVED_CALL_RE.findall(answer or "")]
+    code_blocks = CODE_BLOCK_RE.findall(answer or "")
+    code_block_present = len(code_blocks) > 0
+    text_for_calls = "\n".join(code_blocks) if code_blocks else (answer or "")
+    expected_target = (example_context or {}).get("target")
+    expected_caller = (example_context or {}).get("caller")
+    expected_observed_call = (example_context or {}).get("observed_call")
+    flow_hints = (example_context or {}).get("file_data_flow_hints") or {}
+    requires_file_data = bool(flow_hints.get("requires_file_data"))
 
     file_matches = 0
     has_line_reference = False
@@ -338,12 +597,29 @@ def verify_example_answer_with_context(
 
     target_mentioned = True
     target_signature_present = True
+    target_call_arities: List[int] = []
+    target_call_arg_lists: List[List[str]] = []
+    target_call_present = True
+    target_call_arity_match = True
     if target_function:
         target_mentioned = re.search(rf"\b{re.escape(target_function)}\b", answer or "") is not None
         target_signature_present = any(
             (_extract_name_from_signature(sig) or "") == target_function
             for sig in signature_refs
         )
+        target_call_arities = _extract_call_arities(text_for_calls, target_function)
+        target_call_arg_lists = _extract_call_arg_lists(text_for_calls, target_function)
+        target_call_present = len(target_call_arities) > 0
+
+        expected_arities = set()
+        for c in context_frags:
+            if c.get("name") != target_function:
+                continue
+            ar = _extract_arity(str(c.get("signature", "")))
+            if ar is not None:
+                expected_arities.add(ar)
+        if expected_arities and target_call_arities:
+            target_call_arity_match = any(a in expected_arities for a in target_call_arities)
 
     missing_requirements = set()
     if not file_refs:
@@ -361,6 +637,117 @@ def verify_example_answer_with_context(
     if signature_refs and signature_matches == 0:
         missing_requirements.add("signature_not_in_context")
 
+    if expected_target and target_function and expected_target.get("name") == target_function:
+        target_file_ok = any(_file_matches_chunk(ref, expected_target) for ref in file_refs)
+        target_sig_ok = any(_signature_matches_chunk(sig, expected_target) for sig in signature_refs)
+        if not target_file_ok:
+            missing_requirements.add("target_file_reference")
+        if not target_sig_ok:
+            missing_requirements.add("target_signature_reference")
+
+    if expected_caller:
+        caller_file_ok = any(_file_matches_chunk(ref, expected_caller) for ref in file_refs)
+        caller_sig_ok = any(_signature_matches_chunk(sig, expected_caller) for sig in signature_refs)
+        if not caller_file_ok:
+            missing_requirements.add("caller_file_reference")
+        if not caller_sig_ok:
+            missing_requirements.add("caller_signature_reference")
+        if not observed_call_refs:
+            missing_requirements.add("observed_call_reference")
+
+    consistency_issues = set(base.get("consistency_issues", set()))
+    if not code_block_present:
+        consistency_issues.add("code_block_missing")
+    enforce_target_call_presence = bool(expected_observed_call) or requires_file_data
+    if target_function and enforce_target_call_presence and not target_call_present:
+        consistency_issues.add("target_call_not_found")
+    if target_function and target_call_present and not target_call_arity_match:
+        consistency_issues.add("target_call_arity_mismatch")
+
+    if target_function and observed_call_refs and (expected_observed_call or expected_caller):
+        observed_mentions_target = any(
+            re.search(
+                rf"\b(?:[A-Za-z_]\w*::)*{re.escape(target_function)}\s*\(",
+                _strip_inline_code(ref),
+            ) is not None
+            for ref in observed_call_refs
+        )
+        if not observed_mentions_target:
+            consistency_issues.add("observed_call_not_target")
+
+    if target_function and expected_observed_call and observed_call_refs:
+        expected_arity = expected_observed_call.get("arity")
+        if isinstance(expected_arity, int):
+            observed_ref_arities = []
+            for ref in observed_call_refs:
+                txt = _strip_inline_code(ref)
+                m = re.search(
+                    rf"\b(?:[A-Za-z_]\w*::)*{re.escape(target_function)}\s*\(",
+                    txt,
+                )
+                if not m:
+                    continue
+                open_idx = txt.find("(", m.start())
+                if open_idx == -1:
+                    continue
+                close_idx = _find_matching_paren(txt, open_idx)
+                if close_idx == -1:
+                    continue
+                observed_ref_arities.append(_count_top_level_args(txt[open_idx + 1:close_idx]))
+            if observed_ref_arities and all(a != expected_arity for a in observed_ref_arities):
+                consistency_issues.add("observed_call_arity_mismatch")
+
+    has_argv1 = re.search(r"argv\s*\[\s*1\s*\]", text_for_calls) is not None
+    file_source_vars = _extract_file_source_vars(text_for_calls)
+    target_uses_file_data = False
+    for arg_list in target_call_arg_lists:
+        for arg in arg_list:
+            if re.search(r"argv\s*\[\s*1\s*\]", arg):
+                target_uses_file_data = True
+                break
+            if _arg_uses_any_var(arg, file_source_vars):
+                target_uses_file_data = True
+                break
+        if target_uses_file_data:
+            break
+
+    if requires_file_data:
+        if not has_argv1:
+            missing_requirements.add("argv1_usage")
+        if not target_uses_file_data:
+            missing_requirements.add("file_data_flow_to_target")
+            consistency_issues.add("file_data_not_used_in_target_call")
+
+    score = float(base.get("confidence_score", 1.0))
+    score -= 0.16 * len(missing_requirements)
+    score -= 0.10 * len(consistency_issues)
+    if file_matches > 0:
+        score += 0.04
+    if signature_matches > 0:
+        score += 0.04
+    if target_signature_present:
+        score += 0.03
+    if target_function and target_call_present:
+        score += 0.04
+    if target_function and target_call_present and target_call_arity_match:
+        score += 0.04
+    if expected_caller and observed_call_refs:
+        score += 0.03
+    if requires_file_data and target_uses_file_data:
+        score += 0.05
+
+    # Keep confidence conservative when consistency checks fail.
+    if consistency_issues:
+        score = min(score, 0.74)
+    if "target_call_arity_mismatch" in consistency_issues:
+        # Arity mismatch is a strong signal that generated code likely does not
+        # match real usage, so confidence must not be "high".
+        score = min(score, 0.54)
+    if "file_data_not_used_in_target_call" in consistency_issues:
+        score = min(score, 0.45)
+
+    score = max(0.0, min(1.0, score))
+
     is_valid = (
         base.get("is_valid", False)
         and len(missing_requirements) == 0
@@ -376,7 +763,19 @@ def verify_example_answer_with_context(
         "target_function": target_function,
         "target_mentioned": target_mentioned,
         "target_signature_present": target_signature_present,
+        "code_block_present": code_block_present,
+        "target_call_present": target_call_present,
+        "target_call_arities": target_call_arities,
+        "target_call_arg_lists": target_call_arg_lists,
+        "target_call_arity_match": target_call_arity_match,
+        "observed_call_references": observed_call_refs,
+        "requires_file_data": requires_file_data,
+        "target_uses_file_data": target_uses_file_data,
+        "has_argv1_in_code": has_argv1,
+        "consistency_issues": consistency_issues,
         "missing_requirements": missing_requirements,
+        "confidence_score": score,
+        "confidence_level": _confidence_level(score),
         "is_valid": is_valid,
     })
     return out

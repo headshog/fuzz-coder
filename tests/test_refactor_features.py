@@ -66,6 +66,96 @@ def test_build_prompt_respects_global_char_budget():
     assert len(prompt) <= 2000
 
 
+def test_prompt_listing_uses_layered_policy_and_single_listing_system_block():
+    frags = [{
+        "name": "parse_json_payload",
+        "file": "/repo/src/parsers/json.cpp",
+        "start_line": 10,
+        "end_line": 50,
+        "signature": "parse_json_payload(const std::string & s)",
+        "parameters": [{"name": "s", "type": "const std::string &", "raw": "const std::string & s"}],
+        "code": "bool parse_json_payload(const std::string & s){ return !s.empty(); }",
+        "has_stdin": False,
+        "has_file_input": True,
+        "has_api_call": False,
+    }]
+    analysis = {
+        "query_type": "listing",
+        "needs_fuzz_targets": True,
+        "constraint_mode": "all",
+        "path_filters": ["src/parsers"],
+    }
+
+    prompt = ask_core.build_prompt(frags, "Write a list of functions that can be used for fuzzing", analysis=analysis)
+    assert "### POLICY LAYERS" in prompt
+    assert "MUST:" in prompt
+    assert "SHOULD:" in prompt
+    assert "NICE TO HAVE:" in prompt
+    assert "### SYSTEM BLOCK (LISTING)" in prompt
+    assert "### SYSTEM BLOCK (EXAMPLE_GENERATION)" not in prompt
+    assert "### SYSTEM BLOCK (IMPLEMENTATION_EXPLANATION)" not in prompt
+    assert "### OUTPUT FORMAT (STRICT)" in prompt
+    assert prompt.count("### SYSTEM BLOCK") == 1
+
+
+def test_prompt_example_uses_short_example_system_block_and_strict_template():
+    frags = [{
+        "name": "ma_device_init__dsound",
+        "file": "/repo/vendor/miniaudio/miniaudio.h",
+        "start_line": 26135,
+        "end_line": 26407,
+        "signature": "ma_device_init__dsound(ma_device* pDevice, const ma_device_config* pConfig)",
+        "parameters": [
+            {"name": "pDevice", "type": "ma_device*", "raw": "ma_device* pDevice"},
+            {"name": "pConfig", "type": "const ma_device_config*", "raw": "const ma_device_config* pConfig"},
+        ],
+        "code": "ma_result ma_device_init__dsound(ma_device* pDevice, const ma_device_config* pConfig){return 0;}",
+        "has_stdin": False,
+        "has_file_input": False,
+        "has_api_call": False,
+    }]
+    analysis = {"query_type": "example_generation"}
+
+    prompt = ask_core.build_prompt(
+        frags,
+        "Write an example of ma_device_init__dsound from main with argv[1] bytes",
+        analysis=analysis,
+    )
+    assert "### SYSTEM BLOCK (EXAMPLE_GENERATION)" in prompt
+    assert "### SYSTEM BLOCK (LISTING)" not in prompt
+    assert "### SYSTEM BLOCK (IMPLEMENTATION_EXPLANATION)" not in prompt
+    assert 'Include a short "Evidence from codebase" note' in prompt
+    assert "### OUTPUT FORMAT (STRICT)" in prompt
+    assert "```cpp" in prompt
+    assert prompt.count("### SYSTEM BLOCK") == 1
+
+
+def test_prompt_explanation_uses_short_explanation_system_block():
+    frags = [{
+        "name": "decode_binary_blob",
+        "file": "/repo/src/parsers/blob.cpp",
+        "start_line": 1,
+        "end_line": 40,
+        "signature": "decode_binary_blob(const uint8_t * data, size_t n)",
+        "parameters": [
+            {"name": "data", "type": "const uint8_t *", "raw": "const uint8_t * data"},
+            {"name": "n", "type": "size_t", "raw": "size_t n"},
+        ],
+        "code": "int decode_binary_blob(const uint8_t * data, size_t n){ if(n < 4) return -1; return 0; }",
+        "has_stdin": False,
+        "has_file_input": False,
+        "has_api_call": False,
+    }]
+    analysis = {"query_type": "implementation_explanation"}
+
+    prompt = ask_core.build_prompt(frags, "Explain how decode_binary_blob works", analysis=analysis)
+    assert "### SYSTEM BLOCK (IMPLEMENTATION_EXPLANATION)" in prompt
+    assert "### SYSTEM BLOCK (LISTING)" not in prompt
+    assert "### SYSTEM BLOCK (EXAMPLE_GENERATION)" not in prompt
+    assert "### OUTPUT FORMAT (STRICT)" in prompt
+    assert prompt.count("### SYSTEM BLOCK") == 1
+
+
 def test_build_call_graph_prefers_same_file_and_avoids_ambiguous_cross_file():
     chunks = [
         {
@@ -481,3 +571,43 @@ def test_language_registry_returns_java_profile_with_expected_surface():
     assert ".java" in java_profile.supported_ext
     assert "class" in java_profile.control_keywords
     assert any("readAllBytes" in p for p in java_profile.file_input_patterns)
+
+
+def test_deterministic_example_fallback_does_not_cast_file_bytes_to_std_function():
+    frags = [
+        {
+            "id": 1,
+            "name": "split",
+            "file": "/repo/vendor/cpp-httplib/httplib.cpp",
+            "start_line": 1309,
+            "end_line": 1329,
+            "signature": "split(const char *b, const char *e, char d, size_t m, std::function<void(const char *, const char *)> fn)",
+            "parameters": [
+                {"name": "b", "type": "const char *", "raw": "const char * b"},
+                {"name": "e", "type": "const char *", "raw": "const char * e"},
+                {"name": "d", "type": "char", "raw": "char d"},
+                {"name": "m", "type": "size_t", "raw": "size_t m"},
+                {"name": "fn", "type": "std::function<void(const char *, const char *)>", "raw": "std::function<void(const char *, const char *)> fn"},
+            ],
+            "code": "void split(const char *b, const char *e, char d, size_t m, std::function<void(const char *, const char *)> fn) {}",
+            "has_stdin": False,
+            "has_file_input": False,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": False,
+            "has_error_handling": False,
+        },
+    ]
+    analysis = {
+        "query_type": "example_generation",
+        "needs_file": True,
+        "primary_function_name": "split",
+        "function_names": ["split"],
+    }
+
+    ans = ask_core.build_example_answer_from_context(frags, analysis=analysis)
+
+    assert "reinterpret_cast<std::function" not in ans
+    assert "std::function<void(const char *, const char *)>" in ans
+    assert "input_bytes.data() + input_bytes.size()" in ans
+    assert "static_cast<size_t>(input_bytes.size())" in ans

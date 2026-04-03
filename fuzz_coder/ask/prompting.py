@@ -3,8 +3,7 @@ from __future__ import annotations
 DEFAULT_MAX_PROMPT_CHARS = 20000
 
 
-def _build_thinking_prompt_with_limit(frags, q, analysis=None, conversation_history=None, code_char_limit=1500):
-    max_items = len(frags)
+def _render_function_context(frags, code_char_limit):
     ctx = ""
     for i, f in enumerate(frags, 1):
         param_info = ""
@@ -30,178 +29,289 @@ def _build_thinking_prompt_with_limit(frags, q, analysis=None, conversation_hist
 {f["code"][:code_char_limit]}
 ```
 """
+    return ctx
 
-    history_ctx = ""
-    if conversation_history:
-        history_ctx = "\n### Conversation History:\n"
-        for idx, (prev_q, prev_a) in enumerate(conversation_history[-3:], 1):
-            history_ctx += f"User: {prev_q}\nAssistant: {prev_a[:300]}...\n\n"
 
-    instructions = ""
-    if analysis:
-        listing_constraints = []
-        if analysis.get("needs_stdin"):
-            listing_constraints.append("must read from stdin")
-        if analysis.get("needs_file"):
-            listing_constraints.append("must read from files")
-        if analysis.get("needs_api"):
-            listing_constraints.append("must make API/network calls")
-        if analysis.get("needs_output"):
-            listing_constraints.append("must perform output/logging operations")
-        if analysis.get("needs_memory_mgmt"):
-            listing_constraints.append("must involve memory/buffer management")
-        if analysis.get("needs_error_handling"):
-            listing_constraints.append("must include error-handling paths")
-        if analysis.get("needs_params"):
-            listing_constraints.append("must have input parameters")
-        if analysis.get("requested_types"):
-            listing_constraints.append(f"must match requested types: {', '.join(analysis['requested_types'])}")
-        if analysis.get("needs_parse_like"):
-            listing_constraints.append("should be parse/input-processing related")
-        if analysis.get("exclude_output"):
-            listing_constraints.append("must NOT be write/output-like functions")
-        if analysis.get("needs_fuzz_targets"):
-            listing_constraints.append("should be good fuzzing targets (parsing/decoding, memory handling, complex input processing)")
-        if analysis.get("path_filters"):
-            listing_constraints.append(f"must be located in path/module: {', '.join(analysis['path_filters'])}")
-        if analysis.get("exclude_previously_listed"):
-            listing_constraints.append("must exclude functions already listed in previous answers")
+def _render_history_context(conversation_history):
+    if not conversation_history:
+        return ""
 
-        listing_constraints_text = ""
-        if listing_constraints:
-            mode_text = "all must hold" if analysis.get("constraint_mode") == "all" else "any of positive constraints may match"
-            listing_constraints_text = f"\nConstraint mode: {mode_text}. Constraints: " + "; ".join(listing_constraints)
+    history_ctx = "\n### Conversation History:\n"
+    for prev_q, prev_a in conversation_history[-3:]:
+        history_ctx += f"User: {prev_q}\nAssistant: {prev_a[:300]}...\n\n"
+    return history_ctx
 
-        if analysis["query_type"] == "listing":
-            if analysis.get("needs_fuzz_targets"):
-                step3_text = "Create a numbered list of the BEST fuzzing-target candidates (rank strongest to weaker)"
-                step4_extra = "\n   - Why it is fuzzable (input surface, parser/state complexity, memory/bounds risk)"
-                step7_text = "If strict matches are unclear, still return best candidates by fuzzing potential; avoid empty output unless context is empty"
-                strict_output_format = f"""
-10. Output format is STRICT. Use this exact per-item schema:
-   1. **`function_name`**
-      - File: `path`
-      - Signature: `full signature`
-      - Why it matches: one concise reason tied to the query
-      - Fuzzable: `High|Medium|Low` - short risk rationale
-11. Return at most {max_items} functions (never more than available context functions)
-12. End with a short ranking summary paragraph:
-   - "Functions like A, B are ranked highest due to ..."
-   - "Others such as C are lower due to ..."
-"""
-            else:
-                step3_text = "Create a numbered list of matching functions"
-                step4_extra = ""
-                step7_text = 'If no functions match, explicitly state "No matching functions found in the codebase"'
-                strict_output_format = f"""
-10. Output format is STRICT. Use this exact per-item schema:
-   1. **`function_name`**
-      - File: `path`
-      - Signature: `full signature`
-      - Why it matches: one concise reason tied to the query
-11. Return at most {max_items} functions (never more than available context functions)
-"""
 
-            instructions = f"""
-### Instructions for Listing Queries:
-1. Carefully analyze EACH function in the context above
-2. Check if it matches the criteria from the question (respect the declared constraint mode)
-3. {step3_text}
-4. For each function include:
-   - Name and file location
-   - Relevant parameters with types
-   - Brief explanation why it matches{step4_extra}
-5. CRITICAL: Only include functions that ACTUALLY exist in the provided context
-6. DO NOT invent or assume functions beyond what is shown
-7. {step7_text}
-8. After listing, perform SELF-VERIFICATION:
-   - Re-check each listed function against the original criteria
-   - Confirm the function signature matches the requirements
-   - Mark any uncertain entries with [NEEDS REVIEW]
-9. Respect negative constraints (e.g. "not write-like") strictly{listing_constraints_text}
-{strict_output_format}"""
+def _format_loc(chunk):
+    if not chunk:
+        return "not found"
+    return f"{chunk.get('file', '')}:{chunk.get('start_line', '?')}-{chunk.get('end_line', '?')}"
 
-        elif analysis["query_type"] == "example_generation":
-            instructions = """
-### Instructions for Example Generation:
-1. Identify the specific function(s) mentioned or implied
-2. Prioritize REAL usage patterns from the provided context (call sites, argument preparation, ordering)
-3. Use the real function signature from context exactly (name, arity, types)
-4. Write a complete, compilable code example showing how to call this function
-5. Include:
-   - Necessary #include statements
-   - Proper variable declarations with correct types
-   - The function call with appropriate arguments
-   - Error handling if relevant
-6. Add comments explaining key parts
-7. Make sure the example is realistic and follows the codebase patterns
-8. CRITICAL: Use ONLY the parameter types and names from the actual function signature
-9. DO NOT invent parameters or change types
-10. If context includes caller functions, explicitly ground the example in those call-sites
-11. For parameters, derive initialization strategy from real call-sites when available
-12. If query asks for file/argv bytes, construct arguments from `argv[1]` bytes in code
-13. Include a short "Evidence from codebase" note with concrete `File:start-end` references
-14. Evidence is mandatory and must contain BOTH:
-   - `File: path:start-end`
-   - `Signature: full signature`
-15. If context lacks real call-site details, explicitly state what is missing and provide the minimal safe scaffold
-16. DO NOT instantiate opaque internal structs with fake placeholders unless such pattern exists in context
-17. After generating, perform SELF-VERIFICATION:
-   - Check that all parameter types match the function signature exactly
-   - Verify the function name is correct
-   - Ensure the example would compile with the given signature
-18. Never claim a call-site if it is not present in the provided context"""
 
-        elif analysis["query_type"] == "implementation_explanation":
-            instructions = """
-### Instructions for Implementation Explanation:
-1. Explain the algorithm/logic step by step
-2. Reference specific code sections from the context with line numbers
-3. Describe:
-   - What the function does
-   - How it processes inputs
-   - Key operations and their purpose
-   - Return value meaning
-4. Use simple language but be technically accurate
-5. CRITICAL: Base explanations ONLY on the provided code
-6. DO NOT speculate about implementation details not visible in the code
-7. If something is unclear from the code, state "Implementation detail not visible in provided code"
-8. After explaining, perform SELF-VERIFICATION:
-   - Cross-reference each claim with actual code lines
-   - Remove any assumptions not supported by the code"""
+def _render_example_context_facts(example_context):
+    if not example_context:
+        return ""
 
-        elif analysis["needs_type_info"]:
-            instructions = """
-### Instructions for Type-Specific Queries:
-1. Focus on parameter types mentioned in the question
-2. Check each function's signature carefully
-3. List only functions whose parameters match the requested type
-4. Include the exact type signature for verification
-5. If Russian terms used (e.g., "массив байтов"), match to C++ types like:
-   - byte array → uint8_t*, char*, std::vector<uint8_t>, QByteArray
-   - string → std::string, char*, const char*
-   - integer → int, int32_t, int64_t, size_t
-6. CRITICAL: Verify the type match before including in the answer
-7. DO NOT include functions where you're unsure about the type
-8. After listing, perform SELF-VERIFICATION:
-   - For each function, quote the exact parameter type from the signature
-   - Explain why this type matches (or doesn't match) the query
-   - Mark uncertain matches with [TYPE UNCERTAIN]"""
+    target = example_context.get("target")
+    caller = example_context.get("caller")
+    observed_call = example_context.get("observed_call")
+    arg_shapes = list(example_context.get("arg_shapes") or [])
+    flow = example_context.get("file_data_flow_hints") or {}
 
-        elif analysis["follow_up"]:
-            instructions = """
-### Instructions for Follow-up Questions:
-1. This is a follow-up question - consider the conversation context
-2. If user references "these functions" or "from the list", use previous answer
-3. Maintain consistency with earlier responses
-4. Build upon previous information rather than repeating
-5. CRITICAL: If referencing functions from previous answer, verify they exist in current context
-6. If the current context doesn't contain previously mentioned functions, state this explicitly"""
+    if not target:
+        return ""
 
+    lines = [
+        "### Structured Example Facts",
+        "Target:",
+        f"- Name: {target.get('name', 'unknown')}",
+        f"- File: {_format_loc(target)}",
+        f"- Signature: {target.get('signature', '')}",
+        "Caller:",
+    ]
+
+    if caller:
+        lines.extend([
+            f"- Name: {caller.get('name', 'unknown')}",
+            f"- File: {_format_loc(caller)}",
+            f"- Signature: {caller.get('signature', '')}",
+        ])
+    else:
+        lines.append("- not found in selected context")
+
+    lines.append("Observed call-site:")
+    if observed_call:
+        lines.extend([
+            f"- Expr: {observed_call.get('expr', '')}",
+            f"- Arity: {observed_call.get('arity', 'unknown')}",
+        ])
+    else:
+        lines.append("- not found in selected context")
+
+    lines.append("Arg shapes:")
+    if arg_shapes:
+        for a in arg_shapes[:12]:
+            observed = a.get("observed_arg")
+            obs_suffix = f" <- observed `{observed}`" if observed else ""
+            lines.append(f"- [{a.get('index')}] {a.get('name')}: {a.get('type')} ({a.get('shape')}){obs_suffix}")
+    else:
+        lines.append("- no parameter metadata")
+
+    lines.append("File-data flow hints:")
+    lines.append(f"- requires_file_data: {bool(flow.get('requires_file_data'))}")
+    lines.append(f"- caller_reads_argv1: {bool(flow.get('caller_reads_argv1'))}")
+    lines.append(f"- target_uses_file_data: {bool(flow.get('target_uses_file_data'))}")
+    lines.append(f"- argv1_direct_to_target: {bool(flow.get('argv1_direct_to_target'))}")
+
+    src_vars = list(flow.get("source_vars") or [])
+    if src_vars:
+        lines.append(f"- source_vars: {', '.join(src_vars[:8])}")
+
+    return "\n".join(lines)
+
+
+def _build_constraint_text(analysis):
+    constraints = []
+    if analysis.get("needs_stdin"):
+        constraints.append("must read from stdin")
+    if analysis.get("needs_file"):
+        constraints.append("must read from files")
+    if analysis.get("needs_api"):
+        constraints.append("must make API/network calls")
+    if analysis.get("needs_output"):
+        constraints.append("must perform output/logging operations")
+    if analysis.get("needs_memory_mgmt"):
+        constraints.append("must involve memory/buffer management")
+    if analysis.get("needs_error_handling"):
+        constraints.append("must include error-handling paths")
+    if analysis.get("needs_params"):
+        constraints.append("must have input parameters")
+    if analysis.get("requested_types"):
+        constraints.append(f"must match requested types: {', '.join(analysis['requested_types'])}")
+    if analysis.get("needs_parse_like"):
+        constraints.append("should be parse/input-processing related")
+    if analysis.get("exclude_output"):
+        constraints.append("must NOT be write/output-like functions")
+    if analysis.get("needs_fuzz_targets"):
+        constraints.append("should be good fuzzing targets (parsing/decoding, memory handling, complex inputs)")
+    if analysis.get("path_filters"):
+        constraints.append(f"must be located in path/module: {', '.join(analysis['path_filters'])}")
+    if analysis.get("exclude_previously_listed"):
+        constraints.append("must exclude functions already listed in previous answers")
+
+    if not constraints:
+        return "No explicit hard constraints in query."
+
+    mode_text = (
+        "all positive constraints must hold"
+        if analysis.get("constraint_mode") == "all"
+        else "match strongest subset of positive constraints"
+    )
+    return f"Constraint mode: {mode_text}. Constraints: " + "; ".join(constraints)
+
+
+def _build_policy_layers_block():
+    return """
+### POLICY LAYERS
+MUST:
+- Use only functions from "Available Functions from Codebase".
+- Keep function name, file, line range, and signature exact.
+- Never invent functions, signatures, parameters, files, or line ranges.
+- If context is missing required evidence, state that explicitly.
+SHOULD:
+- Prefer real call-site evidence and real argument shapes from context.
+- Keep each item concise and tied to concrete evidence.
+NICE TO HAVE:
+- Briefly rank confidence/strength when returning multiple candidates.
+""".strip()
+
+
+def _build_listing_system_block(analysis, max_items):
+    fuzz_line = ""
+    summary_line = ""
+    if analysis.get("needs_fuzz_targets"):
+        fuzz_line = "\n- Fuzzable: `High|Medium|Low` - short risk rationale"
+        summary_line = "\nSummary: 1-2 sentences on strongest vs weaker candidates."
+
+    return f"""
+### SYSTEM BLOCK (LISTING)
+MUST:
+- Apply query constraints exactly.
+- Return at most {max_items} functions from context.
+- Use OUTPUT FORMAT exactly.
+SHOULD:
+- Rank strongest matches first.
+NICE TO HAVE:
+- Mark uncertain matches as `[NEEDS REVIEW]`.
+
+Constraints:
+- {_build_constraint_text(analysis)}
+
+### OUTPUT FORMAT (STRICT)
+1. **`function_name`**
+- File: `path:start-end`
+- Signature: `full signature`
+- Why it matches: one concise reason tied to query{fuzz_line}{summary_line}
+""".strip()
+
+
+def _build_example_system_block():
+    return """
+### SYSTEM BLOCK (EXAMPLE_GENERATION)
+MUST:
+- Use the exact target function signature from context (name, arity, types).
+- Ground example in real caller/callee usage from context when available.
+- Include a short "Evidence from codebase" note.
+- Evidence must include at least one `File: path:start-end` and one `Signature: ...`.
+- If query requests argv/file bytes, construct arguments from `argv[1]` bytes.
+- If caller evidence is missing, state that explicitly and provide minimal safe scaffold.
+SHOULD:
+- Make the snippet compilable and realistic for the shown signature.
+NICE TO HAVE:
+- Reuse naming/order patterns from observed call-sites.
+
+### OUTPUT FORMAT (STRICT)
+```cpp
+<compilable example>
+```
+Evidence from codebase:
+- File: `path:start-end`
+- Signature: `full signature`
+- File: `path:start-end` or `not found in provided context`
+- Signature: `full signature` or `not found in provided context`
+- Observed call: `callee(arg1, arg2)` or `not found in provided context`
+""".strip()
+
+
+def _build_explanation_system_block():
+    return """
+### SYSTEM BLOCK (IMPLEMENTATION_EXPLANATION)
+MUST:
+- Explain only behavior visible in provided code.
+- Quote concrete evidence via file/line references.
+- State unknowns explicitly instead of guessing.
+SHOULD:
+- Keep explanation step-wise and compact.
+NICE TO HAVE:
+- Mention notable edge cases and tradeoffs.
+
+### OUTPUT FORMAT (STRICT)
+- Purpose: <what function does>
+- Input handling: <how inputs are validated/parsed>
+- Core flow: <main steps>
+- Error handling: <checks/fail paths>
+- Return value: <what is returned and when>
+- Evidence: `path:start-end`
+""".strip()
+
+
+def _build_generic_system_block(analysis, max_items):
+    if analysis.get("needs_type_info"):
+        return f"""
+### SYSTEM BLOCK (TYPE_SPECIFIC)
+MUST:
+- Return at most {max_items} functions.
+- Match requested parameter types exactly from signature.
+- Use OUTPUT FORMAT exactly.
+SHOULD:
+- Prefer direct type matches over loose semantic matches.
+NICE TO HAVE:
+- Add one-line type mapping note when query uses natural language type names.
+
+### OUTPUT FORMAT (STRICT)
+1. **`function_name`**
+- File: `path:start-end`
+- Signature: `full signature`
+- Why it matches: concise type-based reason
+""".strip()
+
+    return f"""
+### SYSTEM BLOCK (GENERAL)
+MUST:
+- Use only current context functions.
+- Return at most {max_items} items if listing-like response is needed.
+SHOULD:
+- Keep answer focused on the question.
+NICE TO HAVE:
+- Add concise evidence references.
+""".strip()
+
+
+def _build_intent_system_block(analysis, max_items):
+    if not analysis:
+        return _build_generic_system_block({}, max_items)
+
+    query_type = analysis.get("query_type")
+    if query_type == "listing":
+        return _build_listing_system_block(analysis, max_items)
+    if query_type == "example_generation":
+        return _build_example_system_block()
+    if query_type == "implementation_explanation":
+        return _build_explanation_system_block()
+    return _build_generic_system_block(analysis, max_items)
+
+
+def _build_thinking_prompt_with_limit(
+    frags,
+    q,
+    analysis=None,
+    conversation_history=None,
+    code_char_limit=1500,
+    example_context=None,
+):
+    max_items = len(frags)
+    ctx = _render_function_context(frags, code_char_limit=code_char_limit)
+    history_ctx = _render_history_context(conversation_history)
+    example_ctx_block = ""
+    if (analysis or {}).get("query_type") == "example_generation":
+        example_ctx_block = _render_example_context_facts(example_context)
+    policy_block = _build_policy_layers_block()
+    intent_block = _build_intent_system_block(analysis or {}, max_items=max_items)
     thinking_instructions = """
-Think through the task step-by-step internally.
-Do NOT output the phase-by-phase reasoning.
-Return only the final answer with concise evidence (function name, file, signature, why it matches)."""
+### RESPONSE MODE
+Think silently. Do not output chain-of-thought.
+Return only final answer in the required format.
+""".strip()
 
     return f"""You are an expert code analyst with deep understanding of codebases.
 
@@ -210,7 +320,11 @@ Return only the final answer with concise evidence (function name, file, signatu
 
 ### Available Functions from Codebase:
 {ctx}
-{instructions}
+{example_ctx_block}
+{policy_block}
+
+{intent_block}
+
 {thinking_instructions}
 """
 
@@ -251,7 +365,15 @@ Question: {q}
 Answer:"""
 
 
-def _build_prompt_with_limits(frags, q, analysis=None, conversation_history=None, code_char_limit_thinking=1500, code_char_limit_simple=2000):
+def _build_prompt_with_limits(
+    frags,
+    q,
+    analysis=None,
+    conversation_history=None,
+    code_char_limit_thinking=1500,
+    code_char_limit_simple=2000,
+    example_context=None,
+):
     complex_types = ["listing", "example_generation", "implementation_explanation", "type_specific", "input_specific"]
     use_thinking = (analysis and analysis["query_type"] in complex_types) or (conversation_history and len(conversation_history) > 0)
 
@@ -262,12 +384,20 @@ def _build_prompt_with_limits(frags, q, analysis=None, conversation_history=None
             analysis=analysis,
             conversation_history=conversation_history,
             code_char_limit=code_char_limit_thinking,
+            example_context=example_context,
         )
 
     return _build_simple_prompt_with_limit(frags, q, code_char_limit=code_char_limit_simple)
 
 
-def build_prompt(frags, q, analysis=None, conversation_history=None, max_prompt_chars=DEFAULT_MAX_PROMPT_CHARS):
+def build_prompt(
+    frags,
+    q,
+    analysis=None,
+    conversation_history=None,
+    max_prompt_chars=DEFAULT_MAX_PROMPT_CHARS,
+    example_context=None,
+):
     """Build prompt with a total character budget.
 
     Strategy:
@@ -289,6 +419,7 @@ def build_prompt(frags, q, analysis=None, conversation_history=None, max_prompt_
             conversation_history=conversation_history,
             code_char_limit_thinking=limit,
             code_char_limit_simple=max(250, int(limit * 1.2)),
+            example_context=example_context,
         )
         last_prompt = prompt
         if len(prompt) <= max_prompt_chars:
@@ -305,6 +436,7 @@ def build_prompt(frags, q, analysis=None, conversation_history=None, max_prompt_
             conversation_history=conversation_history,
             code_char_limit_thinking=min_limit,
             code_char_limit_simple=max(250, int(min_limit * 1.2)),
+            example_context=example_context,
         )
         last_prompt = prompt
         if len(prompt) <= max_prompt_chars:

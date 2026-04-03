@@ -186,3 +186,172 @@ int main() {
     assert "file_reference" in v["missing_requirements"]
     assert "signature_reference" in v["missing_requirements"]
     assert "line_reference" in v["missing_requirements"]
+
+
+def test_example_verification_detects_target_call_arity_mismatch_as_consistency_issue():
+    context = [
+        {
+            "name": "parse_payload",
+            "file": "/repo/src/parser.cpp",
+            "start_line": 20,
+            "end_line": 60,
+            "signature": "parse_payload(const uint8_t * data, size_t n)",
+        },
+    ]
+    answer = """
+```cpp
+int main() {
+    parse_payload(nullptr);
+    return 0;
+}
+```
+Evidence from codebase:
+- File: `/repo/src/parser.cpp:20-60`
+- Signature: `parse_payload(const uint8_t * data, size_t n)`
+"""
+    v = verify_example_answer_with_context(
+        answer,
+        context,
+        target_function="parse_payload",
+        known_functions={"parse_payload"},
+    )
+    assert v["is_valid"] is True
+    assert "target_call_arity_mismatch" in v["consistency_issues"]
+    assert v["confidence_level"] in {"medium", "low"}
+
+
+def test_example_verification_requires_caller_and_observed_call_when_context_has_caller():
+    context = [
+        {
+            "name": "main",
+            "file": "/repo/tools/main.cpp",
+            "start_line": 10,
+            "end_line": 50,
+            "signature": "main(int argc, char ** argv)",
+        },
+        {
+            "name": "parse_payload",
+            "file": "/repo/src/parser.cpp",
+            "start_line": 20,
+            "end_line": 60,
+            "signature": "parse_payload(const uint8_t * data, size_t n)",
+        },
+    ]
+    example_context = {
+        "target": context[1],
+        "caller": context[0],
+        "observed_call": {"expr": "parse_payload(buf, n)", "args": ["buf", "n"], "arity": 2},
+        "arg_shapes": [],
+        "file_data_flow_hints": {"requires_file_data": False},
+    }
+    answer = """
+```cpp
+int main() {
+    parse_payload(nullptr, 0);
+    return 0;
+}
+```
+Evidence from codebase:
+- File: `/repo/src/parser.cpp:20-60`
+- Signature: `parse_payload(const uint8_t * data, size_t n)`
+"""
+    v = verify_example_answer_with_context(
+        answer,
+        context,
+        target_function="parse_payload",
+        known_functions={"main", "parse_payload"},
+        example_context=example_context,
+    )
+    assert v["is_valid"] is False
+    assert "caller_file_reference" in v["missing_requirements"]
+    assert "caller_signature_reference" in v["missing_requirements"]
+    assert "observed_call_reference" in v["missing_requirements"]
+
+
+def test_example_verification_rejects_file_based_example_without_argv1_to_target_flow():
+    context = [
+        {
+            "name": "main",
+            "file": "/repo/tools/main.cpp",
+            "start_line": 10,
+            "end_line": 50,
+            "signature": "main(int argc, char ** argv)",
+        },
+        {
+            "name": "parse_payload",
+            "file": "/repo/src/parser.cpp",
+            "start_line": 20,
+            "end_line": 60,
+            "signature": "parse_payload(const uint8_t * data, size_t n)",
+        },
+    ]
+    example_context = {
+        "target": context[1],
+        "caller": context[0],
+        "observed_call": {"expr": "parse_payload(buf, n)", "args": ["buf", "n"], "arity": 2},
+        "arg_shapes": [],
+        "file_data_flow_hints": {
+            "requires_file_data": True,
+            "caller_reads_argv1": True,
+            "source_vars": ["line"],
+        },
+    }
+    answer = """
+```cpp
+int main(int argc, char ** argv) {
+    std::ifstream file(argv[1]);
+    std::string line;
+    std::getline(file, line);
+    parse_payload(nullptr, 0);
+    return 0;
+}
+```
+Evidence from codebase:
+- File: `/repo/src/parser.cpp:20-60`
+- Signature: `parse_payload(const uint8_t * data, size_t n)`
+- File: `/repo/tools/main.cpp:10-50`
+- Signature: `main(int argc, char ** argv)`
+- Observed call: `parse_payload(buf, n)`
+"""
+    v = verify_example_answer_with_context(
+        answer,
+        context,
+        target_function="parse_payload",
+        known_functions={"main", "parse_payload"},
+        example_context=example_context,
+    )
+    assert v["is_valid"] is False
+    assert "file_data_flow_to_target" in v["missing_requirements"]
+    assert "file_data_not_used_in_target_call" in v["consistency_issues"]
+    assert v["confidence_level"] == "low"
+
+
+def test_example_verification_ignores_observed_call_noise_when_no_expected_caller_context():
+    context = [
+        {
+            "name": "split",
+            "file": "/repo/vendor/cpp-httplib/httplib.cpp",
+            "start_line": 1309,
+            "end_line": 1329,
+            "signature": "split(const char *b, const char *e, char d, size_t m, std::function<void(const char *, const char *)> fn)",
+        },
+    ]
+    answer = """
+```cpp
+int main(int argc, char ** argv) {
+    return 0;
+}
+```
+Evidence from codebase:
+- File: `/repo/vendor/cpp-httplib/httplib.cpp:1309-1329`
+- Signature: `split(const char *b, const char *e, char d, size_t m, std::function<void(const char *, const char *)> fn)`
+- Observed call: `not_the_target(foo, bar)`
+"""
+    v = verify_example_answer_with_context(
+        answer,
+        context,
+        target_function="split",
+        known_functions={"split"},
+        example_context={"target": context[0], "caller": None, "observed_call": None, "file_data_flow_hints": {"requires_file_data": False}},
+    )
+    assert "observed_call_not_target" not in v["consistency_issues"]

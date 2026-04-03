@@ -520,7 +520,23 @@ def test_alias_example_function_name_expands_to_example_query(tmp_path, monkeypa
     out = capsys.readouterr().out
 
     assert "Target function(s) not found in index" not in out
-    assert "### Current Question: Write an example of decode_binary_blob function that is called from main function and its parameters are constructed from data given from file in argv[1]" in captured_prompt["prompt"]
+    assert "### Current Question: Write an example of decode_binary_blob function." in captured_prompt["prompt"]
+    assert "define a standalone main()" in captured_prompt["prompt"]
+    assert "data given from file in argv[1]" in captured_prompt["prompt"]
+
+
+def test_alias_example_with_module_tail_preserves_module_constraint():
+    expanded, used = ask_app.expand_chat_alias("example split from module vendor/cpp-httplib")
+    assert used is True
+    assert expanded.startswith("Write an example of split function")
+    assert "from module vendor/cpp-httplib" in expanded
+    assert "split from module vendor/cpp-httplib function" not in expanded
+
+
+def test_alias_example_with_path_then_module_is_normalized():
+    expanded, used = ask_app.expand_chat_alias("example split from vendor/cpp-httplib/httplib.cpp module")
+    assert used is True
+    assert "from module vendor/cpp-httplib/httplib.cpp" in expanded
 
 
 def test_example_generation_does_not_emit_listing_verification_warning(tmp_path, monkeypatch, capsys):
@@ -704,6 +720,7 @@ def test_example_generation_prompt_contains_real_target_and_caller_locations(tmp
 
     prompt = captured_prompt["prompt"]
     assert "Include a short \"Evidence from codebase\" note" in prompt
+    assert "### Structured Example Facts" in prompt
     assert "File: /repo/tools/player/main.cpp:10-80" in prompt
     assert "File: /repo/vendor/miniaudio/miniaudio.h:26135-26407" in prompt
     assert "main(int argc, char ** argv)" in prompt
@@ -808,6 +825,666 @@ def test_example_generation_invalid_response_is_replaced_with_context_grounded_f
     assert "Evidence from codebase:" in out
     assert "File: `/repo/vendor/miniaudio/miniaudio.h:26135-26407`" in out
     assert "Signature: `ma_device_init__dsound(" in out
+
+
+def test_example_generation_second_pass_repairs_invalid_answer_without_fallback(tmp_path, monkeypatch, capsys):
+    index_dir = tmp_path / "index_data"
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = [
+        {
+            "id": 0,
+            "name": "main",
+            "file": "/repo/tools/player/main.cpp",
+            "start_line": 10,
+            "end_line": 80,
+            "signature": "main(int argc, char ** argv)",
+            "parameters": [
+                {"name": "argc", "type": "int", "raw": "int argc"},
+                {"name": "argv", "type": "char **", "raw": "char ** argv"},
+            ],
+            "code": "int main(int argc, char ** argv) { ma_device_init__dsound(&device, &cfg, &pb, &cp); return 0; }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": False,
+            "has_error_handling": True,
+        },
+        {
+            "id": 1,
+            "name": "ma_device_init__dsound",
+            "file": "/repo/vendor/miniaudio/miniaudio.h",
+            "start_line": 26135,
+            "end_line": 26407,
+            "signature": "ma_device_init__dsound(ma_device* pDevice, const ma_device_config* pConfig, ma_device_descriptor* pDescriptorPlayback, ma_device_descriptor* pDescriptorCapture)",
+            "parameters": [
+                {"name": "pDevice", "type": "ma_device*", "raw": "ma_device* pDevice"},
+                {"name": "pConfig", "type": "const ma_device_config*", "raw": "const ma_device_config* pConfig"},
+                {"name": "pDescriptorPlayback", "type": "ma_device_descriptor*", "raw": "ma_device_descriptor* pDescriptorPlayback"},
+                {"name": "pDescriptorCapture", "type": "ma_device_descriptor*", "raw": "ma_device_descriptor* pDescriptorCapture"},
+            ],
+            "code": "ma_result ma_device_init__dsound(ma_device* pDevice, const ma_device_config* pConfig, ma_device_descriptor* pDescriptorPlayback, ma_device_descriptor* pDescriptorCapture) { return MA_SUCCESS; }",
+            "has_stdin": False,
+            "has_file_input": False,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": True,
+            "has_error_handling": True,
+        },
+    ]
+
+    with open(index_dir / "meta.jsonl", "w", encoding="utf-8") as f:
+        for row in meta:
+            f.write(json.dumps(row) + "\n")
+
+    _write_json(index_dir / "lexical_index.json", {})
+    _write_json(index_dir / "special_indices.json", {
+        "stdin": [],
+        "file_input": [0],
+        "api_calls": [],
+        "output": [],
+        "memory_management": [1],
+        "error_handling": [0, 1],
+        "by_type": {"byte_array": [0], "string": [], "integer": []},
+    })
+    _write_json(index_dir / "symbols.json", {"main": [0], "ma_device_init__dsound": [1]})
+    _write_json(index_dir / "call_graph.json", {
+        "0": {"called_by": [], "resolved_calls": [1]},
+        "1": {"called_by": [0], "resolved_calls": []},
+    })
+    _write_json(index_dir / "called_by.json", {"0": [], "1": [0], "main": [], "ma_device_init__dsound": [0]})
+
+    llm_payloads = iter([
+        {"response": "invalid answer without evidence"},
+        {"response": "still invalid candidate without grounded evidence"},
+        {
+            "response": (
+                "```cpp\n"
+                "int main(int argc, char ** argv) {\n"
+                "    std::ifstream in(argv[1], std::ios::binary);\n"
+                "    std::vector<uint8_t> input_bytes;\n"
+                "    input_bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());\n"
+                "    ma_device device{};\n"
+                "    ma_device_descriptor pb{};\n"
+                "    ma_device_descriptor cp{};\n"
+                "    auto rc = ma_device_init__dsound(&device, reinterpret_cast<const ma_device_config *>(input_bytes.data()), &pb, &cp);\n"
+                "    (void)rc;\n"
+                "    return 0;\n"
+                "}\n"
+                "```\n"
+                "Evidence from codebase:\n"
+                "- File: `/repo/vendor/miniaudio/miniaudio.h:26135-26407`\n"
+                "- Signature: `ma_device_init__dsound(ma_device* pDevice, const ma_device_config* pConfig, ma_device_descriptor* pDescriptorPlayback, ma_device_descriptor* pDescriptorCapture)`\n"
+                "- File: `/repo/tools/player/main.cpp:10-80`\n"
+                "- Signature: `main(int argc, char ** argv)`\n"
+                "- Observed call: `ma_device_init__dsound(&device, &cfg, &pb, &cp)`\n"
+            )
+        },
+    ])
+    call_count = {"n": 0}
+
+    def _fake_post(_url, **_kwargs):
+        call_count["n"] += 1
+        return _Resp(next(llm_payloads))
+
+    monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(len(meta)))
+    monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
+    monkeypatch.setattr(ask_app, "CrossEncoder", _DummyCrossEncoder)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _fake_post)
+
+    inputs = iter([
+        "Write an example of ma_device_init__dsound function that is called from main function and its parameters are constructed from file bytes given in argv[1]",
+        "quit",
+    ])
+    monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
+    monkeypatch.setattr(sys, "argv", [
+        "ask_fuzz_coder.py",
+        "--index_dir", str(index_dir),
+        "--model", "dummy-model",
+        "--verbose",
+    ])
+
+    ask_app.main()
+    out = capsys.readouterr().out
+
+    assert call_count["n"] == 3
+    assert "[Example Second Pass]" in out
+    assert "Accepted second-pass repaired answer" in out
+    assert "Replaced model output with deterministic context-based example" not in out
+    assert "ma_device_init__dsound(&device, &cfg, &pb, &cp)" in out
+    assert "Evidence from codebase:" in out
+
+
+def test_example_generation_second_pass_repairs_target_call_arity_mismatch(tmp_path, monkeypatch, capsys):
+    index_dir = tmp_path / "index_data"
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = [
+        {
+            "id": 0,
+            "name": "main",
+            "file": "/repo/tools/main.cpp",
+            "start_line": 1,
+            "end_line": 70,
+            "signature": "main(int argc, char ** argv)",
+            "parameters": [
+                {"name": "argc", "type": "int", "raw": "int argc"},
+                {"name": "argv", "type": "char **", "raw": "char ** argv"},
+            ],
+            "code": "int main(int argc, char ** argv) { return parse_payload(buf, n); }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": False,
+            "has_error_handling": True,
+        },
+        {
+            "id": 1,
+            "name": "parse_payload",
+            "file": "/repo/src/parser.cpp",
+            "start_line": 20,
+            "end_line": 60,
+            "signature": "parse_payload(const uint8_t * data, size_t n)",
+            "parameters": [
+                {"name": "data", "type": "const uint8_t *", "raw": "const uint8_t * data"},
+                {"name": "n", "type": "size_t", "raw": "size_t n"},
+            ],
+            "code": "int parse_payload(const uint8_t * data, size_t n) { return (int)n; }",
+            "has_stdin": False,
+            "has_file_input": False,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": True,
+            "has_error_handling": True,
+        },
+    ]
+
+    with open(index_dir / "meta.jsonl", "w", encoding="utf-8") as f:
+        for row in meta:
+            f.write(json.dumps(row) + "\n")
+
+    _write_json(index_dir / "lexical_index.json", {})
+    _write_json(index_dir / "special_indices.json", {
+        "stdin": [],
+        "file_input": [0],
+        "api_calls": [],
+        "output": [],
+        "memory_management": [1],
+        "error_handling": [0, 1],
+        "by_type": {"byte_array": [1], "string": [], "integer": [1]},
+    })
+    _write_json(index_dir / "symbols.json", {"main": [0], "parse_payload": [1]})
+    _write_json(index_dir / "call_graph.json", {
+        "0": {"called_by": [], "resolved_calls": [1]},
+        "1": {"called_by": [0], "resolved_calls": []},
+    })
+    _write_json(index_dir / "called_by.json", {"0": [], "1": [0], "main": [], "parse_payload": [0]})
+
+    llm_payloads = iter([
+        {
+            "response": (
+                "```cpp\n"
+                "int main(int argc, char ** argv) {\n"
+                "    std::ifstream in(argv[1], std::ios::binary);\n"
+                "    std::vector<uint8_t> buf;\n"
+                "    buf.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());\n"
+                "    parse_payload(buf.data());\n"
+                "    return 0;\n"
+                "}\n"
+                "```\n"
+                "Evidence from codebase:\n"
+                "- File: `/repo/src/parser.cpp:20-60`\n"
+                "- Signature: `parse_payload(const uint8_t * data, size_t n)`\n"
+                "- File: `/repo/tools/main.cpp:1-70`\n"
+                "- Signature: `main(int argc, char ** argv)`\n"
+                "- Observed call: `parse_payload(buf, n)`\n"
+            )
+        },
+        {
+            "response": (
+                "```cpp\n"
+                "int main(int argc, char ** argv) {\n"
+                "    std::ifstream in(argv[1], std::ios::binary);\n"
+                "    std::vector<uint8_t> buf;\n"
+                "    buf.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());\n"
+                "    parse_payload(buf.data());\n"
+                "    return 0;\n"
+                "}\n"
+                "```\n"
+                "Evidence from codebase:\n"
+                "- File: `/repo/src/parser.cpp:20-60`\n"
+                "- Signature: `parse_payload(const uint8_t * data, size_t n)`\n"
+                "- File: `/repo/tools/main.cpp:1-70`\n"
+                "- Signature: `main(int argc, char ** argv)`\n"
+                "- Observed call: `parse_payload(buf, n)`\n"
+            )
+        },
+        {
+            "response": (
+                "```cpp\n"
+                "int main(int argc, char ** argv) {\n"
+                "    std::ifstream in(argv[1], std::ios::binary);\n"
+                "    std::vector<uint8_t> buf;\n"
+                "    buf.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());\n"
+                "    parse_payload(buf.data(), buf.size());\n"
+                "    return 0;\n"
+                "}\n"
+                "```\n"
+                "Evidence from codebase:\n"
+                "- File: `/repo/src/parser.cpp:20-60`\n"
+                "- Signature: `parse_payload(const uint8_t * data, size_t n)`\n"
+                "- File: `/repo/tools/main.cpp:1-70`\n"
+                "- Signature: `main(int argc, char ** argv)`\n"
+                "- Observed call: `parse_payload(buf, n)`\n"
+            )
+        },
+    ])
+    call_count = {"n": 0}
+
+    def _fake_post(_url, **_kwargs):
+        call_count["n"] += 1
+        return _Resp(next(llm_payloads))
+
+    monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(len(meta)))
+    monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
+    monkeypatch.setattr(ask_app, "CrossEncoder", _DummyCrossEncoder)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _fake_post)
+
+    inputs = iter([
+        "Write an example of parse_payload function that is called from main function and its parameters are constructed from data given from file in argv[1]",
+        "quit",
+    ])
+    monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
+    monkeypatch.setattr(sys, "argv", [
+        "ask_fuzz_coder.py",
+        "--index_dir", str(index_dir),
+        "--model", "dummy-model",
+        "--verbose",
+    ])
+
+    ask_app.main()
+    out = capsys.readouterr().out
+
+    assert call_count["n"] == 3
+    assert "[Example Second Pass]" in out
+    assert "target_call_arity_mismatch" in out
+    assert "Accepted second-pass repaired answer" in out
+    assert "Replaced model output with deterministic context-based example" not in out
+
+
+def test_example_generation_rejects_when_file_bytes_not_used_in_target_call(tmp_path, monkeypatch, capsys):
+    index_dir = tmp_path / "index_data"
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = [
+        {
+            "id": 0,
+            "name": "main",
+            "file": "/repo/tools/main.cpp",
+            "start_line": 1,
+            "end_line": 70,
+            "signature": "main(int argc, char ** argv)",
+            "parameters": [],
+            "code": "int main(int argc, char ** argv) { return parse_payload(buf, n); }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": False,
+            "has_error_handling": True,
+        },
+        {
+            "id": 1,
+            "name": "parse_payload",
+            "file": "/repo/src/parser.cpp",
+            "start_line": 20,
+            "end_line": 60,
+            "signature": "parse_payload(const uint8_t * data, size_t n)",
+            "parameters": [
+                {"name": "data", "type": "const uint8_t *", "raw": "const uint8_t * data"},
+                {"name": "n", "type": "size_t", "raw": "size_t n"},
+            ],
+            "code": "int parse_payload(const uint8_t * data, size_t n) { return (int)n; }",
+            "has_stdin": False,
+            "has_file_input": False,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": True,
+            "has_error_handling": True,
+        },
+    ]
+
+    with open(index_dir / "meta.jsonl", "w", encoding="utf-8") as f:
+        for row in meta:
+            f.write(json.dumps(row) + "\n")
+
+    _write_json(index_dir / "lexical_index.json", {})
+    _write_json(index_dir / "special_indices.json", {
+        "stdin": [],
+        "file_input": [0],
+        "api_calls": [],
+        "output": [],
+        "memory_management": [1],
+        "error_handling": [0, 1],
+        "by_type": {"byte_array": [1], "string": [], "integer": [1]},
+    })
+    _write_json(index_dir / "symbols.json", {"main": [0], "parse_payload": [1]})
+    _write_json(index_dir / "call_graph.json", {
+        "0": {"called_by": [], "resolved_calls": [1]},
+        "1": {"called_by": [0], "resolved_calls": []},
+    })
+    _write_json(index_dir / "called_by.json", {"0": [], "1": [0], "main": [], "parse_payload": [0]})
+
+    def _fake_post(_url, **_kwargs):
+        return _Resp({
+            "response": (
+                "```cpp\n"
+                "int main(int argc, char ** argv) {\n"
+                "    std::ifstream file(argv[1]);\n"
+                "    std::string line;\n"
+                "    std::getline(file, line);\n"
+                "    parse_payload(nullptr, 0);\n"
+                "    return 0;\n"
+                "}\n"
+                "```\n"
+                "Evidence from codebase:\n"
+                "- File: `/repo/src/parser.cpp:20-60`\n"
+                "- Signature: `parse_payload(const uint8_t * data, size_t n)`\n"
+                "- File: `/repo/tools/main.cpp:1-70`\n"
+                "- Signature: `main(int argc, char ** argv)`\n"
+                "- Observed call: `parse_payload(buf, n)`\n"
+            )
+        })
+
+    monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(len(meta)))
+    monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
+    monkeypatch.setattr(ask_app, "CrossEncoder", _DummyCrossEncoder)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _fake_post)
+
+    inputs = iter([
+        "Write an example of parse_payload function that is called from main function and its parameters are constructed from data given from file in argv[1]",
+        "quit",
+    ])
+    monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
+    monkeypatch.setattr(sys, "argv", [
+        "ask_fuzz_coder.py",
+        "--index_dir", str(index_dir),
+        "--model", "dummy-model",
+        "--verbose",
+    ])
+
+    ask_app.main()
+    out = capsys.readouterr().out
+
+    assert "[⚠️  EXAMPLE VERIFICATION WARNING]" in out
+    assert "file_data_flow_to_target" in out
+    assert "Replaced model output with deterministic context-based example" in out
+
+
+def test_example_generation_second_pass_repairs_missing_argv1_to_target_data_flow(tmp_path, monkeypatch, capsys):
+    index_dir = tmp_path / "index_data"
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = [
+        {
+            "id": 0,
+            "name": "main",
+            "file": "/repo/tools/main.cpp",
+            "start_line": 1,
+            "end_line": 70,
+            "signature": "main(int argc, char ** argv)",
+            "parameters": [],
+            "code": "int main(int argc, char ** argv) { return parse_payload(buf, n); }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": False,
+            "has_error_handling": True,
+        },
+        {
+            "id": 1,
+            "name": "parse_payload",
+            "file": "/repo/src/parser.cpp",
+            "start_line": 20,
+            "end_line": 60,
+            "signature": "parse_payload(const uint8_t * data, size_t n)",
+            "parameters": [
+                {"name": "data", "type": "const uint8_t *", "raw": "const uint8_t * data"},
+                {"name": "n", "type": "size_t", "raw": "size_t n"},
+            ],
+            "code": "int parse_payload(const uint8_t * data, size_t n) { return (int)n; }",
+            "has_stdin": False,
+            "has_file_input": False,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": True,
+            "has_error_handling": True,
+        },
+    ]
+
+    with open(index_dir / "meta.jsonl", "w", encoding="utf-8") as f:
+        for row in meta:
+            f.write(json.dumps(row) + "\n")
+
+    _write_json(index_dir / "lexical_index.json", {})
+    _write_json(index_dir / "special_indices.json", {
+        "stdin": [],
+        "file_input": [0],
+        "api_calls": [],
+        "output": [],
+        "memory_management": [1],
+        "error_handling": [0, 1],
+        "by_type": {"byte_array": [1], "string": [], "integer": [1]},
+    })
+    _write_json(index_dir / "symbols.json", {"main": [0], "parse_payload": [1]})
+    _write_json(index_dir / "call_graph.json", {
+        "0": {"called_by": [], "resolved_calls": [1]},
+        "1": {"called_by": [0], "resolved_calls": []},
+    })
+    _write_json(index_dir / "called_by.json", {"0": [], "1": [0], "main": [], "parse_payload": [0]})
+
+    llm_payloads = iter([
+        {
+            "response": (
+                "```cpp\n"
+                "int main(int argc, char ** argv) {\n"
+                "    std::ifstream file(argv[1]);\n"
+                "    std::string line;\n"
+                "    std::getline(file, line);\n"
+                "    parse_payload(nullptr, 0);\n"
+                "    return 0;\n"
+                "}\n"
+                "```\n"
+                "Evidence from codebase:\n"
+                "- File: `/repo/src/parser.cpp:20-60`\n"
+                "- Signature: `parse_payload(const uint8_t * data, size_t n)`\n"
+                "- File: `/repo/tools/main.cpp:1-70`\n"
+                "- Signature: `main(int argc, char ** argv)`\n"
+                "- Observed call: `parse_payload(buf, n)`\n"
+            )
+        },
+        {
+            "response": (
+                "```cpp\n"
+                "int main(int argc, char ** argv) {\n"
+                "    std::ifstream file(argv[1]);\n"
+                "    std::string line;\n"
+                "    std::getline(file, line);\n"
+                "    parse_payload(nullptr, 0);\n"
+                "    return 0;\n"
+                "}\n"
+                "```\n"
+                "Evidence from codebase:\n"
+                "- File: `/repo/src/parser.cpp:20-60`\n"
+                "- Signature: `parse_payload(const uint8_t * data, size_t n)`\n"
+                "- File: `/repo/tools/main.cpp:1-70`\n"
+                "- Signature: `main(int argc, char ** argv)`\n"
+                "- Observed call: `parse_payload(buf, n)`\n"
+            )
+        },
+        {
+            "response": (
+                "```cpp\n"
+                "int main(int argc, char ** argv) {\n"
+                "    std::ifstream in(argv[1], std::ios::binary);\n"
+                "    std::vector<uint8_t> input_bytes;\n"
+                "    input_bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());\n"
+                "    parse_payload(input_bytes.data(), input_bytes.size());\n"
+                "    return 0;\n"
+                "}\n"
+                "```\n"
+                "Evidence from codebase:\n"
+                "- File: `/repo/src/parser.cpp:20-60`\n"
+                "- Signature: `parse_payload(const uint8_t * data, size_t n)`\n"
+                "- File: `/repo/tools/main.cpp:1-70`\n"
+                "- Signature: `main(int argc, char ** argv)`\n"
+                "- Observed call: `parse_payload(buf, n)`\n"
+            )
+        },
+    ])
+    call_count = {"n": 0}
+
+    def _fake_post(_url, **_kwargs):
+        call_count["n"] += 1
+        return _Resp(next(llm_payloads))
+
+    monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(len(meta)))
+    monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
+    monkeypatch.setattr(ask_app, "CrossEncoder", _DummyCrossEncoder)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _fake_post)
+
+    inputs = iter([
+        "Write an example of parse_payload function that is called from main function and its parameters are constructed from data given from file in argv[1]",
+        "quit",
+    ])
+    monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
+    monkeypatch.setattr(sys, "argv", [
+        "ask_fuzz_coder.py",
+        "--index_dir", str(index_dir),
+        "--model", "dummy-model",
+        "--verbose",
+    ])
+
+    ask_app.main()
+    out = capsys.readouterr().out
+
+    assert call_count["n"] == 3
+    assert "[Example Second Pass]" in out
+    assert "file_data_not_used_in_target_call" in out
+    assert "Accepted second-pass repaired answer" in out
+    assert "Replaced model output with deterministic context-based example" not in out
+
+
+def test_example_generation_rejects_wrong_caller_evidence_and_falls_back(tmp_path, monkeypatch, capsys):
+    index_dir = tmp_path / "index_data"
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = [
+        {
+            "id": 0,
+            "name": "main",
+            "file": "/repo/tools/main.cpp",
+            "start_line": 1,
+            "end_line": 70,
+            "signature": "main(int argc, char ** argv)",
+            "parameters": [],
+            "code": "int main(int argc, char ** argv) { return parse_payload(buf, n); }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": False,
+            "has_error_handling": True,
+        },
+        {
+            "id": 1,
+            "name": "parse_payload",
+            "file": "/repo/src/parser.cpp",
+            "start_line": 20,
+            "end_line": 60,
+            "signature": "parse_payload(const uint8_t * data, size_t n)",
+            "parameters": [
+                {"name": "data", "type": "const uint8_t *", "raw": "const uint8_t * data"},
+                {"name": "n", "type": "size_t", "raw": "size_t n"},
+            ],
+            "code": "int parse_payload(const uint8_t * data, size_t n) { return (int)n; }",
+            "has_stdin": False,
+            "has_file_input": False,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": True,
+            "has_error_handling": True,
+        },
+    ]
+
+    with open(index_dir / "meta.jsonl", "w", encoding="utf-8") as f:
+        for row in meta:
+            f.write(json.dumps(row) + "\n")
+
+    _write_json(index_dir / "lexical_index.json", {})
+    _write_json(index_dir / "special_indices.json", {
+        "stdin": [],
+        "file_input": [0],
+        "api_calls": [],
+        "output": [],
+        "memory_management": [1],
+        "error_handling": [0, 1],
+        "by_type": {"byte_array": [1], "string": [], "integer": [1]},
+    })
+    _write_json(index_dir / "symbols.json", {"main": [0], "parse_payload": [1]})
+    _write_json(index_dir / "call_graph.json", {
+        "0": {"called_by": [], "resolved_calls": [1]},
+        "1": {"called_by": [0], "resolved_calls": []},
+    })
+    _write_json(index_dir / "called_by.json", {"0": [], "1": [0], "main": [], "parse_payload": [0]})
+
+    def _fake_post(_url, **_kwargs):
+        return _Resp({
+            "response": (
+                "```cpp\n"
+                "int main(int argc, char ** argv) {\n"
+                "    std::ifstream in(argv[1], std::ios::binary);\n"
+                "    std::vector<uint8_t> buf;\n"
+                "    buf.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());\n"
+                "    parse_payload(buf.data(), buf.size());\n"
+                "    return 0;\n"
+                "}\n"
+                "```\n"
+                "Evidence from codebase:\n"
+                "- File: `/repo/src/parser.cpp:20-60`\n"
+                "- Signature: `parse_payload(const uint8_t * data, size_t n)`\n"
+                "- File: `/repo/other/not_main.cpp:1-70`\n"
+                "- Signature: `worker_main(int argc, char ** argv)`\n"
+                "- Observed call: `parse_payload(buf, n)`\n"
+            )
+        })
+
+    monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(len(meta)))
+    monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
+    monkeypatch.setattr(ask_app, "CrossEncoder", _DummyCrossEncoder)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _fake_post)
+
+    inputs = iter([
+        "Write an example of parse_payload function that is called from main function and its parameters are constructed from data given from file in argv[1]",
+        "quit",
+    ])
+    monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
+    monkeypatch.setattr(sys, "argv", [
+        "ask_fuzz_coder.py",
+        "--index_dir", str(index_dir),
+        "--model", "dummy-model",
+        "--verbose",
+    ])
+
+    ask_app.main()
+    out = capsys.readouterr().out
+
+    assert "[⚠️  EXAMPLE VERIFICATION WARNING]" in out
+    assert "caller_file_reference" in out or "caller_signature_reference" in out
+    assert "Replaced model output with deterministic context-based example" in out
 
 
 def test_example_generation_missing_target_function_fails_fast_without_llm(tmp_path, monkeypatch, capsys):
@@ -979,3 +1656,220 @@ def test_listing_hallucinated_output_replaced_with_context_listing(tmp_path, mon
     assert "parse_json_payload" in out
     assert "decode_binary_blob" in out
     assert "DEPRECATED" not in out
+
+
+def _prepare_parse_payload_example_index(index_dir):
+    meta = [
+        {
+            "id": 0,
+            "name": "main",
+            "file": "/repo/tools/main.cpp",
+            "start_line": 1,
+            "end_line": 70,
+            "signature": "main(int argc, char ** argv)",
+            "parameters": [
+                {"name": "argc", "type": "int", "raw": "int argc"},
+                {"name": "argv", "type": "char **", "raw": "char ** argv"},
+            ],
+            "code": "int main(int argc, char ** argv) { return parse_payload(buf, n); }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": False,
+            "has_error_handling": True,
+        },
+        {
+            "id": 1,
+            "name": "parse_payload",
+            "file": "/repo/src/parser.cpp",
+            "start_line": 20,
+            "end_line": 60,
+            "signature": "parse_payload(const uint8_t * data, size_t n)",
+            "parameters": [
+                {"name": "data", "type": "const uint8_t *", "raw": "const uint8_t * data"},
+                {"name": "n", "type": "size_t", "raw": "size_t n"},
+            ],
+            "code": "int parse_payload(const uint8_t * data, size_t n) { return (int)n; }",
+            "has_stdin": False,
+            "has_file_input": False,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": True,
+            "has_error_handling": True,
+        },
+    ]
+
+    with open(index_dir / "meta.jsonl", "w", encoding="utf-8") as f:
+        for row in meta:
+            f.write(json.dumps(row) + "\n")
+
+    _write_json(index_dir / "lexical_index.json", {})
+    _write_json(index_dir / "special_indices.json", {
+        "stdin": [],
+        "file_input": [0],
+        "api_calls": [],
+        "output": [],
+        "memory_management": [1],
+        "error_handling": [0, 1],
+        "by_type": {"byte_array": [1], "string": [], "integer": [1]},
+    })
+    _write_json(index_dir / "symbols.json", {"main": [0], "parse_payload": [1]})
+    _write_json(index_dir / "call_graph.json", {
+        "0": {"called_by": [], "resolved_calls": [1]},
+        "1": {"called_by": [0], "resolved_calls": []},
+    })
+    _write_json(index_dir / "called_by.json", {"0": [], "1": [0], "main": [], "parse_payload": [0]})
+
+
+def test_example_dual_pass_both_candidates_conflicting_forces_fallback(tmp_path, monkeypatch, capsys):
+    index_dir = tmp_path / "index_data"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    _prepare_parse_payload_example_index(index_dir)
+
+    llm_payloads = iter([
+        {"response": "invalid answer without evidence"},
+        {
+            "response": (
+                "```cpp\n"
+                "int main(int argc, char ** argv) {\n"
+                "    std::ifstream in(argv[1], std::ios::binary);\n"
+                "    std::vector<uint8_t> buf;\n"
+                "    buf.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());\n"
+                "    parse_payload(buf.data());\n"
+                "    return 0;\n"
+                "}\n"
+                "```\n"
+                "Evidence from codebase:\n"
+                "- File: `/repo/src/parser.cpp:20-60`\n"
+                "- Signature: `parse_payload(const uint8_t * data, size_t n)`\n"
+                "- File: `/repo/tools/main.cpp:1-70`\n"
+                "- Signature: `main(int argc, char ** argv)`\n"
+                "- Observed call: `parse_payload(buf, n)`\n"
+            )
+        },
+        {
+            "response": (
+                "```cpp\n"
+                "int main(int argc, char ** argv) {\n"
+                "    std::ifstream in(argv[1], std::ios::binary);\n"
+                "    std::vector<uint8_t> buf;\n"
+                "    buf.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());\n"
+                "    parse_payload(nullptr, 0);\n"
+                "    return 0;\n"
+                "}\n"
+                "```\n"
+                "Evidence from codebase:\n"
+                "- File: `/repo/src/parser.cpp:20-60`\n"
+                "- Signature: `parse_payload(const uint8_t * data, size_t n)`\n"
+                "- File: `/repo/tools/main.cpp:1-70`\n"
+                "- Signature: `main(int argc, char ** argv)`\n"
+                "- Observed call: `parse_payload(buf, n)`\n"
+            )
+        },
+    ])
+    call_count = {"n": 0}
+
+    def _fake_post(_url, **_kwargs):
+        call_count["n"] += 1
+        return _Resp(next(llm_payloads))
+
+    monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(2))
+    monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
+    monkeypatch.setattr(ask_app, "CrossEncoder", _DummyCrossEncoder)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _fake_post)
+
+    inputs = iter([
+        "Write an example of parse_payload function that is called from main function and its parameters are constructed from data given from file in argv[1]",
+        "quit",
+    ])
+    monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
+    monkeypatch.setattr(sys, "argv", [
+        "ask_fuzz_coder.py",
+        "--index_dir", str(index_dir),
+        "--model", "dummy-model",
+        "--verbose",
+    ])
+
+    ask_app.main()
+    out = capsys.readouterr().out
+
+    assert call_count["n"] == 3
+    assert "[Example Second Pass]" in out
+    assert "No consistent candidate from dual-pass runner; fallback will be used" in out
+    assert "Replaced model output with deterministic context-based example" in out
+
+
+def test_example_dual_pass_prefers_more_grounded_candidate_deterministically(tmp_path, monkeypatch, capsys):
+    index_dir = tmp_path / "index_data"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    _prepare_parse_payload_example_index(index_dir)
+
+    llm_payloads = iter([
+        {"response": "invalid answer without evidence"},
+        {
+            "response": (
+                "int main(int argc, char ** argv) {\n"
+                "    parse_payload(reinterpret_cast<const uint8_t *>(argv[1]), 1);\n"
+                "    return 0;\n"
+                "}\n"
+                "Evidence from codebase:\n"
+                "- File: `/repo/src/parser.cpp:20-60`\n"
+                "- Signature: `parse_payload(const uint8_t * data, size_t n)`\n"
+                "- File: `/repo/tools/main.cpp:1-70`\n"
+                "- Signature: `main(int argc, char ** argv)`\n"
+                "- Observed call: `parse_payload(buf, n)`\n"
+            )
+        },
+        {
+            "response": (
+                "```cpp\n"
+                "int main(int argc, char ** argv) {\n"
+                "    std::ifstream in(argv[1], std::ios::binary);\n"
+                "    std::vector<uint8_t> input_bytes;\n"
+                "    input_bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());\n"
+                "    parse_payload(input_bytes.data(), input_bytes.size());\n"
+                "    return 0;\n"
+                "}\n"
+                "```\n"
+                "Evidence from codebase:\n"
+                "- File: `/repo/src/parser.cpp:20-60`\n"
+                "- Signature: `parse_payload(const uint8_t * data, size_t n)`\n"
+                "- File: `/repo/tools/main.cpp:1-70`\n"
+                "- Signature: `main(int argc, char ** argv)`\n"
+                "- Observed call: `parse_payload(buf, n)`\n"
+            )
+        },
+    ])
+    call_count = {"n": 0}
+
+    def _fake_post(_url, **_kwargs):
+        call_count["n"] += 1
+        return _Resp(next(llm_payloads))
+
+    monkeypatch.setattr(ask_app.faiss, "read_index", lambda _p: _FakeFaissIndex(2))
+    monkeypatch.setattr(ask_app, "get_embedding_backend", lambda *a, **k: _DummyEmbeddingBackend())
+    monkeypatch.setattr(ask_app, "CrossEncoder", _DummyCrossEncoder)
+    monkeypatch.setattr("fuzz_coder.ask.llm.requests.post", _fake_post)
+
+    inputs = iter([
+        "Write an example of parse_payload function that is called from main function and its parameters are constructed from data given from file in argv[1]",
+        "quit",
+    ])
+    monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
+    monkeypatch.setattr(sys, "argv", [
+        "ask_fuzz_coder.py",
+        "--index_dir", str(index_dir),
+        "--model", "dummy-model",
+        "--verbose",
+    ])
+
+    ask_app.main()
+    out = capsys.readouterr().out
+
+    assert call_count["n"] == 3
+    assert "[Example Second Pass]" in out
+    assert "Accepted second-pass repaired answer" in out
+    assert "Winner: candidate_2" in out
+    assert "std::vector<uint8_t> input_bytes;" in out
+    assert "parse_payload(reinterpret_cast<const uint8_t *>(argv[1]), 1);" not in out
