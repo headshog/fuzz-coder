@@ -48,9 +48,38 @@ QUERY_SYMBOL_BLACKLIST = {
     # High-frequency generic nouns/verbs that often appear in prompts and
     # should not become target symbols unless explicitly code-like.
     "data", "line", "value", "values", "path", "file", "module", "directory",
-    "input", "output", "request", "response", "process",
+    "input", "output", "request", "response", "process", "format", "context", "range", "role",
     "construct", "constructed", "build", "built", "define", "generated", "snippet",
 }
+
+
+def extract_explicit_function_mentions(
+    query: str,
+    known_symbols_by_lower: Dict[str, List[str]] | None = None,
+) -> List[str]:
+    """Extract only high-confidence function mentions (code-like/explicit)."""
+    known_symbols_by_lower = known_symbols_by_lower or {}
+    found: List[str] = []
+    seen = set()
+
+    patterns = [
+        r"`([^`]+)`",  # explicit backticked symbol
+        r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*(?=\()",  # call-like mention
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, query):
+            token = (m.group(1) or "").strip().strip("`'\".,:;!?()[]{}")
+            if not token:
+                continue
+            token_lower = token.lower()
+            if token_lower in QUERY_SYMBOL_BLACKLIST:
+                continue
+            resolved = known_symbols_by_lower.get(token_lower, [token])
+            for fn in resolved:
+                if fn not in seen:
+                    seen.add(fn)
+                    found.append(fn)
+    return found
 
 
 def query_contains_keyword(query_lower: str, keyword: str) -> bool:
@@ -149,6 +178,27 @@ def extract_path_filters_from_query(query: str) -> List[str]:
             seen.add(f)
             out.append(f)
     return out
+
+
+def extract_max_param_count(query_lower: str) -> int | None:
+    """Extract upper bound for function parameter count from query text."""
+    patterns = [
+        r"\b(?:at most|no more than|up to|max(?:imum)?|<=|less than or equal to)\s*(\d+)\s*(?:params?|parameters?|args?|arguments?)\b",
+        r"\b(\d+)\s*(?:or fewer|or less)\s*(?:params?|parameters?|args?|arguments?)\b",
+        r"\b(?:не более|максимум|до)\s*(\d+)\s*(?:параметр(?:а|ов)?|аргумент(?:а|ов)?)\b",
+        r"\b(?:параметр(?:ов)?|аргумент(?:ов)?)\s*(?:не более|максимум|до)\s*(\d+)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, query_lower, flags=re.IGNORECASE)
+        if not m:
+            continue
+        try:
+            n = int(m.group(1))
+        except Exception:
+            continue
+        if n >= 0:
+            return n
+    return None
 
 
 def choose_primary_example_function(query: str, resolved_function_names: List[str]) -> str | None:
@@ -279,14 +329,18 @@ def _base_analysis(query_lower: str) -> dict:
         "needs_error_handling": False,
         "needs_params": False,
         "needs_types": False,
+        "needs_param_semantics": False,
         "needs_parse_like": False,
         "needs_fuzz_targets": False,
         "needs_type_info": False,
         "requested_types": [],
         "constraint_mode": "all",
         "exclude_output": False,
+        "max_param_count": None,
+        "needs_broad_fuzz_surface": False,
         "min_fuzz_score": 0.35,
         "min_fallback_fuzz_score": 0.15,
+        "listing_target_count": None,
         "path_filters": [],
         "exclude_previously_listed": False,
         "function_names": [],
@@ -340,6 +394,20 @@ def analyze_query_v2(
     if any(w in query_lower for w in ["param", "argument", "arg", "input", "receive", "accept", "take", "переда", "вход", "параметр"]):
         analysis["needs_params"] = True
 
+    param_semantics_markers = [
+        "parameter semantics",
+        "what parameters", "which parameters", "parameter meanings", "meaning of parameter",
+        "what does parameter", "parameter format", "data format of parameter",
+        "куда передается", "что означает параметр", "какие параметры принимает",
+        "какие аргументы принимает", "формат параметров", "формат данных параметра",
+        "откуда берутся параметры", "source of parameters",
+    ]
+    if any(m in query_lower for m in param_semantics_markers):
+        analysis["needs_param_semantics"] = True
+        analysis["needs_params"] = True
+        if analysis["function_names"] and not analysis.get("primary_function_name"):
+            analysis["primary_function_name"] = analysis["function_names"][0]
+
     analysis["requested_types"] = extract_requested_types(query_lower)
     if analysis["requested_types"]:
         analysis["needs_type_info"] = True
@@ -383,6 +451,10 @@ def analyze_query_v2(
         analysis["is_listing"] = True
         analysis["query_type"] = "listing"
 
+    explicit_max_params = extract_max_param_count(query_lower)
+    if explicit_max_params is not None:
+        analysis["max_param_count"] = explicit_max_params
+
     if query_excludes_output(query_lower):
         analysis["exclude_output"] = True
         analysis["needs_output"] = False
@@ -416,6 +488,37 @@ def analyze_query_v2(
             analysis["constraint_mode"] = "all"
         elif analysis["is_listing"] and analysis["needs_parse_like"]:
             analysis["constraint_mode"] = "any"
+
+    # Broad fuzz-list mode:
+    # - enforce compact signatures (<= 4 params unless user specified another bound)
+    # - require at least one practical fuzz-input surface:
+    #   parse-like OR stdin/file source OR path/file-handle/simple-pointer/vector-like params
+    if analysis["needs_fuzz_targets"] and analysis["is_listing"]:
+        analysis["needs_broad_fuzz_surface"] = True
+        if analysis["max_param_count"] is None:
+            analysis["max_param_count"] = 4
+        analysis["constraint_mode"] = "any"
+        if not analysis.get("listing_target_count"):
+            analysis["listing_target_count"] = 25
+
+        # For broad listing aliases/prompts, token extraction may pick common
+        # words that coincide with symbol names (e.g. parse/split/array). Keep
+        # only explicit code-like mentions, otherwise do not force symbol focus.
+        explicit_mentions = extract_explicit_function_mentions(
+            query,
+            known_symbols_by_lower=symbols_by_lower,
+        )
+        if explicit_mentions:
+            explicit_set = set(explicit_mentions)
+            analysis["function_names"] = [fn for fn in analysis["function_names"] if fn in explicit_set]
+            if not analysis["function_names"]:
+                analysis["function_names"] = list(explicit_mentions)
+            analysis["referenced_functions"] = [fn for fn in analysis["referenced_functions"] if fn in explicit_set]
+            analysis["query_function_candidates"] = [fn for fn in analysis["query_function_candidates"] if fn in explicit_set]
+        else:
+            analysis["function_names"] = []
+            analysis["referenced_functions"] = []
+            analysis["query_function_candidates"] = []
 
     if any(w in query_lower for w in ["example", "пример", "как вызвать", "как использовать", "usage", "использовани"]):
         analysis["needs_example"] = True
@@ -454,6 +557,17 @@ def analyze_query_v2(
         analysis["query_type"] = "example_generation"
     elif analysis["needs_implementation"]:
         analysis["query_type"] = "implementation_explanation"
+    elif analysis["needs_param_semantics"] and len(analysis["function_names"]) > 0:
+        analysis["query_type"] = "parameter_analysis"
+        analysis["is_listing"] = False
+        # Parameter semantics asks are not "file-input" or "output operation" filters.
+        # Alias phrasing may contain words like "input/output" and "file:line" as schema hints.
+        analysis["needs_file"] = False
+        analysis["needs_output"] = False
+        analysis["needs_api"] = False
+        analysis["needs_stdin"] = False
+        if not analysis.get("primary_function_name"):
+            analysis["primary_function_name"] = analysis["function_names"][0]
     elif analysis["is_listing"]:
         analysis["query_type"] = "listing"
     elif analysis["needs_stdin"] or analysis["needs_file"] or analysis["needs_api"]:
@@ -462,6 +576,10 @@ def analyze_query_v2(
         analysis["query_type"] = "type_specific"
     elif len(analysis["function_names"]) > 0:
         analysis["query_type"] = "function_specific"
+
+    if analysis.get("query_type") != "listing":
+        analysis["listing_target_count"] = None
+        analysis["needs_broad_fuzz_surface"] = False
 
     return analysis
 

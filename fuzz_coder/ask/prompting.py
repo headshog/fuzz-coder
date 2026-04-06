@@ -110,6 +110,25 @@ def _render_example_context_facts(example_context):
     return "\n".join(lines)
 
 
+def _render_function_hints(function_hints):
+    if not function_hints:
+        return ""
+
+    lines = ["### Function Docs/Usage Hints"]
+    for fn, hints in (function_hints or {}).items():
+        lines.append(f"Function: `{fn}`")
+        if not hints:
+            lines.append("- no external hints")
+            continue
+        for h in hints[:8]:
+            file_loc = f"{h.get('file', '')}:{h.get('line', '?')}"
+            snippet = " ".join(str(h.get("snippet", "")).split())
+            snippet = snippet[:320]
+            source = h.get("source", "docs")
+            lines.append(f"- [{source}] `{file_loc}`: {snippet}")
+    return "\n".join(lines)
+
+
 def _build_constraint_text(analysis):
     constraints = []
     if analysis.get("needs_stdin"):
@@ -126,10 +145,17 @@ def _build_constraint_text(analysis):
         constraints.append("must include error-handling paths")
     if analysis.get("needs_params"):
         constraints.append("must have input parameters")
+    if isinstance(analysis.get("max_param_count"), int):
+        constraints.append(f"must have at most {analysis['max_param_count']} parameters")
     if analysis.get("requested_types"):
         constraints.append(f"must match requested types: {', '.join(analysis['requested_types'])}")
     if analysis.get("needs_parse_like"):
         constraints.append("should be parse/input-processing related")
+    if analysis.get("needs_broad_fuzz_surface"):
+        constraints.append(
+            "must match at least one input surface: parse-like OR stdin/file input OR "
+            "path/file-handle/simple-pointer/vector-like parameters"
+        )
     if analysis.get("exclude_output"):
         constraints.append("must NOT be write/output-like functions")
     if analysis.get("needs_fuzz_targets"):
@@ -167,17 +193,26 @@ NICE TO HAVE:
 
 
 def _build_listing_system_block(analysis, max_items):
+    desired_count = analysis.get("listing_target_count")
     fuzz_line = ""
     summary_line = ""
     if analysis.get("needs_fuzz_targets"):
         fuzz_line = "\n- Fuzzable: `High|Medium|Low` - short risk rationale"
         summary_line = "\nSummary: 1-2 sentences on strongest vs weaker candidates."
 
+    count_rule = f"Return at most {max_items} functions from context."
+    if isinstance(desired_count, int) and desired_count > 0:
+        desired = min(max_items, desired_count)
+        count_rule = (
+            f"Return {desired} functions if at least {desired} are available; "
+            f"otherwise return all available (up to {max_items})."
+        )
+
     return f"""
 ### SYSTEM BLOCK (LISTING)
 MUST:
 - Apply query constraints exactly.
-- Return at most {max_items} functions from context.
+- {count_rule}
 - Use OUTPUT FORMAT exactly.
 SHOULD:
 - Rank strongest matches first.
@@ -245,6 +280,34 @@ NICE TO HAVE:
 """.strip()
 
 
+def _build_parameter_analysis_system_block():
+    return """
+### SYSTEM BLOCK (PARAMETER_ANALYSIS)
+MUST:
+- Focus on the target function from context.
+- For each parameter, explain expected data format/type and likely semantic role.
+- Ground every claim in one of: signature, observed call-site usage, docs/guide hints.
+- If meaning is unknown, explicitly mark as "unknown from provided context".
+SHOULD:
+- Distinguish input buffer/size/pointer/output/config/path parameters.
+- Mention where parameter values usually come from in code.
+NICE TO HAVE:
+- Mention boundary/validation implications useful for fuzzing.
+
+### OUTPUT FORMAT (STRICT)
+Function: `name`
+Signature: `full signature`
+Parameters:
+1. `param` (`type`)
+- Role: ...
+- Expected format: ...
+- Typical source: ...
+- Evidence: `path:start-end` (and/or docs hint)
+Unknowns:
+- ...
+""".strip()
+
+
 def _build_generic_system_block(analysis, max_items):
     if analysis.get("needs_type_info"):
         return f"""
@@ -286,6 +349,8 @@ def _build_intent_system_block(analysis, max_items):
         return _build_listing_system_block(analysis, max_items)
     if query_type == "example_generation":
         return _build_example_system_block()
+    if query_type == "parameter_analysis":
+        return _build_parameter_analysis_system_block()
     if query_type == "implementation_explanation":
         return _build_explanation_system_block()
     return _build_generic_system_block(analysis, max_items)
@@ -298,13 +363,17 @@ def _build_thinking_prompt_with_limit(
     conversation_history=None,
     code_char_limit=1500,
     example_context=None,
+    function_hints=None,
 ):
     max_items = len(frags)
     ctx = _render_function_context(frags, code_char_limit=code_char_limit)
     history_ctx = _render_history_context(conversation_history)
     example_ctx_block = ""
-    if (analysis or {}).get("query_type") == "example_generation":
+    if (analysis or {}).get("query_type") in {"example_generation", "parameter_analysis"}:
         example_ctx_block = _render_example_context_facts(example_context)
+    function_hints_block = ""
+    if (analysis or {}).get("query_type") == "parameter_analysis":
+        function_hints_block = _render_function_hints(function_hints)
     policy_block = _build_policy_layers_block()
     intent_block = _build_intent_system_block(analysis or {}, max_items=max_items)
     thinking_instructions = """
@@ -321,6 +390,7 @@ Return only final answer in the required format.
 ### Available Functions from Codebase:
 {ctx}
 {example_ctx_block}
+{function_hints_block}
 {policy_block}
 
 {intent_block}
@@ -373,8 +443,9 @@ def _build_prompt_with_limits(
     code_char_limit_thinking=1500,
     code_char_limit_simple=2000,
     example_context=None,
+    function_hints=None,
 ):
-    complex_types = ["listing", "example_generation", "implementation_explanation", "type_specific", "input_specific"]
+    complex_types = ["listing", "example_generation", "parameter_analysis", "implementation_explanation", "type_specific", "input_specific"]
     use_thinking = (analysis and analysis["query_type"] in complex_types) or (conversation_history and len(conversation_history) > 0)
 
     if use_thinking:
@@ -385,6 +456,7 @@ def _build_prompt_with_limits(
             conversation_history=conversation_history,
             code_char_limit=code_char_limit_thinking,
             example_context=example_context,
+            function_hints=function_hints,
         )
 
     return _build_simple_prompt_with_limit(frags, q, code_char_limit=code_char_limit_simple)
@@ -397,6 +469,7 @@ def build_prompt(
     conversation_history=None,
     max_prompt_chars=DEFAULT_MAX_PROMPT_CHARS,
     example_context=None,
+    function_hints=None,
 ):
     """Build prompt with a total character budget.
 
@@ -420,6 +493,7 @@ def build_prompt(
             code_char_limit_thinking=limit,
             code_char_limit_simple=max(250, int(limit * 1.2)),
             example_context=example_context,
+            function_hints=function_hints,
         )
         last_prompt = prompt
         if len(prompt) <= max_prompt_chars:
@@ -437,6 +511,7 @@ def build_prompt(
             code_char_limit_thinking=min_limit,
             code_char_limit_simple=max(250, int(min_limit * 1.2)),
             example_context=example_context,
+            function_hints=function_hints,
         )
         last_prompt = prompt
         if len(prompt) <= max_prompt_chars:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -12,6 +13,71 @@ from fuzz_coder.embeddings.registry import get_embedding_backend
 from fuzz_coder.languages.registry import get_language_profile, get_supported_language_names
 
 from . import core
+
+
+DOC_EXTENSIONS = {".md", ".markdown", ".rst", ".txt", ".adoc"}
+DOC_SKIP_DIRS = {
+    ".git", ".svn", ".hg", "node_modules", "third_party", "vendor", "build", "dist",
+    ".venv", "venv", "__pycache__", "index_data", ".idea", ".vscode",
+}
+
+
+def collect_doc_files(src: Path):
+    files = []
+    for p in src.rglob("*"):
+        if not p.is_file():
+            continue
+        if any(part in DOC_SKIP_DIRS for part in p.parts):
+            continue
+        if p.suffix.lower() not in DOC_EXTENSIONS:
+            continue
+        files.append(p)
+    return files
+
+
+def build_function_hints(symbols, doc_files, max_hints_per_function=8):
+    hints = defaultdict(list)
+    if not symbols or not doc_files:
+        return {}
+
+    symbol_names = set(symbols.keys())
+    symbol_names_lower = {s.lower(): s for s in symbol_names}
+
+    for doc_file in doc_files:
+        try:
+            text = core.read_text(doc_file)
+        except Exception:
+            continue
+        lines = text.splitlines()
+        if not lines:
+            continue
+
+        for i, line in enumerate(lines):
+            tokens = set(re.findall(r"[A-Za-z_]\w*", line))
+            if not tokens:
+                continue
+            matched_symbols = []
+            for tok in tokens:
+                key = symbol_names_lower.get(tok.lower())
+                if key is not None:
+                    matched_symbols.append(key)
+            if not matched_symbols:
+                continue
+
+            start = max(0, i - 1)
+            end = min(len(lines), i + 2)
+            snippet = "\n".join(lines[start:end]).strip()[:500]
+            for fn in matched_symbols:
+                if len(hints[fn]) >= max_hints_per_function:
+                    continue
+                hints[fn].append({
+                    "source": "docs",
+                    "file": str(doc_file),
+                    "line": i + 1,
+                    "snippet": snippet,
+                })
+
+    return dict(hints)
 
 
 def apply_language_profile(language_name: str) -> None:
@@ -110,6 +176,12 @@ def main():
     with open(out/"symbols.json", "w") as f:
         json.dump(dict(symbols), f)
 
+    # Save doc/guide hints linked to function names.
+    doc_files = collect_doc_files(src)
+    function_hints = build_function_hints(dict(symbols), doc_files)
+    with open(out/"function_hints.json", "w") as f:
+        json.dump(function_hints, f)
+
     # Save call graph
     with open(out/"call_graph.json", "w") as f:
         json.dump(call_graph, f)
@@ -156,6 +228,7 @@ def main():
     print(f"  - Functions with output: {len(output_indices)}")
     print(f"  - Functions with memory management: {len(memory_mgmt_indices)}")
     print(f"  - Functions with error handling: {len(error_handling_indices)}")
+    print(f"  - Docs/guide hints linked to functions: {sum(len(v) for v in function_hints.values())}")
 
 
 if __name__ == "__main__":

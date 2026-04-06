@@ -15,6 +15,7 @@
 - **Type-specific**: "функции с массивом байтов", "принимающие строку"
 - **Input-specific**: "читают из stdin", "работают с файлами"
 - **Example generation**: "дай пример использования", "как вызвать"
+- **Parameter analysis**: "какие параметры принимает...", "что означает каждый параметр"
 - **Implementation explanation**: "как работает", "алгоритм"
 - **Follow-up вопросы**: контекстные уточнения к предыдущим ответам
 
@@ -94,6 +95,7 @@ python index_fuzz_coder.py --src /path/to/code_dir --out ./index_data
 - Call graph (кто кого вызывает)
 - Семантические эмбеддинги для поиска
 - Лексический индекс для keyword search
+- Подсказки из docs/guides (`function_hints.json`), если в документации встречаются имена функций
 
 ### Шаг 2: Запуск интерактивного режима
 
@@ -120,6 +122,30 @@ python ask_fuzz_coder.py \
 - `FC_EXAMPLE_GROUNDING_LEGACY=1` — включить legacy-grounding для example_generation (по умолчанию используется v2-grounding)
 - `FC_EXAMPLE_GROUNDING_SHADOW=1` — сравнивать legacy и v2 grounding в verbose-режиме без смены ответа
 
+### Шаг 2.1 (опционально): Браузерный чат (Gradio)
+
+Если нужен UI в браузере вместо консоли:
+
+```bash
+pip install gradio
+
+python web_fuzz_coder.py \
+  --index_dir ./index_data \
+  --model qwen2.5-coder:32b \
+  --host 127.0.0.1 \
+  --port 7860
+```
+
+После запуска откройте `http://127.0.0.1:7860`.
+
+В браузерном чате поддерживаются те же alias-команды:
+- `fuzz`
+- `fuzz wide`
+- `more fuzz`
+- `more fuzz wide`
+- `example FUNCTION_NAME`
+- `explain FUNCTION_NAME`
+
 ### Шаг 3: Задавайте вопросы!
 
 Примеры запросов:
@@ -143,6 +169,13 @@ python ask_fuzz_coder.py \
 > Дай пример кода, вызывающий функцию parseData
 > Как использовать функцию readFile? Покажи пример
 > Напиши пример вызова processBuffer с правильными типами
+```
+
+#### Анализ параметров функции
+```
+> Какие параметры принимает функция llama_params_fit?
+> What parameters does process_request take and what does each parameter mean?
+> Для функции foo: формат данных по каждому параметру и откуда обычно берутся значения
 ```
 
 #### Follow-up вопросы (контекстные)

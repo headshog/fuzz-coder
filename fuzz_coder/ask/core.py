@@ -14,7 +14,10 @@ from .prompting import build_prompt as _build_prompt_impl
 from .prompting import _build_thinking_prompt_with_limit as _build_thinking_prompt_impl
 from .query_analysis import analyze_query_v2 as _analyze_query_v2_impl
 from .query_analysis import compare_analysis as _compare_analysis_impl
+from .query_analysis import extract_max_param_count as _extract_max_param_count_impl
+from .query_analysis import extract_explicit_function_mentions as _extract_explicit_function_mentions_impl
 from .example_context import build_example_context as _build_example_context_impl
+from .example_context import _classify_param_shape as _classify_param_shape_impl
 from .example_grounding import build_example_context_grounded as _build_example_context_grounded_impl
 from .verification import verify_answer_with_context as _verify_answer_with_context_impl
 from .verification import verify_example_answer_with_context as _verify_example_answer_with_context_impl
@@ -70,6 +73,33 @@ FUZZ_TARGET_KEYWORDS = [
     "base64", "utf8", "utf-8", "binary", "header", "payload",
 ]
 
+SIMPLE_POINTER_TYPE_HINTS = [
+    "char", "signed char", "unsigned char",
+    "short", "unsigned short",
+    "int", "unsigned int",
+    "long", "unsigned long",
+    "long long", "unsigned long long",
+    "int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t", "int64_t", "uint64_t",
+    "size_t", "ssize_t",
+    "float", "double", "bool",
+]
+
+FILE_HANDLE_TYPE_HINTS = [
+    "file *", "file*", "std::file",
+    "ifstream", "ofstream", "fstream",
+    "istream", "ostream", "stream &", "stream&",
+]
+
+PATH_PARAM_NAME_HINTS = [
+    "path", "file", "filename", "fname", "filepath", "dir", "directory",
+]
+
+VECTOR_LIKE_TYPE_HINTS = [
+    "std::vector<", "vector<",
+    "std::array<", "array<",
+    "std::span<", "span<",
+]
+
 PATH_FILTER_PATTERNS = [
     # English: from/in module|directory|subdirectory|folder|path <value>
     r"\b(?:from|in)\s+(?:the\s+)?(?:module|directory|subdirectory|folder|path)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1",
@@ -97,6 +127,7 @@ QUERY_SYMBOL_BLACKLIST = {
     "that", "this", "these", "those", "can", "used", "use", "is", "are",
     "of", "in", "on", "to", "an", "a", "the",
     "construct", "constructed", "build", "built", "define", "generated", "snippet",
+    "format", "context", "range", "role",
 }
 
 
@@ -413,6 +444,67 @@ def chunk_matches_requested_types(chunk, requested_types):
     return False
 
 
+def _param_text(param):
+    return f"{param.get('raw', '')} {param.get('type', '')} {param.get('name', '')}".lower()
+
+
+def has_simple_pointer_param(chunk):
+    for p in chunk.get("parameters") or []:
+        txt = _param_text(p)
+        if "*" not in txt:
+            continue
+        # Skip function-pointer style parameters.
+        if "(*" in txt:
+            continue
+        if any(hint in txt for hint in SIMPLE_POINTER_TYPE_HINTS):
+            return True
+    return False
+
+
+def has_file_handle_param(chunk):
+    for p in chunk.get("parameters") or []:
+        txt = _param_text(p)
+        if any(hint in txt for hint in FILE_HANDLE_TYPE_HINTS):
+            return True
+    return False
+
+
+def has_path_like_param(chunk):
+    for p in chunk.get("parameters") or []:
+        p_name = str(p.get("name", "")).lower()
+        txt = _param_text(p)
+        has_name_hint = any(h in p_name for h in PATH_PARAM_NAME_HINTS)
+        has_path_type = any(t in txt for t in ["std::string", "string", "char *", "const char *", "filesystem::path", "path"])
+        if has_name_hint and has_path_type:
+            return True
+    return False
+
+
+def has_vector_like_param(chunk):
+    for p in chunk.get("parameters") or []:
+        txt = _param_text(p)
+        if any(h in txt for h in VECTOR_LIKE_TYPE_HINTS):
+            return True
+    return False
+
+
+def chunk_matches_broad_fuzz_surface(chunk):
+    """OR-surface for broad fuzz listing queries."""
+    if is_parse_like_chunk(chunk):
+        return True
+    if chunk.get("has_stdin") or chunk.get("has_file_input"):
+        return True
+    if has_path_like_param(chunk):
+        return True
+    if has_file_handle_param(chunk):
+        return True
+    if has_simple_pointer_param(chunk):
+        return True
+    if has_vector_like_param(chunk):
+        return True
+    return False
+
+
 def is_write_like_chunk(chunk):
     """Heuristic detector for write/output-like functions."""
     if chunk.get("has_output"):
@@ -509,6 +601,8 @@ def collect_positive_constraint_matches(chunk, analysis):
         matches["types"] = chunk_matches_requested_types(chunk, analysis["requested_types"])
     if analysis.get("needs_parse_like"):
         matches["parse_like"] = is_parse_like_chunk(chunk)
+    if analysis.get("needs_broad_fuzz_surface"):
+        matches["broad_fuzz_surface"] = chunk_matches_broad_fuzz_surface(chunk)
     if analysis.get("needs_fuzz_targets"):
         min_fuzz_score = analysis.get("min_fuzz_score", 0.35)
         matches["fuzz_target"] = fuzz_target_score(chunk) >= min_fuzz_score
@@ -521,6 +615,10 @@ def chunk_matches_constraints(chunk, analysis):
         return False
     if analysis.get("needs_params") and not chunk.get("parameters"):
         return False
+    max_params = analysis.get("max_param_count")
+    if isinstance(max_params, int) and max_params >= 0:
+        if len(chunk.get("parameters") or []) > max_params:
+            return False
     if analysis.get("exclude_output") and is_write_like_chunk(chunk):
         return False
     if analysis.get("path_filters") and not chunk_matches_path_filters(chunk, analysis["path_filters"]):
@@ -1358,6 +1456,121 @@ def build_example_answer_from_context(frags, analysis=None, example_context=None
     return "\n".join(lines)
 
 
+def _infer_param_role_from_shape(pname, ptype):
+    shape = _classify_param_shape_impl(ptype, pname)
+    n = (pname or "").lower()
+    if "path" in n or "file" in n:
+        return shape, "path/file locator"
+    if "ctx" in n:
+        return shape, "context/config value"
+    if "param" in n or "config" in n:
+        return shape, "configuration structure/value"
+    if shape == "byte_buffer":
+        return shape, "raw input buffer / payload bytes"
+    if shape == "size_or_length":
+        return shape, "size/length/count for related payload"
+    if shape == "out_pointer":
+        return shape, "output pointer populated by callee"
+    if shape == "pointer":
+        return shape, "pointer to object/array for in/out behavior"
+    if shape == "reference":
+        return shape, "by-reference in/out value"
+    if shape == "integer":
+        return shape, "numeric control parameter"
+    if shape == "float":
+        return shape, "floating-point control parameter"
+    if shape == "bool":
+        return shape, "boolean feature/behavior flag"
+    if shape == "string":
+        return shape, "text/string input"
+    return shape, "unknown from provided context"
+
+
+def build_parameter_analysis_from_context(frags, analysis=None, example_context=None, function_hints=None):
+    """Deterministic fallback for parameter-analysis answers."""
+    analysis = analysis or {}
+    clean_frags = [f for f in frags if is_valid_function_chunk(f)]
+    if not clean_frags:
+        return "Not enough verified context to build parameter analysis."
+
+    if example_context is None:
+        example_context = _build_example_context_impl(clean_frags, analysis=analysis)
+
+    target = example_context.get("target")
+    if target is None or target not in clean_frags:
+        primary = analysis.get("primary_function_name")
+        by_name = {f.get("name"): f for f in clean_frags}
+        target = by_name.get(primary) if primary else None
+    if target is None:
+        target = clean_frags[0]
+
+    target_name = str(target.get("name", "")).strip() or "target_function"
+    target_sig = target.get("signature") or f"{target_name}()"
+    params = list(target.get("parameters") or [])
+    caller = example_context.get("caller")
+    observed = example_context.get("observed_call") or {}
+    observed_args = list(observed.get("args") or [])
+
+    hints_for_target = list((function_hints or {}).get(target_name, []))
+
+    lines = [
+        f"Function: `{target_name}`",
+        f"Signature: `{target_sig}`",
+        "Parameters:",
+    ]
+
+    unknowns = []
+    for idx, p in enumerate(params, 1):
+        pname = str(p.get("name", "")).strip() or f"arg{idx - 1}"
+        ptype = str(p.get("type", "")).strip() or "unknown"
+        shape, role = _infer_param_role_from_shape(pname, ptype)
+
+        expected_fmt = f"{shape}; declared type `{ptype}`"
+        src_bits = []
+        if idx - 1 < len(observed_args):
+            src_bits.append(f"observed caller arg `{observed_args[idx - 1]}`")
+        if "path" in pname.lower() or "file" in pname.lower():
+            src_bits.append("usually comes from file path/CLI/config")
+        if shape in {"byte_buffer", "size_or_length"}:
+            src_bits.append("often paired with buffer+size data flow")
+        typical_source = "; ".join(src_bits) if src_bits else "not explicit in selected fragments"
+
+        evidence_items = [f"`{_format_file_loc(target)}`"]
+        if caller is not None:
+            evidence_items.append(f"`{_format_file_loc(caller)}`")
+        if hints_for_target:
+            h0 = hints_for_target[0]
+            evidence_items.append(f"`{h0.get('file', '')}:{h0.get('line', '?')}` (docs/guide)")
+
+        lines.extend([
+            f"{idx}. `{pname}` (`{ptype}`)",
+            f"- Role: {role}",
+            f"- Expected format: {expected_fmt}",
+            f"- Typical source: {typical_source}",
+            f"- Evidence: {', '.join(evidence_items)}",
+        ])
+
+        if role == "unknown from provided context":
+            unknowns.append(f"`{pname}` semantic meaning is not explicit in current context")
+
+    lines.append("Unknowns:")
+    if unknowns:
+        for u in unknowns:
+            lines.append(f"- {u}")
+    else:
+        lines.append("- No critical unknowns from selected context; domain-specific constraints may still exist.")
+
+    if hints_for_target:
+        lines.append("Docs/guide hints:")
+        for h in hints_for_target[:4]:
+            snippet = " ".join(str(h.get("snippet", "")).split())[:260]
+            lines.append(
+                f"- `{h.get('file', '')}:{h.get('line', '?')}`: {snippet}"
+            )
+
+    return "\n".join(lines)
+
+
 class QueryPlanner:
     """Advanced query planner with thinking mode support"""
 
@@ -1419,14 +1632,18 @@ class QueryPlanner:
             "needs_error_handling": False,
             "needs_params": False,
             "needs_types": False,
+            "needs_param_semantics": False,
             "needs_parse_like": False,
             "needs_fuzz_targets": False,
             "needs_type_info": False,
             "requested_types": [],
             "constraint_mode": "all",
             "exclude_output": False,
+            "max_param_count": None,
+            "needs_broad_fuzz_surface": False,
             "min_fuzz_score": 0.35,
             "min_fallback_fuzz_score": 0.15,
+            "listing_target_count": None,
             "path_filters": [],
             "exclude_previously_listed": False,
             "function_names": [],
@@ -1474,6 +1691,18 @@ class QueryPlanner:
 
         # Detect parameter-related queries
         if any(w in query_lower for w in ["param", "argument", "arg", "input", "receive", "accept", "take", "переда", "вход", "параметр"]):
+            analysis["needs_params"] = True
+
+        param_semantics_markers = [
+            "parameter semantics",
+            "what parameters", "which parameters", "parameter meanings", "meaning of parameter",
+            "what does parameter", "parameter format", "data format of parameter",
+            "куда передается", "что означает параметр", "какие параметры принимает",
+            "какие аргументы принимает", "формат параметров", "формат данных параметра",
+            "откуда берутся параметры", "source of parameters",
+        ]
+        if any(m in query_lower for m in param_semantics_markers):
+            analysis["needs_param_semantics"] = True
             analysis["needs_params"] = True
 
         # Detect type-specific queries
@@ -1525,6 +1754,10 @@ class QueryPlanner:
             analysis["is_listing"] = True
             analysis["query_type"] = "listing"
 
+        explicit_max_params = _extract_max_param_count_impl(query_lower)
+        if explicit_max_params is not None:
+            analysis["max_param_count"] = explicit_max_params
+
         # Detect exclusion constraints
         if query_excludes_output(query_lower):
             analysis["exclude_output"] = True
@@ -1567,6 +1800,29 @@ class QueryPlanner:
             elif analysis["is_listing"] and analysis["needs_parse_like"]:
                 # Typical query style: "parse ... or stdin/string/bytes input"
                 analysis["constraint_mode"] = "any"
+
+        if analysis["needs_fuzz_targets"] and analysis["is_listing"]:
+            analysis["needs_broad_fuzz_surface"] = True
+            if analysis["max_param_count"] is None:
+                analysis["max_param_count"] = 4
+            analysis["constraint_mode"] = "any"
+            if not analysis.get("listing_target_count"):
+                analysis["listing_target_count"] = 25
+            explicit_mentions = _extract_explicit_function_mentions_impl(
+                query,
+                known_symbols_by_lower=self.symbols_by_lower,
+            )
+            if explicit_mentions:
+                explicit_set = set(explicit_mentions)
+                analysis["function_names"] = [fn for fn in analysis["function_names"] if fn in explicit_set]
+                if not analysis["function_names"]:
+                    analysis["function_names"] = list(explicit_mentions)
+                analysis["referenced_functions"] = [fn for fn in analysis["referenced_functions"] if fn in explicit_set]
+                analysis["query_function_candidates"] = [fn for fn in analysis["query_function_candidates"] if fn in explicit_set]
+            else:
+                analysis["function_names"] = []
+                analysis["referenced_functions"] = []
+                analysis["query_function_candidates"] = []
 
         # Detect example generation requests
         if any(w in query_lower for w in ["example", "пример", "как вызвать", "как использовать", "usage", "использовани"]):
@@ -1615,6 +1871,15 @@ class QueryPlanner:
             analysis["query_type"] = "example_generation"
         elif analysis["needs_implementation"]:
             analysis["query_type"] = "implementation_explanation"
+        elif analysis["needs_param_semantics"] and len(analysis["function_names"]) > 0:
+            analysis["query_type"] = "parameter_analysis"
+            analysis["is_listing"] = False
+            analysis["needs_file"] = False
+            analysis["needs_output"] = False
+            analysis["needs_api"] = False
+            analysis["needs_stdin"] = False
+            if not analysis.get("primary_function_name"):
+                analysis["primary_function_name"] = analysis["function_names"][0]
         elif analysis["is_listing"]:
             analysis["query_type"] = "listing"
         elif analysis["needs_stdin"] or analysis["needs_file"] or analysis["needs_api"]:
@@ -1623,6 +1888,10 @@ class QueryPlanner:
             analysis["query_type"] = "type_specific"
         elif len(analysis["function_names"]) > 0:
             analysis["query_type"] = "function_specific"
+
+        if analysis.get("query_type") != "listing":
+            analysis["listing_target_count"] = None
+            analysis["needs_broad_fuzz_surface"] = False
 
         return analysis
 
@@ -1641,7 +1910,7 @@ class QueryPlanner:
 
     def get_search_candidates(self, analysis, k=20):
         """Get candidate indices based on query analysis"""
-        if analysis.get("query_type") in {"example_generation", "function_specific", "implementation_explanation"} and analysis.get("function_names"):
+        if analysis.get("query_type") in {"example_generation", "parameter_analysis", "function_specific", "implementation_explanation"} and analysis.get("function_names"):
             focused = []
             primary_name = analysis.get("primary_function_name")
             if analysis.get("query_type") == "example_generation" and primary_name:
@@ -1724,6 +1993,18 @@ class QueryPlanner:
                     if alias in by_type:
                         candidates.update(by_type[alias])
 
+        if analysis.get("needs_broad_fuzz_surface"):
+            for key in ["stdin", "file_input"]:
+                if key in self.special_indices:
+                    candidates.update(self.special_indices[key])
+            by_type = self.special_indices.get("by_type", {})
+            for type_name in ["byte_array", "string", "template", "pointer", "integer"]:
+                if type_name in by_type:
+                    candidates.update(by_type[type_name])
+                for alias in TYPE_INDEX_ALIASES.get(type_name, []):
+                    if alias in by_type:
+                        candidates.update(by_type[alias])
+
         # Type-based search
         if analysis.get("requested_types"):
             by_type = self.special_indices.get("by_type", {})
@@ -1798,6 +2079,7 @@ def build_prompt(
     conversation_history=None,
     max_prompt_chars=20000,
     example_context=None,
+    function_hints=None,
 ):
     """Main prompt builder with total-character budget."""
     return _build_prompt_impl(
@@ -1807,6 +2089,7 @@ def build_prompt(
         conversation_history=conversation_history,
         max_prompt_chars=max_prompt_chars,
         example_context=example_context,
+        function_hints=function_hints,
     )
 
 
