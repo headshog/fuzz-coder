@@ -363,6 +363,10 @@ def analyze_query_v2(
     query_lower = (query or "").lower()
     analysis = _base_analysis(query_lower)
     symbols_by_lower = symbols_by_lower or {}
+    is_example_request = any(
+        w in query_lower
+        for w in ["example", "пример", "как вызвать", "как использовать", "usage", "использовани"]
+    )
 
     if any(w in query_lower for w in ["stdin", "standard input", "console", "cin", "scanf", "getchar", "fgets", "ввод"]):
         analysis["needs_stdin"] = True
@@ -493,7 +497,7 @@ def analyze_query_v2(
     # - enforce compact signatures (<= 4 params unless user specified another bound)
     # - require at least one practical fuzz-input surface:
     #   parse-like OR stdin/file source OR path/file-handle/simple-pointer/vector-like params
-    if analysis["needs_fuzz_targets"] and analysis["is_listing"]:
+    if analysis["needs_fuzz_targets"] and analysis["is_listing"] and not is_example_request:
         analysis["needs_broad_fuzz_surface"] = True
         if analysis["max_param_count"] is None:
             analysis["max_param_count"] = 4
@@ -520,7 +524,7 @@ def analyze_query_v2(
             analysis["referenced_functions"] = []
             analysis["query_function_candidates"] = []
 
-    if any(w in query_lower for w in ["example", "пример", "как вызвать", "как использовать", "usage", "использовани"]):
+    if is_example_request:
         analysis["needs_example"] = True
         analysis["query_type"] = "example_generation"
         analysis["is_listing"] = False

@@ -129,14 +129,21 @@ python ask_fuzz_coder.py \
 ```bash
 pip install gradio
 
+# Вариант 1: автообнаружение index_data_* рядом с web_fuzz_coder.py
+python web_fuzz_coder.py \
+  --model qwen3-coder:30b \
+  --host 0.0.0.0 \
+  --port 8080
+
+# Вариант 2: явный один индекс
 python web_fuzz_coder.py \
   --index_dir ./index_data \
-  --model qwen2.5-coder:32b \
-  --host 127.0.0.1 \
-  --port 7860
+  --model qwen3-coder:30b \
+  --host 0.0.0.0 \
+  --port 8080
 ```
 
-После запуска откройте `http://127.0.0.1:7860`.
+Если найдены несколько папок `index_data_PROJECT`, в UI появится выпадающий список проекта.
 
 В браузерном чате поддерживаются те же alias-команды:
 - `fuzz`

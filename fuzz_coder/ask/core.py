@@ -1619,6 +1619,10 @@ class QueryPlanner:
     def _analyze_query_legacy(self, query, context_history=None):
         """Analyze query to determine search strategy with thinking mode"""
         query_lower = query.lower()
+        is_example_request = any(
+            w in query_lower
+            for w in ["example", "пример", "как вызвать", "как использовать", "usage", "использовани"]
+        )
 
         analysis = {
             "query_type": "general",
@@ -1801,7 +1805,7 @@ class QueryPlanner:
                 # Typical query style: "parse ... or stdin/string/bytes input"
                 analysis["constraint_mode"] = "any"
 
-        if analysis["needs_fuzz_targets"] and analysis["is_listing"]:
+        if analysis["needs_fuzz_targets"] and analysis["is_listing"] and not is_example_request:
             analysis["needs_broad_fuzz_surface"] = True
             if analysis["max_param_count"] is None:
                 analysis["max_param_count"] = 4
@@ -1825,7 +1829,7 @@ class QueryPlanner:
                 analysis["query_function_candidates"] = []
 
         # Detect example generation requests
-        if any(w in query_lower for w in ["example", "пример", "как вызвать", "как использовать", "usage", "использовани"]):
+        if is_example_request:
             analysis["needs_example"] = True
             analysis["query_type"] = "example_generation"
             # Example generation should not be treated as listing/ranking query.
