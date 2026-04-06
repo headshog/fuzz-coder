@@ -39,3 +39,5 @@ htmlcov/
 .mypy_cache/
 
 .gradio/
+.web_fuzz_histories/
+users.txt

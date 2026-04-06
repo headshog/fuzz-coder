@@ -141,9 +141,39 @@ python web_fuzz_coder.py \
   --model qwen3-coder:30b \
   --host 0.0.0.0 \
   --port 8080
+
+# Вариант 3: базовая авторизация (inline)
+python web_fuzz_coder.py \
+  --index_base_dir . \
+  --model qwen3-coder:30b \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --auth_users "alice:secret,bob:secret2"
+
+# Вариант 4: базовая авторизация из файла
+python web_fuzz_coder.py \
+  --index_base_dir . \
+  --model qwen3-coder:30b \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --auth_users_file ./users.txt
 ```
 
 Если найдены несколько папок `index_data_PROJECT`, в UI появится выпадающий список проекта.
+
+Браузерный UI поддерживает базовую авторизацию и отдельную историю для каждого пользователя:
+- При передаче `--auth_users` или `--auth_users_file` включается login/password.
+- История каждого пользователя хранится отдельно в `--history_dir` (по умолчанию `.web_fuzz_histories`).
+- После перезапуска сервера истории сохраняются.
+- При включенной авторизации в UI появляется кнопка `Logout`.
+
+Форматы `--auth_users_file`:
+- `users.txt`:
+  - `alice:secret`
+  - `bob:secret2`
+- `users.json`:
+  - `{"alice":"secret","bob":"secret2"}`
+  - или `[{"username":"alice","password":"secret"}]`
 
 В браузерном чате поддерживаются те же alias-команды:
 - `fuzz`
@@ -152,6 +182,29 @@ python web_fuzz_coder.py \
 - `more fuzz wide`
 - `example FUNCTION_NAME`
 - `explain FUNCTION_NAME`
+
+### Шаг 2.2 (опционально): Автозапуск через systemd
+
+В репозитории есть готовый unit-файл:
+- `deploy/systemd/web_fuzz_coder.service`
+
+Он уже настроен под команду:
+- `/home/headshog/.venv/bin/python /home/headshog/coder/web_fuzz_coder.py --model qwen3-coder:30b --host 0.0.0.0 --port 8080 --auth_users_file /home/headshog/coder/users.txt`
+
+Установка сервиса:
+
+```bash
+sudo cp deploy/systemd/web_fuzz_coder.service /etc/systemd/system/web_fuzz_coder.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now web_fuzz_coder.service
+```
+
+Проверка:
+
+```bash
+sudo systemctl status web_fuzz_coder.service
+journalctl -u web_fuzz_coder.service -f
+```
 
 ### Шаг 3: Задавайте вопросы!
 

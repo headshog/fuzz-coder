@@ -1,0 +1,17 @@
+[Unit]
+Description=Fuzz Coder Web UI (Gradio)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=headshog
+Group=headshog
+WorkingDirectory=/home/headshog/coder
+ExecStart=/home/headshog/.venv/bin/python /home/headshog/coder/web_fuzz_coder.py --model qwen3-coder:30b --host 0.0.0.0 --port 8080 --auth_users_file /home/headshog/coder/users.txt
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

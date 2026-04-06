@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
+import re
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 import faiss
 import gradio as gr
@@ -36,6 +39,21 @@ def _parse_args():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7860)
     ap.add_argument("--share", action="store_true")
+    ap.add_argument(
+        "--auth_users",
+        default="",
+        help="Optional basic auth users: 'alice:pass,bob:pass2'",
+    )
+    ap.add_argument(
+        "--auth_users_file",
+        default=None,
+        help="Optional file with users for basic auth (.txt with user:pass per line, or .json)",
+    )
+    ap.add_argument(
+        "--history_dir",
+        default=str(Path(__file__).resolve().parent / ".web_fuzz_histories"),
+        help="Directory for per-user persisted chat histories",
+    )
     return ap.parse_args()
 
 
@@ -93,6 +111,151 @@ def _history_to_conversation(history):
         return out
 
     return []
+
+
+def _conversation_to_history(conversation, mode: str):
+    conversation = _normalize_conversation(conversation)
+    if mode == "messages":
+        out = []
+        for user_text, assistant_text in conversation:
+            out.append({"role": "user", "content": str(user_text)})
+            out.append({"role": "assistant", "content": str(assistant_text)})
+        return out
+    return [(str(user_text), str(assistant_text)) for user_text, assistant_text in conversation]
+
+
+def _normalize_conversation(conversation):
+    out = []
+    if not isinstance(conversation, list):
+        return out
+    for item in conversation:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            user_text, assistant_text = item[0], item[1]
+        elif isinstance(item, dict):
+            user_text = item.get("user")
+            assistant_text = item.get("assistant")
+        else:
+            continue
+        if user_text is None or assistant_text is None:
+            continue
+        out.append((str(user_text), str(assistant_text)))
+    return out
+
+
+def _parse_auth_credentials(args):
+    creds: Dict[str, str] = {}
+
+    def _add_cred(raw_user: str, raw_pass: str, src: str):
+        user = str(raw_user or "").strip()
+        password = str(raw_pass or "").strip()
+        if not user or not password:
+            raise ValueError(f"Invalid auth entry from {src}: empty username/password")
+        creds[user] = password
+
+    if args.auth_users_file:
+        p = Path(args.auth_users_file).expanduser().resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"Auth users file not found: {p}")
+        content = p.read_text(encoding="utf-8")
+        if p.suffix.lower() == ".json":
+            data = json.loads(content)
+            if isinstance(data, dict):
+                for user, password in data.items():
+                    _add_cred(user, password, f"{p}")
+            elif isinstance(data, list):
+                for idx, item in enumerate(data, 1):
+                    if isinstance(item, dict):
+                        user = item.get("username", item.get("user"))
+                        password = item.get("password", item.get("pass"))
+                        _add_cred(user, password, f"{p}:{idx}")
+                    elif isinstance(item, str) and ":" in item:
+                        user, password = item.split(":", 1)
+                        _add_cred(user, password, f"{p}:{idx}")
+                    else:
+                        raise ValueError(f"Invalid JSON auth entry at {p}:{idx}")
+            else:
+                raise ValueError(f"Unsupported JSON auth format in {p}")
+        else:
+            for idx, line in enumerate(content.splitlines(), 1):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if ":" not in line:
+                    raise ValueError(f"Invalid auth line (expected user:pass) at {p}:{idx}")
+                user, password = line.split(":", 1)
+                _add_cred(user, password, f"{p}:{idx}")
+
+    raw_inline = str(args.auth_users or "").strip()
+    if raw_inline:
+        for idx, item in enumerate(raw_inline.split(","), 1):
+            item = item.strip()
+            if not item:
+                continue
+            if ":" not in item:
+                raise ValueError(f"Invalid --auth_users entry #{idx} (expected user:pass)")
+            user, password = item.split(":", 1)
+            _add_cred(user, password, f"--auth_users#{idx}")
+
+    if not creds:
+        return None
+    return list(creds.items())
+
+
+def _user_from_request(request):
+    if request is not None:
+        username = getattr(request, "username", None)
+        if username:
+            return str(username)
+    return "anonymous"
+
+
+def _safe_user_slug(username: str):
+    normalized = str(username or "anonymous")
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", normalized).strip("._")
+    if not slug:
+        slug = "user"
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
+    return f"{slug}_{digest}"
+
+
+def _history_file_for_user(history_dir: Path, username: str):
+    return history_dir / f"{_safe_user_slug(username)}.json"
+
+
+def _load_user_histories(history_dir: Path, username: str, project_names: List[str]):
+    result = {name: [] for name in project_names}
+    p = _history_file_for_user(history_dir, username)
+    if not p.exists():
+        return result
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return result
+
+    projects_blob = data.get("projects") if isinstance(data, dict) else None
+    if not isinstance(projects_blob, dict):
+        return result
+
+    for project_name in project_names:
+        result[project_name] = _normalize_conversation(projects_blob.get(project_name, []))
+    return result
+
+
+def _save_user_histories(history_dir: Path, username: str, user_histories, project_names: List[str]):
+    history_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "username": username,
+        "projects": {},
+    }
+    for project_name in project_names:
+        conv = _normalize_conversation(user_histories.get(project_name, []))
+        if conv:
+            payload["projects"][project_name] = [[u, a] for u, a in conv]
+
+    p = _history_file_for_user(history_dir, username)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(p)
 
 
 def _looks_like_index_dir(path: Path):
@@ -236,16 +399,6 @@ def _normalize_history_for_mode(history, mode: str):
     return out
 
 
-def _append_turn(history, user_text: str, answer_text: str, mode: str):
-    history = list(history or [])
-    if mode == "messages":
-        history.append({"role": "user", "content": str(user_text)})
-        history.append({"role": "assistant", "content": str(answer_text)})
-        return history
-    history.append((str(user_text), str(answer_text)))
-    return history
-
-
 def main():
     args = _parse_args()
     projects = _discover_projects(args)
@@ -256,6 +409,8 @@ def main():
         )
 
     embed_model, reranker = _load_models(args)
+    auth_credentials = _parse_auth_credentials(args)
+    history_dir = Path(args.history_dir).expanduser().resolve()
     pipeline_cache: Dict[str, QueryPipeline] = {}
 
     def _get_pipeline(project_name: str):
@@ -269,17 +424,40 @@ def main():
 
     chatbot_mode_holder = {"mode": "messages"}
 
-    def _on_project_change(project_name, histories):
-        histories = dict(histories or {})
+    def _init_history_state(state):
+        state = dict(state or {})
+        users = state.get("users")
+        if not isinstance(users, dict):
+            users = {}
+        state["users"] = users
+        return state
+
+    def _ensure_user_histories(state, username: str):
+        state = _init_history_state(state)
+        users = state["users"]
+        if username not in users:
+            users[username] = _load_user_histories(history_dir, username, project_names)
+        user_histories = users[username]
+        for pname in project_names:
+            if pname not in user_histories:
+                user_histories[pname] = []
+            else:
+                user_histories[pname] = _normalize_conversation(user_histories[pname])
+        return user_histories, state
+
+    def _on_project_change(project_name, histories, request: gr.Request = None):
+        username = _user_from_request(request)
+        user_histories, histories = _ensure_user_histories(histories, username)
         mode = chatbot_mode_holder["mode"]
-        project_hist = _normalize_history_for_mode(histories.get(project_name, []), mode)
-        histories[project_name] = project_hist
+        project_hist = _conversation_to_history(user_histories.get(project_name, []), mode)
         return project_hist, histories
 
-    def _chat_submit(message, chat_history, project_name, histories):
-        histories = dict(histories or {})
+    def _chat_submit(message, chat_history, project_name, histories, request: gr.Request = None):
+        username = _user_from_request(request)
+        user_histories, histories = _ensure_user_histories(histories, username)
         mode = chatbot_mode_holder["mode"]
         chat_history = _normalize_history_for_mode(chat_history, mode)
+        conversation_history = _history_to_conversation(chat_history)
         q = (message or "").strip()
         if not q:
             return "", chat_history, histories
@@ -289,18 +467,21 @@ def main():
         else:
             expanded_q, _alias_used = ask_app.expand_chat_alias(q)
             pipeline = _get_pipeline(project_name)
-            conversation_history = _history_to_conversation(chat_history)
             result = pipeline.run(expanded_q, conversation_history)
             ans = result.answer
 
-        chat_history = _append_turn(chat_history, q, ans, mode)
-        histories[project_name] = chat_history
-        return "", chat_history, histories
+        conversation_history.append((q, ans))
+        user_histories[project_name] = conversation_history
+        _save_user_histories(history_dir, username, user_histories, project_names)
 
-    def _clear_project_chat(project_name, histories):
-        histories = dict(histories or {})
-        histories[project_name] = []
-        return [], histories
+        return "", _conversation_to_history(conversation_history, mode), histories
+
+    def _clear_project_chat(project_name, histories, request: gr.Request = None):
+        username = _user_from_request(request)
+        user_histories, histories = _ensure_user_histories(histories, username)
+        user_histories[project_name] = []
+        _save_user_histories(history_dir, username, user_histories, project_names)
+        return _conversation_to_history([], chatbot_mode_holder["mode"]), histories
 
     project_names = list(projects.keys())
     default_project = project_names[0]
@@ -320,14 +501,24 @@ def main():
         chatbot_mode_holder["mode"] = chatbot_mode
         if args.verbose:
             print(f"[Web UI] Chatbot mode: {chatbot_mode}")
+            print(f"[Web UI] Auth enabled: {'yes' if auth_credentials else 'no'}")
+            print(f"[Web UI] History dir: {history_dir}")
         msg = gr.Textbox(placeholder="Ask about functions, fuzz targets, or type 'help'", label="Message")
+        logout_btn = None
         with gr.Row():
             send_btn = gr.Button("Send", variant="primary")
             clear_btn = gr.Button("Clear Current Project Chat")
+            if auth_credentials:
+                logout_btn = gr.Button("Logout")
 
-        histories_state = gr.State({default_project: []})
+        histories_state = gr.State({"users": {}})
 
         project.change(
+            fn=_on_project_change,
+            inputs=[project, histories_state],
+            outputs=[chatbot, histories_state],
+        )
+        demo.load(
             fn=_on_project_change,
             inputs=[project, histories_state],
             outputs=[chatbot, histories_state],
@@ -347,8 +538,20 @@ def main():
             inputs=[project, histories_state],
             outputs=[chatbot, histories_state],
         )
+        if logout_btn is not None:
+            logout_btn.click(
+                fn=lambda: None,
+                js="() => { window.location.href = '/logout'; }",
+            )
 
-    demo.launch(server_name=args.host, server_port=args.port, share=args.share)
+    launch_kwargs = {
+        "server_name": args.host,
+        "server_port": args.port,
+        "share": args.share,
+    }
+    if auth_credentials:
+        launch_kwargs["auth"] = auth_credentials
+    demo.launch(**launch_kwargs)
 
 
 if __name__ == "__main__":
