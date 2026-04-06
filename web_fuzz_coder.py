@@ -545,6 +545,18 @@ def main():
             )
         return pipeline_cache[project_name]
 
+    def _sync_projects_from_disk():
+        if args.index_dir:
+            return
+        try:
+            discovered = _discover_projects(args)
+        except Exception:
+            return
+        for name, path in discovered.items():
+            if name not in projects:
+                projects[name] = path.resolve()
+                project_names.append(name)
+
     chatbot_mode_holder = {"mode": "messages"}
 
     def _init_history_state(state):
@@ -574,6 +586,12 @@ def main():
         mode = chatbot_mode_holder["mode"]
         project_hist = _conversation_to_history(user_histories.get(project_name, []), mode)
         return project_hist, histories
+
+    def _on_page_load(project_name, histories, request: gr.Request = None):
+        _sync_projects_from_disk()
+        current_project = project_name if project_name in project_names else project_names[0]
+        project_hist, histories = _on_project_change(current_project, histories, request=request)
+        return gr.update(choices=project_names, value=current_project), project_hist, histories
 
     def _chat_submit(message, chat_history, project_name, histories, request: gr.Request = None):
         username = _user_from_request(request)
@@ -641,8 +659,9 @@ def main():
                 histories,
                 status_text,
                 gr.update(value=(zip_value if keep_zip else None)),
-                gr.update(interactive=(zip_ready if keep_ready else False)),
+                gr.update(interactive=(zip_ready if keep_ready else False), visible=True),
                 gr.update(visible=False),
+                gr.update(visible=zip_still_selected),
                 gr.update(visible=zip_still_selected),
             )
 
@@ -725,24 +744,38 @@ def main():
         zip_selected = bool(zip_value)
         if not zip_value:
             # Keep the current status message (do not erase add-project logs/errors).
-            return gr.update(), gr.update(interactive=False), gr.update(visible=False), gr.update(visible=False)
+            return (
+                gr.update(),
+                gr.update(interactive=False, visible=True),
+                gr.update(visible=False),
+                gr.update(visible=False),
+                gr.update(visible=False),
+            )
         zip_path = Path(zip_value).expanduser().resolve()
         if not zip_path.exists():
             return (
                 f"Uploaded file is not accessible on server: `{zip_path}`",
-                gr.update(interactive=False),
+                gr.update(interactive=False, visible=True),
                 gr.update(visible=False),
+                gr.update(visible=zip_selected),
                 gr.update(visible=zip_selected),
             )
         if zip_path.suffix.lower() != ".zip":
             return (
                 f"Only .zip archives are supported, got: `{zip_path.name}`",
-                gr.update(interactive=False),
+                gr.update(interactive=False, visible=True),
                 gr.update(visible=False),
+                gr.update(visible=zip_selected),
                 gr.update(visible=zip_selected),
             )
         # Valid ZIP selected: enable Add button without overwriting status.
-        return gr.update(), gr.update(interactive=True), gr.update(visible=False), gr.update(visible=True)
+        return (
+            gr.update(),
+            gr.update(interactive=True, visible=True),
+            gr.update(visible=False),
+            gr.update(visible=True),
+            gr.update(visible=True),
+        )
 
     def _cleanup_partial_index_dir(path: Path):
         try:
@@ -793,9 +826,10 @@ def main():
         return (
             status,
             gr.update(value=zip_file),
-            gr.update(interactive=bool(_normalize_uploaded_zip_path(zip_file))),
+            gr.update(interactive=bool(_normalize_uploaded_zip_path(zip_file)), visible=True),
             gr.update(visible=False),
             current_project_name,
+            gr.update(visible=bool(_normalize_uploaded_zip_path(zip_file))),
             gr.update(visible=bool(_normalize_uploaded_zip_path(zip_file))),
         )
 
@@ -803,7 +837,8 @@ def main():
         return (
             "ZIP selection canceled.",
             gr.update(value=None),
-            gr.update(interactive=False),
+            gr.update(interactive=False, visible=True),
+            gr.update(visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
         )
@@ -821,9 +856,10 @@ def main():
                 gr.update(value="Close Add Project"),
                 gr.update(visible=False),
                 gr.update(visible=False),
+                gr.update(visible=False),
                 gr.update(),
                 gr.update(),
-                gr.update(),
+                gr.update(visible=True),
             )
         # Closing: fully reset modal UI so nothing remains visible.
         return (
@@ -832,9 +868,28 @@ def main():
             gr.update(value="Add Project"),
             gr.update(visible=False),
             gr.update(visible=False),
+            gr.update(visible=False),
             gr.update(value=""),
             gr.update(value=None),
-            gr.update(interactive=False),
+            gr.update(interactive=False, visible=True),
+        )
+
+    def _finalize_add_project_ui(status_text):
+        text = _content_to_text(status_text).strip().lower()
+        if text.startswith("added project"):
+            return (
+                gr.update(visible=False),
+                gr.update(visible=False),
+                gr.update(visible=False),
+                gr.update(interactive=False, visible=True),
+                gr.update(value=None),
+            )
+        return (
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
         )
 
     project_names = list(projects.keys())
@@ -991,7 +1046,7 @@ def main():
                         type="filepath",
                         elem_id="project_zip_upload",
                     )
-                with gr.Row(elem_id="clear_zip_row"):
+                with gr.Row(elem_id="clear_zip_row", visible=False) as clear_zip_row:
                     clear_zip_select_btn = gr.Button(
                         "✕",
                         visible=False,
@@ -1015,7 +1070,7 @@ def main():
                         interactive=False,
                         elem_id="add_project_btn",
                     )
-                    cancel_add_project_btn = gr.Button("✕ Cancel Upload", variant="stop", visible=False)
+                    cancel_add_project_btn = gr.Button("✕", variant="stop", visible=False, min_width=56)
         chatbot, chatbot_mode = _create_chatbot()
         chatbot_mode_holder["mode"] = chatbot_mode
         if args.verbose:
@@ -1050,6 +1105,7 @@ def main():
                 open_add_project_btn,
                 cancel_add_project_btn,
                 clear_zip_select_btn,
+                clear_zip_row,
                 add_project_status,
                 zip_upload,
                 add_project_btn,
@@ -1065,24 +1121,25 @@ def main():
         zip_change_evt = zip_upload.change(
             fn=_on_zip_change,
             inputs=[zip_upload],
-            outputs=[add_project_status, add_project_btn, cancel_add_project_btn, clear_zip_select_btn],
+            outputs=[add_project_status, add_project_btn, cancel_add_project_btn, clear_zip_select_btn, clear_zip_row],
         )
         clear_zip_select_btn.click(
             fn=_clear_zip_selection,
-            outputs=[add_project_status, zip_upload, add_project_btn, cancel_add_project_btn, clear_zip_select_btn],
+            outputs=[add_project_status, zip_upload, add_project_btn, cancel_add_project_btn, clear_zip_select_btn, clear_zip_row],
             cancels=[zip_change_evt],
             show_progress="hidden",
             queue=False,
         )
-        show_cancel_evt = add_project_btn.click(
+        add_project_btn.click(
             fn=lambda: (
                 gr.update(visible=True),
-                gr.update(interactive=False),
+                gr.update(visible=False),
             ),
             outputs=[cancel_add_project_btn, add_project_btn],
             show_progress="hidden",
+            queue=False,
         )
-        add_project_evt = show_cancel_evt.then(
+        add_project_evt = add_project_btn.click(
             fn=_add_project_from_zip,
             inputs=[zip_upload, project_name_input, language_input, project, histories_state],
             outputs=[
@@ -1093,8 +1150,15 @@ def main():
                 add_project_btn,
                 cancel_add_project_btn,
                 clear_zip_select_btn,
+                clear_zip_row,
             ],
             show_progress="full",
+        )
+        add_project_evt.then(
+            fn=_finalize_add_project_ui,
+            inputs=[add_project_status],
+            outputs=[clear_zip_select_btn, clear_zip_row, cancel_add_project_btn, add_project_btn, zip_upload],
+            show_progress="hidden",
         )
         add_project_evt.then(
             fn=_refresh_project_dropdown,
@@ -1112,14 +1176,15 @@ def main():
                 cancel_add_project_btn,
                 add_project_target_state,
                 clear_zip_select_btn,
+                clear_zip_row,
             ],
             cancels=[add_project_evt],
             show_progress="hidden",
         )
         demo.load(
-            fn=_on_project_change,
+            fn=_on_page_load,
             inputs=[project, histories_state],
-            outputs=[chatbot, histories_state],
+            outputs=[project, chatbot, histories_state],
         )
         send_start_evt = send_btn.click(
             fn=_chat_request_started,
