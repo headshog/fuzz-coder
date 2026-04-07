@@ -285,10 +285,85 @@ def _extract_file_source_vars(code_text: str) -> List[str]:
     return out
 
 
+def _normalize_chain_token(token: str) -> str:
+    t = str(token or "").strip()
+    t = re.sub(r"\s+", "", t)
+    return t
+
+
+def _lhs_base_name(lhs_expr: str) -> str:
+    lhs = _normalize_chain_token(lhs_expr)
+    if "->" in lhs:
+        return lhs.split("->", 1)[0]
+    if "." in lhs:
+        return lhs.split(".", 1)[0]
+    return lhs
+
+
+def _extract_simple_assignment_edges(code: str) -> List[tuple[str, str]]:
+    if not code:
+        return []
+    pat = re.compile(
+        r"([A-Za-z_]\w*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)*)\s*"
+        r"(?<![=!<>+\-*/%&|^])=(?!=)\s*"
+        r"([^;]+);"
+    )
+    edges: List[tuple[str, str]] = []
+    for m in pat.finditer(code):
+        lhs_raw = (m.group(1) or "").strip()
+        rhs_raw = (m.group(2) or "").strip()
+        if not lhs_raw or not rhs_raw:
+            continue
+        if lhs_raw.startswith(("return ", "if ", "while ", "for ", "switch ")):
+            continue
+        lhs = _normalize_chain_token(lhs_raw)
+        edges.append((lhs, rhs_raw))
+    return edges
+
+
+def _extract_file_data_flow_symbols(code_text: str, source_vars: List[str]) -> List[str]:
+    derived = {_normalize_chain_token(v) for v in (source_vars or []) if v}
+    code = code_text or ""
+    if not code:
+        return sorted({v for v in derived if v})
+
+    for v in list(derived):
+        base = _lhs_base_name(v)
+        if base:
+            derived.add(base)
+
+    edges = _extract_simple_assignment_edges(code)
+    for _ in range(6):
+        changed = False
+        names = [v for v in derived if v]
+        for lhs, rhs in edges:
+            if not names:
+                break
+            if _arg_uses_any_var(rhs, names):
+                if lhs not in derived:
+                    derived.add(lhs)
+                    changed = True
+                base = _lhs_base_name(lhs)
+                if base and base not in derived:
+                    derived.add(base)
+                    changed = True
+        if not changed:
+            break
+
+    return sorted({v for v in derived if v})
+
+
 def _arg_uses_any_var(arg_expr: str, names: List[str]) -> bool:
     expr = arg_expr or ""
     for name in names:
-        if re.search(rf"\b{re.escape(name)}\b", expr):
+        n = _normalize_chain_token(name)
+        if not n:
+            continue
+        if "." in n or "->" in n:
+            pat = rf"(?<![A-Za-z0-9_]){re.escape(n)}(?![A-Za-z0-9_])"
+        else:
+            pat = rf"\b{re.escape(n)}\b"
+        if re.search(pat, expr):
             return True
     return False
 
@@ -699,13 +774,14 @@ def verify_example_answer_with_context(
 
     has_argv1 = re.search(r"argv\s*\[\s*1\s*\]", text_for_calls) is not None
     file_source_vars = _extract_file_source_vars(text_for_calls)
+    file_flow_vars = _extract_file_data_flow_symbols(text_for_calls, file_source_vars)
     target_uses_file_data = False
     for arg_list in target_call_arg_lists:
         for arg in arg_list:
             if re.search(r"argv\s*\[\s*1\s*\]", arg):
                 target_uses_file_data = True
                 break
-            if _arg_uses_any_var(arg, file_source_vars):
+            if _arg_uses_any_var(arg, file_flow_vars):
                 target_uses_file_data = True
                 break
         if target_uses_file_data:
@@ -772,6 +848,8 @@ def verify_example_answer_with_context(
         "requires_file_data": requires_file_data,
         "target_uses_file_data": target_uses_file_data,
         "has_argv1_in_code": has_argv1,
+        "file_source_vars": file_source_vars,
+        "file_flow_vars": file_flow_vars,
         "consistency_issues": consistency_issues,
         "missing_requirements": missing_requirements,
         "confidence_score": score,

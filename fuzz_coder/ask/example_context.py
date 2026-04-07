@@ -206,10 +206,101 @@ def _extract_file_source_vars(code: str) -> List[str]:
     return vars_found
 
 
+def _normalize_chain_token(token: str) -> str:
+    t = str(token or "").strip()
+    t = re.sub(r"\s+", "", t)
+    return t
+
+
+def _lhs_base_name(lhs_expr: str) -> str:
+    lhs = _normalize_chain_token(lhs_expr)
+    if "->" in lhs:
+        return lhs.split("->", 1)[0]
+    if "." in lhs:
+        return lhs.split(".", 1)[0]
+    return lhs
+
+
+def _extract_simple_assignment_edges(code: str) -> List[tuple[str, str]]:
+    """Extract simple assignment edges like lhs = rhs; from caller code.
+
+    This is intentionally lightweight and heuristic-driven. It ignores compound
+    assignments and equality checks by matching only top-level '=' tokens.
+    """
+    if not code:
+        return []
+
+    pat = re.compile(
+        r"([A-Za-z_]\w*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)*)\s*"
+        r"(?<![=!<>+\-*/%&|^])=(?!=)\s*"
+        r"([^;]+);"
+    )
+    edges: List[tuple[str, str]] = []
+    for m in pat.finditer(code):
+        lhs_raw = (m.group(1) or "").strip()
+        rhs_raw = (m.group(2) or "").strip()
+        if not lhs_raw or not rhs_raw:
+            continue
+
+        # Skip very obvious non-dataflow cases.
+        if lhs_raw.startswith(("return ", "if ", "while ", "for ", "switch ")):
+            continue
+
+        lhs = _normalize_chain_token(lhs_raw)
+        edges.append((lhs, rhs_raw))
+    return edges
+
+
+def _extract_file_data_flow_symbols(code: str, source_vars: List[str]) -> List[str]:
+    """Propagate file-derived vars through simple assignment chains.
+
+    Example: line -> tmp -> cfg.path -> target(cfg.path)
+    """
+    derived = {_normalize_chain_token(v) for v in (source_vars or []) if v}
+    if not code:
+        return sorted({v for v in derived if v})
+
+    # Add base-object aliases for member variables.
+    for v in list(derived):
+        base = _lhs_base_name(v)
+        if base:
+            derived.add(base)
+
+    edges = _extract_simple_assignment_edges(code)
+    if not edges:
+        return sorted({v for v in derived if v})
+
+    for _ in range(6):
+        changed = False
+        names = [v for v in derived if v]
+        for lhs, rhs in edges:
+            if not names:
+                break
+            if _arg_uses_any_var(rhs, names):
+                if lhs not in derived:
+                    derived.add(lhs)
+                    changed = True
+                base = _lhs_base_name(lhs)
+                if base and base not in derived:
+                    derived.add(base)
+                    changed = True
+        if not changed:
+            break
+
+    return sorted({v for v in derived if v})
+
+
 def _arg_uses_any_var(arg_expr: str, names: List[str]) -> bool:
     expr = arg_expr or ""
     for name in names:
-        if re.search(rf"\b{re.escape(name)}\b", expr):
+        n = _normalize_chain_token(name)
+        if not n:
+            continue
+        if "." in n or "->" in n:
+            pat = rf"(?<![A-Za-z0-9_]){re.escape(n)}(?![A-Za-z0-9_])"
+        else:
+            pat = rf"\b{re.escape(n)}\b"
+        if re.search(pat, expr):
             return True
     return False
 
@@ -369,6 +460,7 @@ class ExampleContextBuilder:
         requires_file_data = bool(self.analysis.get("needs_file"))
         caller_code = str((caller or {}).get("code", ""))
         source_vars = _extract_file_source_vars(caller_code)
+        flow_vars = _extract_file_data_flow_symbols(caller_code, source_vars)
         caller_reads_argv1 = "argv[1]" in caller_code and bool(re.search(
             r"\b(ifstream|fopen|open|read|getline|istreambuf_iterator)\b", caller_code
         ))
@@ -380,7 +472,7 @@ class ExampleContextBuilder:
                 argv1_direct_to_target = True
                 target_uses_file_data = True
                 break
-            if _arg_uses_any_var(a, source_vars):
+            if _arg_uses_any_var(a, flow_vars):
                 target_uses_file_data = True
                 break
 
@@ -393,6 +485,8 @@ class ExampleContextBuilder:
             evidence.append(f"observed_call={observed_call.get('expr')}")
         if source_vars:
             evidence.append(f"file_source_vars={', '.join(source_vars)}")
+        if flow_vars:
+            evidence.append(f"file_flow_vars={', '.join(flow_vars)}")
 
         return {
             "target": target,
@@ -403,6 +497,7 @@ class ExampleContextBuilder:
                 "requires_file_data": requires_file_data,
                 "caller_reads_argv1": caller_reads_argv1,
                 "source_vars": source_vars,
+                "flow_vars": flow_vars,
                 "target_uses_file_data": target_uses_file_data,
                 "argv1_direct_to_target": argv1_direct_to_target,
                 "evidence": evidence,

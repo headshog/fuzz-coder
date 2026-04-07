@@ -248,3 +248,148 @@ def test_grounding_resolver_prefers_non_self_caller_when_available():
 
     assert ctx["target"]["name"] == "process_request"
     assert ctx["caller"]["name"] == "main"
+
+
+def test_grounding_resolver_prefers_target_with_real_main_caller_connectivity():
+    meta = [
+        {
+            "id": 0,
+            "name": "decode_blob",
+            "file": "/repo/src/alt.cpp",
+            "start_line": 10,
+            "end_line": 40,
+            "signature": "decode_blob(const uint8_t * data, size_t n)",
+            "parameters": [
+                {"name": "data", "type": "const uint8_t *", "raw": "const uint8_t * data"},
+                {"name": "n", "type": "size_t", "raw": "size_t n"},
+            ],
+            "code": "int decode_blob(const uint8_t * data, size_t n) { return 0; }",
+        },
+        {
+            "id": 1,
+            "name": "decode_blob",
+            "file": "/repo/src/real.cpp",
+            "start_line": 100,
+            "end_line": 170,
+            "signature": "decode_blob(const uint8_t * data, size_t n)",
+            "parameters": [
+                {"name": "data", "type": "const uint8_t *", "raw": "const uint8_t * data"},
+                {"name": "n", "type": "size_t", "raw": "size_t n"},
+            ],
+            "code": "int decode_blob(const uint8_t * data, size_t n) { return parse(data, n); }",
+        },
+        {
+            "id": 2,
+            "name": "main",
+            "file": "/repo/tools/main.cpp",
+            "start_line": 1,
+            "end_line": 80,
+            "signature": "main(int argc, char ** argv)",
+            "parameters": [],
+            "code": (
+                "int main(int argc, char ** argv) {\n"
+                "  std::ifstream in(argv[1], std::ios::binary);\n"
+                "  std::vector<uint8_t> b;\n"
+                "  b.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());\n"
+                "  decode_blob(b.data(), b.size());\n"
+                "  return 0;\n"
+                "}\n"
+            ),
+        },
+    ]
+    symbols = {"decode_blob": [0, 1], "main": [2]}
+    call_graph = {
+        "0": {"called_by": [], "resolved_calls": []},
+        "1": {"called_by": [2], "resolved_calls": []},
+        "2": {"called_by": [], "resolved_calls": [1]},
+    }
+    analysis = {
+        "query_type": "example_generation",
+        "primary_function_name": "decode_blob",
+        "function_names": ["decode_blob", "main"],
+        "needs_file": True,
+    }
+
+    ctx = _resolver(meta, symbols=symbols, call_graph=call_graph).resolve(
+        frags=[meta[0], meta[1]],
+        analysis=analysis,
+        candidate_ids=[0, 1, 2],
+        top_k=20,
+    )
+
+    assert ctx["target"]["file"].endswith("/repo/src/real.cpp")
+    assert ctx["caller"]["name"] == "main"
+
+
+def test_grounding_resolver_prefers_caller_with_file_data_flow_into_target_args():
+    meta = [
+        {
+            "id": 0,
+            "name": "parse_payload",
+            "file": "/repo/src/parser.cpp",
+            "start_line": 20,
+            "end_line": 60,
+            "signature": "parse_payload(const uint8_t * data, size_t n)",
+            "parameters": [
+                {"name": "data", "type": "const uint8_t *", "raw": "const uint8_t * data"},
+                {"name": "n", "type": "size_t", "raw": "size_t n"},
+            ],
+            "code": "int parse_payload(const uint8_t * data, size_t n) { return (int)n; }",
+        },
+        {
+            "id": 1,
+            "name": "main",
+            "file": "/repo/tools/main.cpp",
+            "start_line": 1,
+            "end_line": 70,
+            "signature": "main(int argc, char ** argv)",
+            "parameters": [],
+            "code": (
+                "int main(int argc, char ** argv) {\n"
+                "  std::ifstream in(argv[1], std::ios::binary);\n"
+                "  parse_payload(nullptr, 0);\n"
+                "  return 0;\n"
+                "}\n"
+            ),
+        },
+        {
+            "id": 2,
+            "name": "run_real",
+            "file": "/repo/tools/run.cpp",
+            "start_line": 10,
+            "end_line": 90,
+            "signature": "run_real(int argc, char ** argv)",
+            "parameters": [],
+            "code": (
+                "int run_real(int argc, char ** argv) {\n"
+                "  std::ifstream in(argv[1], std::ios::binary);\n"
+                "  std::vector<uint8_t> bytes;\n"
+                "  bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());\n"
+                "  return parse_payload(bytes.data(), bytes.size());\n"
+                "}\n"
+            ),
+        },
+    ]
+    symbols = {"parse_payload": [0], "main": [1], "run_real": [2]}
+    call_graph = {
+        "0": {"called_by": [1, 2], "resolved_calls": []},
+        "1": {"called_by": [], "resolved_calls": [0]},
+        "2": {"called_by": [], "resolved_calls": [0]},
+    }
+    analysis = {
+        "query_type": "example_generation",
+        "primary_function_name": "parse_payload",
+        "function_names": ["parse_payload", "main", "run_real"],
+        "needs_file": True,
+    }
+
+    ctx = _resolver(meta, symbols=symbols, call_graph=call_graph).resolve(
+        frags=[meta[0]],
+        analysis=analysis,
+        candidate_ids=[0, 1, 2],
+        top_k=20,
+    )
+
+    assert ctx["target"]["name"] == "parse_payload"
+    assert ctx["caller"]["name"] == "run_real"
+    assert "bytes.data()" in (ctx["observed_call"] or {}).get("expr", "")

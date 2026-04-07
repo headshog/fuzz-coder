@@ -7,6 +7,7 @@ from .example_context import (
     _arg_uses_any_var,
     _classify_param_shape,
     _extract_call_argument_lists,
+    _extract_file_data_flow_symbols,
     _extract_file_source_vars,
     _file_matches_any_filter,
     _target_quality_score,
@@ -120,7 +121,31 @@ class ExampleGroundingResolver:
         if not target_candidates:
             return None
 
-        return sorted(target_candidates, key=_target_quality_score, reverse=True)[0]
+        needs_file = bool(analysis.get("needs_file"))
+
+        def _target_score(chunk: Dict):
+            cid = int(chunk.get("id", -1))
+            cg = _get_call_graph_entry(self.call_graph, cid) if cid >= 0 else {}
+            callers = _dedup(_to_int_ids(cg.get("called_by", [])))
+            caller_chunks = [self.id_to_chunk.get(x) for x in callers if x in self.id_to_chunk]
+            caller_chunks = [c for c in caller_chunks if c is not None]
+            has_main_caller = any(str(c.get("name", "")).lower() == "main" for c in caller_chunks)
+            has_file_reader_caller = any(
+                "argv[1]" in str(c.get("code", "")) and bool(re.search(
+                    r"\b(ifstream|fopen|open|read|getline|istreambuf_iterator|fread)\b",
+                    str(c.get("code", "")),
+                ))
+                for c in caller_chunks
+            )
+            quality = _target_quality_score(chunk)
+            return (
+                1 if has_main_caller else 0,
+                1 if (needs_file and has_file_reader_caller) else 0,
+                len(callers),
+                quality,
+            )
+
+        return sorted(target_candidates, key=_target_score, reverse=True)[0]
 
     def _collect_expanded_pool_ids(
         self,
@@ -175,6 +200,7 @@ class ExampleGroundingResolver:
             n for n in list(analysis.get("function_names") or [])
             if n and n != target_name
         }
+        needs_file = bool(analysis.get("needs_file"))
 
         primary_candidates = []
         fallback_same_name_candidates = []
@@ -193,29 +219,71 @@ class ExampleGroundingResolver:
             arity_match = False
             if target_arity is not None:
                 arity_match = len(observed.get("args", [])) == target_arity
+            cg = _get_call_graph_entry(self.call_graph, cid)
+            resolved = set(_to_int_ids(cg.get("resolved_calls", [])))
+            edge_to_target = target_id in resolved
+            caller_code = str(chunk.get("code", ""))
+            caller_reads_file = "argv[1]" in caller_code and bool(re.search(
+                r"\b(ifstream|fopen|open|read|getline|istreambuf_iterator|fread)\b",
+                caller_code,
+            ))
+            source_vars = _extract_file_source_vars(caller_code)
+            flow_vars = _extract_file_data_flow_symbols(caller_code, source_vars)
+            observed_args = list(observed.get("args", []))
+            target_uses_file_data = False
+            for a in observed_args:
+                if "argv[1]" in (a or ""):
+                    target_uses_file_data = True
+                    break
+                if _arg_uses_any_var(a, flow_vars):
+                    target_uses_file_data = True
+                    break
 
             # Higher is better.
             score = (
+                1 if edge_to_target else 0,
                 1 if cid in edge_callers else 0,
                 1 if chunk_name in secondary_names else 0,
                 1 if chunk_name.lower() == "main" else 0,
+                1 if (needs_file and target_uses_file_data) else 0,
+                1 if (needs_file and caller_reads_file) else 0,
                 1 if arity_match else 0,
                 _target_quality_score(chunk),
             )
+            candidate = {
+                "score": score,
+                "chunk": chunk,
+                "observed": observed,
+                "arity_match": arity_match,
+                "caller_reads_file": caller_reads_file,
+                "target_uses_file_data": target_uses_file_data,
+            }
             # Prefer non-self callers for clearer real-usage grounding.
             # Same-name callers (overloads/recursive-like patterns) are only a fallback.
             if chunk_name == target_name:
-                fallback_same_name_candidates.append((score, chunk, observed))
+                fallback_same_name_candidates.append(candidate)
             else:
-                primary_candidates.append((score, chunk, observed))
+                primary_candidates.append(candidate)
 
         candidates = primary_candidates if primary_candidates else fallback_same_name_candidates
         if not candidates:
             return None, None
 
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        _, caller, observed = candidates[0]
-        return caller, observed
+        # Prefer exact-arity call-site when at least one exists.
+        if any(c["arity_match"] for c in candidates):
+            candidates = [c for c in candidates if c["arity_match"]]
+
+        # For file-driven examples, prefer callers that actually read argv[1]
+        # and route file-derived vars into target-call arguments.
+        if needs_file:
+            if any(c["caller_reads_file"] for c in candidates):
+                candidates = [c for c in candidates if c["caller_reads_file"]]
+            if any(c["target_uses_file_data"] for c in candidates):
+                candidates = [c for c in candidates if c["target_uses_file_data"]]
+
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        best = candidates[0]
+        return best["chunk"], best["observed"]
 
     def resolve(
         self,
@@ -275,6 +343,7 @@ class ExampleGroundingResolver:
         requires_file_data = bool(analysis.get("needs_file"))
         caller_code = str((caller or {}).get("code", ""))
         source_vars = _extract_file_source_vars(caller_code)
+        flow_vars = _extract_file_data_flow_symbols(caller_code, source_vars)
         caller_reads_argv1 = "argv[1]" in caller_code and bool(re.search(
             r"\b(ifstream|fopen|open|read|getline|istreambuf_iterator|fread)\b",
             caller_code,
@@ -287,7 +356,7 @@ class ExampleGroundingResolver:
                 argv1_direct_to_target = True
                 target_uses_file_data = True
                 break
-            if _arg_uses_any_var(a, source_vars):
+            if _arg_uses_any_var(a, flow_vars):
                 target_uses_file_data = True
                 break
 
@@ -303,6 +372,8 @@ class ExampleGroundingResolver:
             evidence.append(f"observed_call={observed_call.get('expr')}")
         if source_vars:
             evidence.append(f"file_source_vars={', '.join(source_vars)}")
+        if flow_vars:
+            evidence.append(f"file_flow_vars={', '.join(flow_vars)}")
 
         return {
             "target": target,
@@ -315,6 +386,7 @@ class ExampleGroundingResolver:
                 "requires_file_data": requires_file_data,
                 "caller_reads_argv1": caller_reads_argv1,
                 "source_vars": source_vars,
+                "flow_vars": flow_vars,
                 "target_uses_file_data": target_uses_file_data,
                 "argv1_direct_to_target": argv1_direct_to_target,
                 "evidence": evidence,

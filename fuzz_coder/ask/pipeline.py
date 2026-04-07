@@ -316,6 +316,7 @@ def _verify_answer(
     question,
     example_context=None,
     function_hints=None,
+    type_init_index=None,
 ):
     verification = {
         "is_valid": True,
@@ -464,6 +465,8 @@ def _verify_answer(
                 frags,
                 analysis=analysis,
                 example_context=example_context,
+                symbols=symbols,
+                type_init_index=type_init_index or {},
             )
             used_fallback = True
             if used_second_pass:
@@ -560,6 +563,7 @@ class QueryPipeline:
         config: PipelineConfig,
         called_by=None,
         function_hints=None,
+        type_init_index=None,
         shadow_runner: Optional[Callable[[str, List[Any]], PipelineResult]] = None,
     ):
         self.core = core_module
@@ -573,6 +577,7 @@ class QueryPipeline:
         self.call_graph = call_graph
         self.called_by = called_by or {}
         self.function_hints = function_hints or {}
+        self.type_init_index = type_init_index or {}
         self.config = config
         self._shadow_runner = shadow_runner
 
@@ -799,6 +804,7 @@ class QueryPipeline:
             question=q,
             example_context=example_context,
             function_hints=function_hints,
+            type_init_index=self.type_init_index,
         )
 
         elapsed = time.time() - start_time

@@ -182,6 +182,11 @@ def main():
     with open(out/"function_hints.json", "w") as f:
         json.dump(function_hints, f)
 
+    # Save type initialization patterns (for better example generation fallback).
+    type_init_index = core.build_type_init_index(chunks)
+    with open(out/"type_init_index.json", "w") as f:
+        json.dump(type_init_index, f)
+
     # Save call graph
     with open(out/"call_graph.json", "w") as f:
         json.dump(call_graph, f)
@@ -229,6 +234,8 @@ def main():
     print(f"  - Functions with memory management: {len(memory_mgmt_indices)}")
     print(f"  - Functions with error handling: {len(error_handling_indices)}")
     print(f"  - Docs/guide hints linked to functions: {sum(len(v) for v in function_hints.values())}")
+    types_count = len(type_init_index.get("types", {})) if isinstance(type_init_index, dict) else 0
+    print(f"  - Types with observed init patterns: {types_count}")
 
 
 if __name__ == "__main__":

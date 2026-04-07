@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from .base import LanguageProfile
+from typing import Any, Dict, List, Set
+
+from .base import LanguageFrontend, LanguageProfile
 
 
 C_CPP_PROFILE = LanguageProfile(
@@ -64,3 +66,69 @@ C_CPP_PROFILE = LanguageProfile(
         "template": [r"\b(std::vector|std::map|std::set|std::unordered_map|std::array)\b"],
     },
 )
+
+
+class CCppFrontend(LanguageFrontend):
+    @property
+    def name(self) -> str:
+        return "c_cpp"
+
+    def get_tree_sitter_raw_language(self) -> Any:
+        try:
+            import tree_sitter_cpp
+            return tree_sitter_cpp.language()
+        except Exception:
+            return None
+
+    def parse_tree_sitter_functions(
+        self,
+        *,
+        parser_utils: Any,
+        source_bytes: bytes,
+        root: Any,
+        control_keywords: Set[str],
+    ) -> List[Dict[str, Any]]:
+        functions: List[Dict[str, Any]] = []
+        for func_node in parser_utils._iter_nodes_by_type(root, "function_definition"):
+            name_node = parser_utils._extract_function_name_node(func_node)
+            if name_node is None:
+                continue
+
+            func_name = source_bytes[name_node.start_byte:name_node.end_byte].decode(
+                "utf-8", errors="ignore"
+            )
+            if not func_name or func_name in control_keywords:
+                continue
+
+            params = []
+            params_node = parser_utils._extract_function_params_node(func_node)
+            if params_node:
+                params_text = source_bytes[params_node.start_byte:params_node.end_byte].decode(
+                    "utf-8", errors="ignore"
+                )
+                params = parser_utils._parse_parameters(params_text)
+
+            body_node = func_node.child_by_field_name("body")
+            if not body_node:
+                continue
+
+            func_code = source_bytes[func_node.start_byte:func_node.end_byte].decode(
+                "utf-8", errors="ignore"
+            )
+            start_line = source_bytes[:func_node.start_byte].count(b"\n") + 1
+            end_line = source_bytes[:func_node.end_byte].count(b"\n") + 1
+
+            functions.append({
+                "name": func_name,
+                "signature": parser_utils._build_signature(func_name, params),
+                "parameters": params,
+                "code": func_code,
+                "body": func_code,
+                "start_line": start_line,
+                "end_line": end_line,
+                "parser": "tree-sitter",
+            })
+        return functions
+
+
+C_CPP_FRONTEND = CCppFrontend()

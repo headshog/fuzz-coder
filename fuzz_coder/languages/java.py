@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from .base import LanguageProfile
+import re
+from typing import Any, Dict, List, Set
+
+from .base import LanguageFrontend, LanguageProfile
 
 
 JAVA_PROFILE = LanguageProfile(
@@ -48,3 +51,76 @@ JAVA_PROFILE = LanguageProfile(
         "template": [r"\b(List|Set|Map|ArrayList|HashMap|HashSet)\s*<"],
     },
 )
+
+
+class JavaFrontend(LanguageFrontend):
+    @property
+    def name(self) -> str:
+        return "java"
+
+    def get_tree_sitter_raw_language(self) -> Any:
+        try:
+            import tree_sitter_java
+            return tree_sitter_java.language()
+        except Exception:
+            return None
+
+    def parse_tree_sitter_functions(
+        self,
+        *,
+        parser_utils: Any,
+        source_bytes: bytes,
+        root: Any,
+        control_keywords: Set[str],
+    ) -> List[Dict[str, Any]]:
+        functions: List[Dict[str, Any]] = []
+        for node_type in ("method_declaration", "constructor_declaration"):
+            for func_node in parser_utils._iter_nodes_by_type(root, node_type):
+                body_node = func_node.child_by_field_name("body")
+                if not body_node:
+                    continue
+
+                name_node = func_node.child_by_field_name("name")
+                if name_node is None:
+                    continue
+
+                func_name = source_bytes[name_node.start_byte:name_node.end_byte].decode(
+                    "utf-8", errors="ignore"
+                )
+                if not func_name or func_name in control_keywords:
+                    continue
+
+                params = []
+                params_node = func_node.child_by_field_name("parameters")
+                if params_node:
+                    params_text = source_bytes[params_node.start_byte:params_node.end_byte].decode(
+                        "utf-8", errors="ignore"
+                    )
+                    params = parser_utils._parse_parameters(params_text)
+
+                func_code = source_bytes[func_node.start_byte:func_node.end_byte].decode(
+                    "utf-8", errors="ignore"
+                )
+                start_line = source_bytes[:func_node.start_byte].count(b"\n") + 1
+                end_line = source_bytes[:func_node.end_byte].count(b"\n") + 1
+
+                functions.append({
+                    "name": func_name,
+                    "signature": parser_utils._build_signature(func_name, params),
+                    "parameters": params,
+                    "code": func_code,
+                    "body": func_code,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "parser": "tree-sitter",
+                })
+        return functions
+
+    def preprocess_regex_signature(self, compact_signature: str) -> str:
+        return re.sub(r"^(@[A-Za-z_]\w*(?:\([^)]*\))?\s+)+", "", compact_signature)
+
+    def extra_regex_bad_prefixes(self):
+        return ("interface ", "enum ", "record ", "package ", "import ")
+
+
+JAVA_FRONTEND = JavaFrontend()

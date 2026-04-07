@@ -64,6 +64,7 @@ def test_indexer_smoke_local_project(tmp_path, monkeypatch):
         out / "call_graph.json",
         out / "called_by.json",
         out / "function_hints.json",
+        out / "type_init_index.json",
     ]
     for p in expected:
         assert p.exists(), f"missing artifact: {p}"

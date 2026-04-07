@@ -13,6 +13,7 @@ import os
 from bisect import bisect_right
 from .call_graph import detect_calls as _detect_calls_impl
 from .call_graph import build_call_graph as _build_call_graph_impl
+from fuzz_coder.languages.registry import get_language_frontend
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -22,22 +23,6 @@ try:
     HAS_TREE_SITTER = True
 except ImportError:
     HAS_TREE_SITTER = False
-
-if HAS_TREE_SITTER:
-    try:
-        import tree_sitter_cpp
-        HAS_TREE_SITTER_CPP = True
-    except ImportError:
-        HAS_TREE_SITTER_CPP = False
-
-    try:
-        import tree_sitter_java
-        HAS_TREE_SITTER_JAVA = True
-    except ImportError:
-        HAS_TREE_SITTER_JAVA = False
-else:
-    HAS_TREE_SITTER_CPP = False
-    HAS_TREE_SITTER_JAVA = False
 
 SUPPORTED_EXT = {
     ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh"
@@ -220,6 +205,7 @@ class TreeSitterParser:
 
     def __init__(self, language_name="c_cpp"):
         self.language_name = language_name
+        self.frontend = get_language_frontend(language_name)
         if not HAS_TREE_SITTER:
             self.parser = None
             return
@@ -259,10 +245,12 @@ class TreeSitterParser:
             source_bytes = code.encode("utf-8", errors="ignore")
             tree = self.parser.parse(source_bytes)
             root = tree.root_node
-            if self.language_name == "java":
-                functions = self._parse_java_functions(source_bytes, root)
-            else:
-                functions = self._parse_c_cpp_functions(source_bytes, root)
+            functions = self.frontend.parse_tree_sitter_functions(
+                parser_utils=self,
+                source_bytes=source_bytes,
+                root=root,
+                control_keywords=CONTROL_KEYWORDS,
+            )
 
         except Exception as e:
             print(f"Tree-sitter error for {filepath}: {e}")
@@ -275,106 +263,8 @@ class TreeSitterParser:
         return functions
 
     def _get_raw_language(self, language_name):
-        if language_name == "c_cpp" and HAS_TREE_SITTER_CPP:
-            return tree_sitter_cpp.language()
-        if language_name == "java" and HAS_TREE_SITTER_JAVA:
-            return tree_sitter_java.language()
-        return None
-
-    def _parse_c_cpp_functions(self, source_bytes, root):
-        functions = []
-        for func_node in self._iter_nodes_by_type(root, "function_definition"):
-            name_node = self._extract_function_name_node(func_node)
-            if name_node is None:
-                continue
-
-            func_name = source_bytes[name_node.start_byte:name_node.end_byte].decode(
-                "utf-8", errors="ignore"
-            )
-
-            if func_name in CONTROL_KEYWORDS:
-                continue
-
-            # Extract parameters
-            params = []
-            params_node = self._extract_function_params_node(func_node)
-            if params_node:
-                params_text = source_bytes[params_node.start_byte:params_node.end_byte].decode(
-                    "utf-8", errors="ignore"
-                )
-                params = self._parse_parameters(params_text)
-
-            body_node = func_node.child_by_field_name("body")
-            if not body_node:
-                continue
-
-            func_code = source_bytes[func_node.start_byte:func_node.end_byte].decode(
-                "utf-8", errors="ignore"
-            )
-
-            start_line = source_bytes[:func_node.start_byte].count(b"\n") + 1
-            end_line = source_bytes[:func_node.end_byte].count(b"\n") + 1
-
-            functions.append({
-                "name": func_name,
-                "signature": self._build_signature(func_name, params),
-                "parameters": params,
-                "code": func_code,
-                "body": func_code,
-                "start_line": start_line,
-                "end_line": end_line,
-                "parser": "tree-sitter"
-            })
-
-        return functions
-
-    def _parse_java_functions(self, source_bytes, root):
-        functions = []
-        for node_type in ("method_declaration", "constructor_declaration"):
-            for func_node in self._iter_nodes_by_type(root, node_type):
-                body_node = func_node.child_by_field_name("body")
-                if not body_node:
-                    # Interface/abstract declarations without body are not embeddable targets.
-                    continue
-
-                name_node = func_node.child_by_field_name("name")
-                if name_node is None:
-                    continue
-
-                func_name = source_bytes[name_node.start_byte:name_node.end_byte].decode(
-                    "utf-8", errors="ignore"
-                )
-
-                if not func_name or func_name in CONTROL_KEYWORDS:
-                    continue
-
-                params = []
-                params_node = func_node.child_by_field_name("parameters")
-                if params_node:
-                    params_text = source_bytes[params_node.start_byte:params_node.end_byte].decode(
-                        "utf-8", errors="ignore"
-                    )
-                    params = self._parse_parameters(params_text)
-
-                func_code = source_bytes[func_node.start_byte:func_node.end_byte].decode(
-                    "utf-8", errors="ignore"
-                )
-
-                start_line = source_bytes[:func_node.start_byte].count(b"\n") + 1
-                end_line = source_bytes[:func_node.end_byte].count(b"\n") + 1
-
-                functions.append({
-                    "name": func_name,
-                    "signature": self._build_signature(func_name, params),
-                    "parameters": params,
-                    "code": func_code,
-                    "body": func_code,
-                    "start_line": start_line,
-                    "end_line": end_line,
-                    "parser": "tree-sitter"
-                })
-
-        return functions
+        _ = language_name
+        return self.frontend.get_tree_sitter_raw_language()
 
     def _parse_parameters(self, params_text):
         """Parse parameter list into structured format"""
@@ -500,10 +390,12 @@ class TreeSitterParser:
 def extract_functions_regex(_filepath, text, language_name="c_cpp"):
     """Fallback regex-based function extraction"""
     res = []
+    frontend = get_language_frontend(language_name)
     lines_with_end = text.splitlines(keepends=True)
     lines = [ln.rstrip("\r\n") for ln in lines_with_end]
-    max_signature_scan_lines = 80
-    max_signature_scan_chars = 12000
+    # Keep fallback conservative but resilient for heavy template/macros signatures.
+    max_signature_scan_lines = 160
+    max_signature_scan_chars = 40000
 
     offsets = []
     cur = 0
@@ -566,14 +458,11 @@ def extract_functions_regex(_filepath, text, language_name="c_cpp"):
             i += 1
             continue
 
-        # Drop leading Java annotations in regex mode fallback.
-        if language_name == "java":
-            compact = re.sub(r"^(@[A-Za-z_]\w*(?:\([^)]*\))?\s+)+", "", compact)
+        compact = frontend.preprocess_regex_signature(compact)
 
         bad_prefixes = ("if ", "for ", "while ", "switch ",
                         "catch ", "#", "typedef ", "return ", "class ", "struct ")
-        if language_name == "java":
-            bad_prefixes = bad_prefixes + ("interface ", "enum ", "record ", "package ", "import ")
+        bad_prefixes = frontend.merge_regex_bad_prefixes(bad_prefixes)
         if compact.startswith(bad_prefixes):
             i += 1
             continue
@@ -740,15 +629,17 @@ def parse_parameters_simple(params_text):
     """Simple parameter parsing for regex fallback"""
     params = []
     params_text = params_text.strip()
-    if not params_text:
+    if not params_text or params_text == "void":
         return params
 
-    for param in split_top_level_params(params_text):
+    for idx, param in enumerate(split_top_level_params(params_text)):
         param = param.strip()
         if not param:
             continue
 
         name, param_type = parse_single_parameter_simple(param)
+        if not name or name == "unknown":
+            name = f"arg{idx}"
         params.append({
             "name": name,
             "type": param_type,
@@ -874,12 +765,25 @@ def parse_single_parameter_simple(param_text):
     if not raw:
         return "unknown", "unknown"
 
-    no_default = raw
-    if "=" in raw:
-        no_default = raw.split("=", 1)[0].rstrip()
+    no_default = _strip_default_initializer_top_level(raw)
+    no_default = re.sub(r"\b__attribute__\s*\(\(.*?\)\)", " ", no_default)
+    no_default = re.sub(r"\[\[.*?\]\]", " ", no_default)
+    no_default = re.sub(r"\s+", " ", no_default).strip()
+    if no_default == "...":
+        return "varargs", "..."
+
+    # Named parameter packs: Args&&... args
+    pack = re.search(r"\.\.\.\s*([A-Za-z_]\w*)\s*$", no_default)
+    if pack:
+        name = pack.group(1)
+        ptype = no_default[:pack.start(1)].strip()
+        return name, ptype or "unknown"
 
     # Function pointer param: void (*cb)(int)
-    fp = re.search(r"\(\s*[*&]\s*([A-Za-z_]\w*)\s*\)", no_default)
+    fp = re.search(
+        r"\(\s*[*&]\s*(?:(?:const|volatile|restrict|__restrict__)\s+)*([A-Za-z_]\w*)\s*\)",
+        no_default,
+    )
     if fp:
         name = fp.group(1)
         return name, no_default
@@ -891,14 +795,197 @@ def parse_single_parameter_simple(param_text):
         ptype = no_default[:arr.start(1)].strip()
         return name, ptype or "unknown"
 
-    # Generic trailing identifier.
-    m = re.search(r"([A-Za-z_]\w*)\s*$", no_default)
-    if m:
-        name = m.group(1)
-        ptype = no_default[:m.start(1)].strip()
-        return name, ptype or "unknown"
+    # Generic trailing identifier at top-level.
+    trailing = _extract_trailing_identifier_top_level(no_default)
+    if trailing:
+        name, start_idx = trailing
+        ptype = no_default[:start_idx].strip()
+        if ptype:
+            return name, ptype
+        return name, "unknown"
 
     return raw, "unknown"
+
+
+def _strip_default_initializer_top_level(param_text):
+    """Strip default initializer (`= ...`) only at top-level."""
+    s = str(param_text or "")
+    depth_angle = 0
+    depth_paren = 0
+    depth_brace = 0
+    depth_bracket = 0
+    in_str = False
+    in_char = False
+    escape = False
+
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_str:
+            if not escape and ch == '"':
+                in_str = False
+            escape = (ch == "\\" and not escape)
+            i += 1
+            continue
+        if in_char:
+            if not escape and ch == "'":
+                in_char = False
+            escape = (ch == "\\" and not escape)
+            i += 1
+            continue
+
+        if ch == '"':
+            in_str = True
+            escape = False
+            i += 1
+            continue
+        if ch == "'":
+            in_char = True
+            escape = False
+            i += 1
+            continue
+
+        if ch == "<":
+            depth_angle += 1
+            i += 1
+            continue
+        if ch == ">":
+            depth_angle = max(0, depth_angle - 1)
+            i += 1
+            continue
+        if ch == "(":
+            depth_paren += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth_paren = max(0, depth_paren - 1)
+            i += 1
+            continue
+        if ch == "{":
+            depth_brace += 1
+            i += 1
+            continue
+        if ch == "}":
+            depth_brace = max(0, depth_brace - 1)
+            i += 1
+            continue
+        if ch == "[":
+            depth_bracket += 1
+            i += 1
+            continue
+        if ch == "]":
+            depth_bracket = max(0, depth_bracket - 1)
+            i += 1
+            continue
+
+        if ch == "=" and depth_angle == 0 and depth_paren == 0 and depth_brace == 0 and depth_bracket == 0:
+            return s[:i].rstrip()
+
+        i += 1
+    return s.strip()
+
+
+def _extract_trailing_identifier_top_level(param_text):
+    """Return (identifier, start_idx) for a trailing top-level parameter name."""
+    s = str(param_text or "").rstrip()
+    if not s:
+        return None
+
+    depth_angle = 0
+    depth_paren = 0
+    depth_brace = 0
+    depth_bracket = 0
+    in_str = False
+    in_char = False
+    escape = False
+
+    i = len(s) - 1
+    while i >= 0:
+        ch = s[i]
+        if in_str:
+            if not escape and ch == '"':
+                in_str = False
+            escape = (ch == "\\" and not escape)
+            i -= 1
+            continue
+        if in_char:
+            if not escape and ch == "'":
+                in_char = False
+            escape = (ch == "\\" and not escape)
+            i -= 1
+            continue
+
+        if ch == '"':
+            in_str = True
+            escape = False
+            i -= 1
+            continue
+        if ch == "'":
+            in_char = True
+            escape = False
+            i -= 1
+            continue
+
+        if ch == ">":
+            depth_angle += 1
+            i -= 1
+            continue
+        if ch == "<":
+            depth_angle = max(0, depth_angle - 1)
+            i -= 1
+            continue
+        if ch == ")":
+            depth_paren += 1
+            i -= 1
+            continue
+        if ch == "(":
+            depth_paren = max(0, depth_paren - 1)
+            i -= 1
+            continue
+        if ch == "}":
+            depth_brace += 1
+            i -= 1
+            continue
+        if ch == "{":
+            depth_brace = max(0, depth_brace - 1)
+            i -= 1
+            continue
+        if ch == "]":
+            depth_bracket += 1
+            i -= 1
+            continue
+        if ch == "[":
+            depth_bracket = max(0, depth_bracket - 1)
+            i -= 1
+            continue
+
+        if depth_angle == 0 and depth_paren == 0 and depth_brace == 0 and depth_bracket == 0:
+            if ch.isalnum() or ch == "_":
+                end = i
+                start = i
+                while start >= 0 and (s[start].isalnum() or s[start] == "_"):
+                    start -= 1
+                name = s[start + 1:end + 1]
+                # Ensure name is really trailing token (skip known type-only endings).
+                if name and name not in {
+                    "const", "volatile", "unsigned", "signed", "short", "long",
+                    "int", "char", "float", "double", "bool", "void", "size_t",
+                    "ssize_t", "struct", "class", "enum", "typename", "auto",
+                }:
+                    return name, start + 1
+                return None
+            if ch.isspace():
+                i -= 1
+                continue
+            # Hit top-level non-identifier token before any trailing identifier.
+            if ch in "*&])":
+                i -= 1
+                continue
+            return None
+
+        i -= 1
+    return None
 
 
 def find_matching_brace(text, pos):
@@ -1132,3 +1219,496 @@ def build_lexical_index(chunks):
         for w in words:
             idx[w].append(i)
     return idx
+
+
+def _split_call_args_top_level(args_text):
+    args_text = str(args_text or "").strip()
+    if not args_text:
+        return []
+    return split_top_level_params(args_text)
+
+
+def _is_literal_like_token(token):
+    t = str(token or "").strip()
+    if not t:
+        return False
+    if re.fullmatch(r"(?:[-+]?\d+(?:\.\d+)?(?:[uUlLfF]*)|nullptr|NULL|true|false)", t):
+        return True
+    if re.fullmatch(r"'(?:\\.|[^'])+'", t):
+        return True
+    if re.fullmatch(r"\"(?:\\.|[^\"])*\"", t):
+        return True
+    # allow namespaced/UPPERCASE constants
+    if re.fullmatch(r"(?:[A-Za-z_]\w*::)*[A-Z_][A-Z0-9_]*", t):
+        return True
+    return False
+
+
+def _is_self_contained_call_expr(expr):
+    e = str(expr or "").strip()
+    m = re.fullmatch(r"(?P<fn>(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*\((?P<args>.*)\)", e)
+    if not m:
+        return False
+    args = _split_call_args_top_level(m.group("args") or "")
+    if not args:
+        return True
+    for a in args:
+        if not _is_literal_like_token(a):
+            return False
+    return True
+
+
+def _extract_nominal_type_name_for_init(type_text):
+    t = re.sub(r"\b(const|volatile|restrict|__restrict__)\b", " ", str(type_text or ""))
+    t = re.sub(r"\s+", " ", t).strip()
+    t = t.replace("*", " ").replace("&", " ")
+    tokens = re.findall(r"[A-Za-z_]\w*", t)
+    if not tokens:
+        return None
+    skip = {
+        "struct", "class", "enum",
+        "unsigned", "signed", "long", "short",
+        "int", "float", "double", "bool", "void",
+        "size_t", "ssize_t", "auto", "typename",
+    }
+    for tok in reversed(tokens):
+        if tok.lower() not in skip:
+            return tok
+    return None
+
+
+def _normalize_expr(expr, max_len=240):
+    e = " ".join(str(expr or "").split()).strip()
+    if len(e) <= max_len:
+        return e
+    return e[: max_len - 3].rstrip() + "..."
+
+
+def _extract_call_name(expr):
+    e = str(expr or "").strip()
+    m = re.match(r"((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*\(", e)
+    if not m:
+        return None
+    return m.group(1).split("::")[-1]
+
+
+def _init_pattern_score(kind, expr):
+    score = 0
+    e = str(expr or "").lower()
+    if kind == "pointer_call":
+        score += 6
+    elif kind == "value_call":
+        score += 5
+    elif kind == "value_brace":
+        score += 3
+    elif kind == "value_default":
+        score += 1
+
+    for kw in ["alloc", "create", "init", "default", "open", "new"]:
+        if kw in e:
+            score += 2
+    if _is_self_contained_call_expr(expr):
+        score += 3
+    return score
+
+
+def _extract_variable_type_hints(code):
+    """Extract local variable -> nominal type hints from a function body."""
+    hints = {}
+    ptr_decl = re.compile(
+        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*\*\s*"
+        r"(?P<var>[A-Za-z_]\w*)\b"
+    )
+    val_decl = re.compile(
+        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+"
+        r"(?P<var>[A-Za-z_]\w*)\b"
+    )
+
+    for raw in str(code or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("//") or line.startswith("#"):
+            continue
+        if "(" in line and ")" in line and line.endswith("{"):
+            continue
+
+        match = ptr_decl.match(line)
+        is_ptr = True
+        if not match:
+            match = val_decl.match(line)
+            is_ptr = False
+        if not match:
+            continue
+
+        var = str(match.group("var") or "").strip()
+        nominal = _extract_nominal_type_name_for_init(match.group("type"))
+        if not var or not nominal:
+            continue
+        hints[var] = {"nominal_type": nominal, "is_pointer": is_ptr}
+    return hints
+
+
+def _extract_field_assignments(code):
+    """Extract assignments like cfg.x = ... and cfg->x = ..."""
+    out = []
+    pat = re.compile(
+        r"^\s*(?P<base>[A-Za-z_]\w*)\s*"
+        r"(?P<tail>(?:(?:\.|->)\s*[A-Za-z_]\w+)+)\s*=\s*"
+        r"(?P<rhs>[^;]+)\s*;\s*$"
+    )
+
+    for li, raw in enumerate(str(code or "").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("//") or line.startswith("#"):
+            continue
+        if "==" in line or "+=" in line or "-=" in line or "*=" in line or "/=" in line:
+            continue
+        m = pat.match(line)
+        if not m:
+            continue
+
+        base = str(m.group("base") or "").strip()
+        tail = str(m.group("tail") or "")
+        rhs = str(m.group("rhs") or "").strip()
+        if not base or not tail or not rhs:
+            continue
+
+        pieces = re.findall(r"(\.|->)\s*([A-Za-z_]\w+)", tail)
+        if not pieces:
+            continue
+        access = "arrow" if pieces[0][0] == "->" else "dot"
+        path = ".".join(name for _, name in pieces)
+        out.append({
+            "line": li,
+            "base": base,
+            "access": access,
+            "path": path,
+            "rhs": _normalize_expr(rhs),
+        })
+    return out
+
+
+def _extract_call_sites(code, control_keywords):
+    """Extract call sites with name/arity/args/line from function body."""
+    out = []
+    masked = code
+    # Reuse call-regex from call graph module semantics.
+    call_re = re.compile(
+        r"(?<![A-Za-z0-9_~])(?P<expr>"
+        r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*"
+        r"|"
+        r"[A-Za-z_]\w*\s*(?:->|\.)\s*[A-Za-z_]\w*"
+        r")\s*\("
+    )
+
+    for m in call_re.finditer(masked):
+        expr = re.sub(r"\s+", "", (m.group("expr") or ""))
+        if not expr:
+            continue
+        if "->" in expr:
+            name = expr.split("->")[-1]
+        elif "." in expr:
+            name = expr.split(".")[-1]
+        else:
+            name = expr.split("::")[-1]
+        if not name or name in control_keywords:
+            continue
+
+        open_idx = m.end() - 1
+        close_idx = find_matching_paren(code, open_idx)
+        if close_idx == -1:
+            continue
+        args_text = code[open_idx + 1:close_idx]
+        args = _split_call_args_top_level(args_text)
+        line_no = code.count("\n", 0, m.start()) + 1
+        out.append({
+            "name": name,
+            "arity": len(args),
+            "args": args,
+            "line": line_no,
+        })
+    return out
+
+
+def _extract_arg_base_var(arg_expr):
+    expr = str(arg_expr or "").strip()
+    if not expr:
+        return None
+    if re.fullmatch(r"&\s*([A-Za-z_]\w*)", expr):
+        return re.sub(r"^&\s*", "", expr).strip()
+    if re.fullmatch(r"\*+\s*([A-Za-z_]\w*)", expr):
+        return re.sub(r"^\*+\s*", "", expr).strip()
+    if re.fullmatch(r"[A-Za-z_]\w*", expr):
+        return expr
+    return None
+
+
+def _field_rhs_score(expr):
+    e = _normalize_expr(expr)
+    if _is_literal_like_token(e):
+        return 6
+    if _is_self_contained_call_expr(e):
+        return 5
+    if re.fullmatch(r"(?:[A-Za-z_]\w*::)*[A-Z_][A-Z0-9_]*", e):
+        return 4
+    return 1
+
+
+def build_type_init_index(chunks, max_per_type=16):
+    """Build v2 type initialization/field-chain index for example generation."""
+    by_type = defaultdict(dict)  # type -> (kind, expr) -> aggregated record
+    by_name = defaultdict(list)
+    for c in chunks or []:
+        name = str(c.get("name", "")).strip()
+        if name:
+            by_name[name].append(c)
+
+    pat_ptr_eq = re.compile(
+        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*\*\s*"
+        r"(?P<var>[A-Za-z_]\w*)\s*=\s*(?P<expr>[^;]+)\s*;\s*$"
+    )
+    pat_val_eq = re.compile(
+        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+"
+        r"(?P<var>[A-Za-z_]\w*)\s*=\s*(?P<expr>[^;]+)\s*;\s*$"
+    )
+    pat_val_ctor = re.compile(
+        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+"
+        r"(?P<var>[A-Za-z_]\w*)\s*\((?P<expr>[^;]*)\)\s*;\s*$"
+    )
+    pat_val_brace = re.compile(
+        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+"
+        r"(?P<var>[A-Za-z_]\w*)\s*(?P<expr>\{[^;]*\})\s*;\s*$"
+    )
+    pat_val_default = re.compile(
+        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+"
+        r"(?P<var>[A-Za-z_]\w*)\s*;\s*$"
+    )
+
+    # Pass 1: aggregate init-pattern candidates per nominal type.
+    for c in chunks or []:
+        file_path = str(c.get("file", ""))
+        start_line = int(c.get("start_line", 1) or 1)
+        code = str(c.get("code", "") or c.get("body", ""))
+        if not code:
+            continue
+        lines = code.splitlines()
+        for li, raw in enumerate(lines, start=1):
+            line = (raw or "").strip()
+            if not line or line.startswith("//") or line.startswith("#"):
+                continue
+
+            kind = None
+            type_text = None
+            expr = None
+            match = None
+
+            for k, pat in [
+                ("pointer_call", pat_ptr_eq),
+                ("value_call", pat_val_eq),
+                ("value_call", pat_val_ctor),
+                ("value_brace", pat_val_brace),
+                ("value_default", pat_val_default),
+            ]:
+                m = pat.match(line)
+                if m:
+                    match = m
+                    kind = k
+                    type_text = m.group("type")
+                    expr = (m.groupdict().get("expr") or "").strip()
+                    break
+
+            if not match or not kind or not type_text:
+                continue
+
+            if kind in {"pointer_call", "value_call"}:
+                if not re.fullmatch(r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*\s*\([^;]*\)", expr or ""):
+                    continue
+
+            nominal = _extract_nominal_type_name_for_init(type_text)
+            if not nominal:
+                continue
+
+            expr_norm = _normalize_expr(expr)
+            key = (kind, expr_norm)
+            rec = by_type[nominal].get(key)
+            if rec is None:
+                call_name = _extract_call_name(expr_norm) if kind in {"pointer_call", "value_call"} else None
+                rec = {
+                    "kind": kind,
+                    "expr": expr_norm,
+                    "function": call_name,
+                    "self_contained": _is_self_contained_call_expr(expr_norm) if kind in {"pointer_call", "value_call"} else (kind != "value_default"),
+                    "count": 0,
+                    "score": 0,
+                    "evidence": [],
+                }
+                by_type[nominal][key] = rec
+
+            rec["count"] += 1
+            rec["score"] += _init_pattern_score(kind, expr_norm)
+            if len(rec["evidence"]) < 3:
+                rec["evidence"].append({
+                    "file": file_path,
+                    "line": start_line + li - 1,
+                    "function": str(c.get("name", "")),
+                })
+
+    types_out = {}
+    for nominal, variants in by_type.items():
+        ranked = sorted(
+            variants.values(),
+            key=lambda x: (x.get("score", 0), x.get("count", 0), len(str(x.get("expr", "")))),
+            reverse=True,
+        )
+        types_out[nominal] = ranked[:max_per_type]
+
+    # Pass 2: infer required field chains before target function calls.
+    # key: (func, arg_index, arg_name, nominal_type)
+    req = {}
+    for c in chunks or []:
+        code = str(c.get("code", "") or c.get("body", ""))
+        if not code:
+            continue
+        file_path = str(c.get("file", ""))
+        start_line = int(c.get("start_line", 1) or 1)
+        var_hints = _extract_variable_type_hints(code)
+        field_assignments = _extract_field_assignments(code)
+        if not field_assignments:
+            continue
+        call_sites = _extract_call_sites(code, CONTROL_KEYWORDS)
+        if not call_sites:
+            continue
+
+        for cs in call_sites:
+            call_name = str(cs.get("name") or "").strip()
+            arity = int(cs.get("arity") or 0)
+            target_candidates = by_name.get(call_name, [])
+            if not target_candidates:
+                continue
+
+            arity_matches = [
+                tc for tc in target_candidates
+                if len(list(tc.get("parameters") or [])) == arity
+            ]
+            if arity_matches:
+                target_candidates = arity_matches
+            if not target_candidates:
+                continue
+
+            for target in target_candidates:
+                params = list(target.get("parameters") or [])
+                args = list(cs.get("args") or [])
+                for i, param in enumerate(params):
+                    if i >= len(args):
+                        continue
+                    arg = args[i]
+                    base_var = _extract_arg_base_var(arg)
+                    if not base_var:
+                        continue
+                    hint = var_hints.get(base_var)
+                    if not hint:
+                        continue
+                    nominal = _extract_nominal_type_name_for_init(param.get("type", ""))
+                    if not nominal:
+                        continue
+                    if str(hint.get("nominal_type", "")).lower() != nominal.lower():
+                        continue
+
+                    key = (
+                        str(target.get("name", "")).strip(),
+                        int(i),
+                        str(param.get("name", "")).strip() or f"arg{i}",
+                        nominal,
+                    )
+                    bucket = req.get(key)
+                    if bucket is None:
+                        bucket = {
+                            "function": key[0],
+                            "arg_index": key[1],
+                            "arg_name": key[2],
+                            "type": key[3],
+                            "call_sites": 0,
+                            "fields": {},  # (path, access) -> rec
+                        }
+                        req[key] = bucket
+                    bucket["call_sites"] += 1
+
+                    seen_fields = set()
+                    for fa in field_assignments:
+                        if fa["base"] != base_var:
+                            continue
+                        if int(fa["line"]) >= int(cs["line"]):
+                            continue
+                        fkey = (fa["path"], fa["access"])
+                        if fkey in seen_fields:
+                            continue
+                        seen_fields.add(fkey)
+                        rec = bucket["fields"].get(fkey)
+                        if rec is None:
+                            rec = {
+                                "path": fa["path"],
+                                "access": fa["access"],
+                                "count": 0,
+                                "rhs": defaultdict(int),
+                                "evidence": [],
+                            }
+                            bucket["fields"][fkey] = rec
+                        rec["count"] += 1
+                        rec["rhs"][fa["rhs"]] += 1
+                        if len(rec["evidence"]) < 3:
+                            rec["evidence"].append({
+                                "file": file_path,
+                                "line": start_line + int(fa["line"]) - 1,
+                                "function": str(c.get("name", "")),
+                            })
+
+    required_fields_by_function = defaultdict(list)
+    for _, bucket in req.items():
+        call_sites = max(1, int(bucket["call_sites"]))
+        fields_out = []
+        for _, frec in bucket["fields"].items():
+            rhs_items = sorted(
+                frec["rhs"].items(),
+                key=lambda x: (_field_rhs_score(x[0]), x[1], len(str(x[0]))),
+                reverse=True,
+            )
+            sample_expr = rhs_items[0][0] if rhs_items else "{}"
+            support = float(frec["count"]) / float(call_sites)
+            required = bool(
+                (frec["count"] == call_sites and call_sites >= 1)
+                or (support >= 0.80 and frec["count"] >= 2)
+            )
+            fields_out.append({
+                "path": frec["path"],
+                "access": frec["access"],
+                "count": int(frec["count"]),
+                "support": round(support, 4),
+                "required": required,
+                "sample_expr": sample_expr,
+                "self_contained": bool(_is_literal_like_token(sample_expr) or _is_self_contained_call_expr(sample_expr)),
+                "evidence": list(frec["evidence"]),
+            })
+
+        fields_out.sort(key=lambda x: (x["required"], x["support"], x["count"], len(x["path"])), reverse=True)
+        if not fields_out:
+            continue
+        required_fields_by_function[bucket["function"]].append({
+            "arg_index": bucket["arg_index"],
+            "arg_name": bucket["arg_name"],
+            "type": bucket["type"],
+            "call_sites": int(call_sites),
+            "fields": fields_out[:24],
+        })
+
+    # deterministic ordering
+    req_out = {}
+    for fname, entries in required_fields_by_function.items():
+        req_out[fname] = sorted(
+            entries,
+            key=lambda e: (int(e.get("arg_index", 0)), str(e.get("arg_name", ""))),
+        )
+
+    return {
+        "version": 2,
+        "types": types_out,
+        "required_fields_by_function": req_out,
+    }
