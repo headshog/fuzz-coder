@@ -11,6 +11,42 @@ def test_analyze_query_detects_fuzz_and_path_filter_ru():
     assert analysis["is_listing"] is True
     assert analysis["needs_fuzz_targets"] is True
     assert analysis["path_filters"] == ["src/parsers"]
+    assert analysis["max_param_count"] == 4
+    assert analysis["needs_broad_fuzz_surface"] is True
+    assert analysis["constraint_mode"] == "any"
+    assert analysis["listing_target_count"] == 25
+
+
+def test_analyze_query_broad_fuzz_listing_does_not_infer_noise_function_mentions():
+    planner = QueryPlanner(
+        special_indices={},
+        symbols={
+            "parse": [1],
+            "decode": [2],
+            "split": [3],
+            "tokenize": [4],
+            "array": [5],
+            "stream": [6],
+        },
+        call_graph={},
+        called_by={},
+        meta=[],
+    )
+    q = (
+        "Write a large list (20-30) of functions that can be used for fuzzing. "
+        "Only include functions with at most 4 parameters. "
+        "A function is eligible if ANY of these is true: "
+        "it parses input (or has parse/decode/split/tokenize in name/logic), "
+        "OR it has std::vector/std::array/std::span-like parameters."
+    )
+
+    analysis = planner.analyze_query(q)
+
+    assert analysis["query_type"] == "listing"
+    assert analysis["needs_fuzz_targets"] is True
+    assert analysis["needs_broad_fuzz_surface"] is True
+    assert analysis["function_names"] == []
+    assert analysis["query_function_candidates"] == []
 
 
 def test_analyze_query_detects_path_filter_en_module():
@@ -390,3 +426,67 @@ def test_analyze_query_path_filter_ignores_alias_sentence_fragment_between_from_
 
     assert analysis["query_type"] == "example_generation"
     assert analysis["path_filters"] == ["vendor/cpp-httplib/httplib.cpp"]
+
+
+def test_analyze_query_detects_parameter_analysis_intent_en():
+    planner = QueryPlanner(
+        special_indices={},
+        symbols={"llama_params_fit": [1]},
+        call_graph={},
+        called_by={},
+        meta=[],
+    )
+    q = "What parameters does llama_params_fit take and what is the data format of each parameter?"
+
+    analysis = planner.analyze_query(q)
+
+    assert analysis["query_type"] == "parameter_analysis"
+    assert analysis["needs_param_semantics"] is True
+    assert analysis["needs_params"] is True
+    assert "llama_params_fit" in analysis["function_names"]
+
+
+def test_analyze_query_detects_parameter_analysis_intent_ru():
+    planner = QueryPlanner(
+        special_indices={},
+        symbols={"llama_params_fit": [1]},
+        call_graph={},
+        called_by={},
+        meta=[],
+    )
+    q = "Какие параметры принимает функция llama_params_fit и что означает каждый параметр?"
+
+    analysis = planner.analyze_query(q)
+
+    assert analysis["query_type"] == "parameter_analysis"
+    assert analysis["needs_param_semantics"] is True
+    assert analysis["needs_params"] is True
+    assert "llama_params_fit" in analysis["function_names"]
+
+
+def test_analyze_query_parameter_alias_text_does_not_enable_file_or_output_filters():
+    planner = QueryPlanner(
+        special_indices={},
+        symbols={
+            "llama_params_fit": [1],
+            "format": [2],
+            "context": [3],
+        },
+        call_graph={},
+        called_by={},
+        meta=[],
+    )
+    q = (
+        "Analyze function parameter semantics for llama_params_fit: for each parameter, explain its role, "
+        "expected data format/range, whether it is input/output/inout, where values usually come from in the codebase, "
+        "and provide evidence from signature, call sites, and docs (file:line). "
+        "If unknown, say explicitly \"unknown from provided context\"."
+    )
+
+    analysis = planner.analyze_query(q)
+
+    assert analysis["query_type"] == "parameter_analysis"
+    assert analysis["needs_param_semantics"] is True
+    assert analysis["needs_file"] is False
+    assert analysis["needs_output"] is False
+    assert analysis["function_names"] == ["llama_params_fit"]

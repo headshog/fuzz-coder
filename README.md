@@ -15,6 +15,7 @@
 - **Type-specific**: "функции с массивом байтов", "принимающие строку"
 - **Input-specific**: "читают из stdin", "работают с файлами"
 - **Example generation**: "дай пример использования", "как вызвать"
+- **Parameter analysis**: "какие параметры принимает...", "что означает каждый параметр"
 - **Implementation explanation**: "как работает", "алгоритм"
 - **Follow-up вопросы**: контекстные уточнения к предыдущим ответам
 
@@ -94,6 +95,7 @@ python index_fuzz_coder.py --src /path/to/code_dir --out ./index_data
 - Call graph (кто кого вызывает)
 - Семантические эмбеддинги для поиска
 - Лексический индекс для keyword search
+- Подсказки из docs/guides (`function_hints.json`), если в документации встречаются имена функций
 
 ### Шаг 2: Запуск интерактивного режима
 
@@ -120,6 +122,95 @@ python ask_fuzz_coder.py \
 - `FC_EXAMPLE_GROUNDING_LEGACY=1` — включить legacy-grounding для example_generation (по умолчанию используется v2-grounding)
 - `FC_EXAMPLE_GROUNDING_SHADOW=1` — сравнивать legacy и v2 grounding в verbose-режиме без смены ответа
 
+### Шаг 2.1 (опционально): Браузерный чат (Gradio)
+
+Если нужен UI в браузере вместо консоли:
+
+```bash
+pip install gradio
+
+# Вариант 1: автообнаружение index_data_* рядом с web_fuzz_coder.py
+python web_fuzz_coder.py \
+  --model qwen3-coder:30b \
+  --host 0.0.0.0 \
+  --port 8080
+
+# Вариант 2: явный один индекс
+python web_fuzz_coder.py \
+  --index_dir ./index_data \
+  --model qwen3-coder:30b \
+  --host 0.0.0.0 \
+  --port 8080
+
+# Вариант 3: базовая авторизация (inline)
+python web_fuzz_coder.py \
+  --index_base_dir . \
+  --model qwen3-coder:30b \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --auth_users "alice:secret,bob:secret2"
+
+# Вариант 4: базовая авторизация из файла
+python web_fuzz_coder.py \
+  --index_base_dir . \
+  --model qwen3-coder:30b \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --auth_users_file ./users.txt
+```
+
+Если найдены несколько папок `index_data_PROJECT`, в UI появится выпадающий список проекта.
+Также в веб-UI можно добавить новый проект без перезагрузки страницы:
+- Загрузите `.zip` через блок `Add Project`.
+- Укажите имя проекта (опционально) и язык.
+- Нажмите `Add Project from ZIP`.
+- После завершения индексации новый проект сразу появится в dropdown и будет выбран автоматически.
+
+Браузерный UI поддерживает базовую авторизацию и отдельную историю для каждого пользователя:
+- При передаче `--auth_users` или `--auth_users_file` включается login/password.
+- История каждого пользователя хранится отдельно в `--history_dir` (по умолчанию `.web_fuzz_histories`).
+- После перезапуска сервера истории сохраняются.
+- При включенной авторизации в UI появляется кнопка `Logout`.
+
+Форматы `--auth_users_file`:
+- `users.txt`:
+  - `alice:secret`
+  - `bob:secret2`
+- `users.json`:
+  - `{"alice":"secret","bob":"secret2"}`
+  - или `[{"username":"alice","password":"secret"}]`
+
+В браузерном чате поддерживаются те же alias-команды:
+- `fuzz`
+- `fuzz wide`
+- `more fuzz`
+- `more fuzz wide`
+- `example FUNCTION_NAME`
+- `explain FUNCTION_NAME`
+
+### Шаг 2.2 (опционально): Автозапуск через systemd
+
+В репозитории есть готовый unit-файл:
+- `deploy/systemd/web_fuzz_coder.service`
+
+Он уже настроен под команду:
+- `/home/headshog/.venv/bin/python /home/headshog/coder/web_fuzz_coder.py --model qwen3-coder:30b --host 0.0.0.0 --port 8080 --auth_users_file /home/headshog/coder/users.txt`
+
+Установка сервиса:
+
+```bash
+sudo cp deploy/systemd/web_fuzz_coder.service /etc/systemd/system/web_fuzz_coder.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now web_fuzz_coder.service
+```
+
+Проверка:
+
+```bash
+sudo systemctl status web_fuzz_coder.service
+journalctl -u web_fuzz_coder.service -f
+```
+
 ### Шаг 3: Задавайте вопросы!
 
 Примеры запросов:
@@ -143,6 +234,13 @@ python ask_fuzz_coder.py \
 > Дай пример кода, вызывающий функцию parseData
 > Как использовать функцию readFile? Покажи пример
 > Напиши пример вызова processBuffer с правильными типами
+```
+
+#### Анализ параметров функции
+```
+> Какие параметры принимает функция llama_params_fit?
+> What parameters does process_request take and what does each parameter mean?
+> Для функции foo: формат данных по каждому параметру и откуда обычно берутся значения
 ```
 
 #### Follow-up вопросы (контекстные)

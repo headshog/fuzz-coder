@@ -388,6 +388,53 @@ def test_pipeline_golden_example_dual_pass_selects_grounded_candidate(monkeypatc
     assert "parse_payload(reinterpret_cast<const uint8_t *>(argv[1]), 1);" not in result.answer
 
 
+def test_pipeline_parameter_analysis_enforces_function_signature_header_and_falls_back(monkeypatch):
+    meta = [
+        {
+            "id": 0,
+            "name": "llama_params_fit",
+            "file": "/repo/src/llama.cpp",
+            "start_line": 100,
+            "end_line": 180,
+            "signature": "llama_params_fit(const char * path_model, struct llama_model_params * mparams, uint32_t n_ctx_min)",
+            "parameters": [
+                {"name": "path_model", "type": "const char *", "raw": "const char * path_model"},
+                {"name": "mparams", "type": "struct llama_model_params *", "raw": "struct llama_model_params * mparams"},
+                {"name": "n_ctx_min", "type": "uint32_t", "raw": "uint32_t n_ctx_min"},
+            ],
+            "code": "bool llama_params_fit(const char * path_model, struct llama_model_params * mparams, uint32_t n_ctx_min) { return true; }",
+            "has_stdin": False,
+            "has_file_input": False,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": False,
+            "has_error_handling": True,
+        },
+    ]
+
+    def _stub_call_llm(_prompt, _model, temperature=0.1):  # noqa: ARG001
+        return {
+            "ok": True,
+            "response": (
+                "1. path_model: const char *\n"
+                "2. mparams: struct llama_model_params *\n"
+                "3. n_ctx_min: uint32_t\n"
+            ),
+            "error": None,
+        }
+
+    pipeline = _build_pipeline(monkeypatch, meta, _stub_call_llm, shadow_mode=False)
+    result = pipeline.run(
+        "Analyze function parameter semantics for llama_params_fit: for each parameter explain role and format",
+        [],
+    )
+
+    assert result.used_fallback is True
+    assert "Function: `llama_params_fit`" in result.answer
+    assert "Signature: `llama_params_fit(" in result.answer
+    assert "Parameters:" in result.answer
+
+
 def test_pipeline_example_grounding_v2_includes_real_caller_and_observed_call(monkeypatch):
     meta = [
         {

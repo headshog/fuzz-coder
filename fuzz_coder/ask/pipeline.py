@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -56,10 +57,14 @@ def _print_query_analysis(analysis):
     print(f"  Needs memory mgmt: {analysis['needs_memory_mgmt']}")
     print(f"  Needs error handling: {analysis['needs_error_handling']}")
     print(f"  Needs params: {analysis['needs_params']}")
+    print(f"  Needs param semantics: {analysis.get('needs_param_semantics', False)}")
     print(f"  Needs parse-like: {analysis['needs_parse_like']}")
     print(f"  Needs fuzz-targets: {analysis['needs_fuzz_targets']}")
     print(f"  Path filters: {analysis['path_filters']}")
     print(f"  Constraint mode: {analysis['constraint_mode']}")
+    print(f"  Max params: {analysis.get('max_param_count')}")
+    print(f"  Broad fuzz surface mode: {analysis.get('needs_broad_fuzz_surface', False)}")
+    print(f"  Listing target count: {analysis.get('listing_target_count')}")
     print(f"  Exclude output/write-like: {analysis['exclude_output']}")
     print(f"  Requested types: {analysis['requested_types']}")
     print(f"  Mentioned functions: {analysis['function_names']}")
@@ -87,9 +92,14 @@ def _compute_retrieval(
         candidate_ids = [cid for cid in candidate_ids if cid not in excluded_prev_ids]
 
     is_listing = analysis.get("query_type") == "listing"
+    desired_listing_count = int(analysis.get("listing_target_count") or 0) if is_listing else 0
     semantic_k = top_k * (4 if is_listing else 2)
     lexical_k = top_k * (6 if is_listing else 3)
     retrieval_budget = max(top_k * (12 if is_listing else 6), rerank_top_k * 4)
+    if is_listing and desired_listing_count > 0:
+        semantic_k = max(semantic_k, desired_listing_count * 4)
+        lexical_k = max(lexical_k, desired_listing_count * 6)
+        retrieval_budget = max(retrieval_budget, desired_listing_count * 6)
     if is_listing:
         retrieval_budget = max(retrieval_budget, 150)
     retrieval_budget = min(len(meta), retrieval_budget)
@@ -128,8 +138,14 @@ def _print_retrieval_stats(stats):
 def _rerank_candidates(core, q, analysis, all_candidates, meta, reranker, rerank_top_k, excluded_prev_ids):
     effective_rerank_top_k = rerank_top_k
     if analysis.get("query_type") == "listing":
-        effective_rerank_top_k = 10
+        desired_listing_count = int(analysis.get("listing_target_count") or 0)
+        if desired_listing_count > 0:
+            effective_rerank_top_k = max(rerank_top_k, min(desired_listing_count, 40))
+        else:
+            effective_rerank_top_k = 10
     elif analysis.get("query_type") == "example_generation":
+        effective_rerank_top_k = max(rerank_top_k, 8)
+    elif analysis.get("query_type") == "parameter_analysis":
         effective_rerank_top_k = max(rerank_top_k, 8)
 
     rerank_pool_size = max(effective_rerank_top_k * 4, effective_rerank_top_k + 10)
@@ -170,7 +186,7 @@ def _rerank_candidates(core, q, analysis, all_candidates, meta, reranker, rerank
 def _select_ranked_ids(core, analysis, ranked_pool_ids, effective_rerank_top_k, meta, symbols, call_graph):
     fuzz_fallback_applied = False
 
-    if analysis.get("query_type") in {"example_generation", "function_specific", "implementation_explanation"}:
+    if analysis.get("query_type") in {"example_generation", "parameter_analysis", "function_specific", "implementation_explanation"}:
         mentioned_ids = []
         primary_name = analysis.get("primary_function_name")
         if analysis.get("query_type") == "example_generation" and primary_name:
@@ -246,6 +262,7 @@ def _build_prompt_and_call_llm(
     model,
     verbose,
     example_context=None,
+    function_hints=None,
 ):
     prompt_history = conversation_history if (conversation_history and analysis.get("follow_up")) else None
     prompt = core.build_prompt(
@@ -255,6 +272,7 @@ def _build_prompt_and_call_llm(
         prompt_history,
         max_prompt_chars=max_prompt_chars,
         example_context=example_context,
+        function_hints=function_hints,
     )
 
     if verbose:
@@ -297,6 +315,7 @@ def _verify_answer(
     prompt,
     question,
     example_context=None,
+    function_hints=None,
 ):
     verification = {
         "is_valid": True,
@@ -451,6 +470,52 @@ def _verify_answer(
                 reasoning_path = "dual_pass_fallback"
             if verbose:
                 print("  Replaced model output with deterministic context-based example")
+    elif query_type == "parameter_analysis":
+        verification = core.verify_answer_with_context(
+            ans,
+            frags,
+            known_functions=set(symbols.keys()),
+        )
+        _print_confidence(verification, verbose, "Parameter analysis")
+        target_fn = analysis.get("primary_function_name")
+        target_missing = bool(target_fn) and (target_fn not in (ans or ""))
+        has_signature_line = re.search(r"^\s*Signature:\s*`?.+`?\s*$", ans or "", flags=re.MULTILINE) is not None
+        has_function_line = re.search(r"^\s*Function:\s*`?.+`?\s*$", ans or "", flags=re.MULTILINE) is not None
+        has_verification_issues = any([
+            verification.get("hallucinated"),
+            verification.get("out_of_context"),
+            verification.get("file_mismatches"),
+            verification.get("signature_mismatches"),
+            verification.get("context_mismatches"),
+        ])
+        low_confidence = float(verification.get("confidence_score", 0.0)) < LOW_CONFIDENCE_THRESHOLD
+        if has_verification_issues or low_confidence or target_missing or not has_signature_line or not has_function_line:
+            if verbose:
+                print(f"\n[⚠️  PARAMETER ANALYSIS WARNING]")
+                if verification.get("hallucinated"):
+                    print(f"  Unknown functions (not found in index): {verification['hallucinated']}")
+                if verification.get("out_of_context"):
+                    print(f"  Mentioned but not in current context: {verification['out_of_context']}")
+                if verification.get("file_mismatches"):
+                    print(f"  File mismatch vs indexed context: {verification['file_mismatches']}")
+                if verification.get("signature_mismatches"):
+                    print(f"  Signature mismatch vs indexed context: {verification['signature_mismatches']}")
+                if verification.get("context_mismatches"):
+                    print(f"  Function/File/Signature tuple mismatch: {verification['context_mismatches']}")
+                if target_missing:
+                    print(f"  Target function `{target_fn}` is missing in model output")
+                if not has_function_line or not has_signature_line:
+                    print("  Missing required structured header: Function/Signature")
+                print("  Replacing with deterministic context-grounded parameter analysis.")
+            ans = core.build_parameter_analysis_from_context(
+                frags,
+                analysis=analysis,
+                example_context=example_context,
+                function_hints=function_hints,
+            )
+            used_fallback = True
+            if verbose:
+                print("  Replaced model output with deterministic context-based parameter analysis")
 
     return ans, verification, used_fallback, used_second_pass, reasoning_path
 
@@ -492,8 +557,9 @@ class QueryPipeline:
         reranker,
         symbols,
         call_graph,
-        called_by=None,
         config: PipelineConfig,
+        called_by=None,
+        function_hints=None,
         shadow_runner: Optional[Callable[[str, List[Any]], PipelineResult]] = None,
     ):
         self.core = core_module
@@ -506,6 +572,7 @@ class QueryPipeline:
         self.symbols = symbols
         self.call_graph = call_graph
         self.called_by = called_by or {}
+        self.function_hints = function_hints or {}
         self.config = config
         self._shadow_runner = shadow_runner
 
@@ -617,7 +684,7 @@ class QueryPipeline:
 
         example_context = None
         frags = [self.meta[i] for i in ranked_ids]
-        if analysis.get("query_type") == "example_generation":
+        if analysis.get("query_type") in {"example_generation", "parameter_analysis"}:
             legacy_grounding = os.getenv("FC_EXAMPLE_GROUNDING_LEGACY", "0") == "1"
             use_grounding_v2 = not legacy_grounding
             grounding_shadow = os.getenv("FC_EXAMPLE_GROUNDING_SHADOW", "0") == "1"
@@ -691,6 +758,21 @@ class QueryPipeline:
                 print(f"    caller: {caller_name or 'not found'}")
                 print(f"    observed_call: {observed or 'not found'}")
 
+        function_hints = None
+        if analysis.get("query_type") == "parameter_analysis":
+            primary = analysis.get("primary_function_name")
+            targets = []
+            if primary:
+                targets.append(primary)
+            for fn in analysis.get("function_names", []):
+                if fn not in targets:
+                    targets.append(fn)
+            function_hints = {}
+            for fn in targets:
+                hints = list(self.function_hints.get(fn, []))
+                if hints:
+                    function_hints[fn] = hints
+
         prompt, llm_result, ans = _build_prompt_and_call_llm(
             self.core,
             q=q,
@@ -701,6 +783,7 @@ class QueryPipeline:
             model=self.config.model,
             verbose=self.config.verbose,
             example_context=example_context,
+            function_hints=function_hints,
         )
 
         ans, verification, used_fallback, used_second_pass, reasoning_path = _verify_answer(
@@ -715,6 +798,7 @@ class QueryPipeline:
             prompt=prompt,
             question=q,
             example_context=example_context,
+            function_hints=function_hints,
         )
 
         elapsed = time.time() - start_time

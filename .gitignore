@@ -37,3 +37,7 @@ htmlcov/
 # Testing
 .pytest_cache/
 .mypy_cache/
+
+.gradio/
+.web_fuzz_histories/
+users.txt

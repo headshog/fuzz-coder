@@ -346,11 +346,14 @@ def test_help_command_prints_capabilities_without_llm_call(tmp_path, monkeypatch
     assert "list functions" in out_lower
     assert "chat aliases" in out_lower
     assert "fuzz ->" in out_lower
+    assert "fuzz wide ->" in out_lower
     assert "more fuzz ->" in out_lower
+    assert "more fuzz wide ->" in out_lower
     assert "example function_name ->" in out_lower
+    assert "explain function_name ->" in out_lower
 
 
-def test_alias_fuzz_and_more_fuzz_expand_to_canonical_queries(tmp_path, monkeypatch, capsys):
+def test_alias_fuzz_variants_expand_to_canonical_queries(tmp_path, monkeypatch, capsys):
     index_dir = tmp_path / "index_data"
     index_dir.mkdir(parents=True, exist_ok=True)
 
@@ -405,7 +408,9 @@ def test_alias_fuzz_and_more_fuzz_expand_to_canonical_queries(tmp_path, monkeypa
 
     inputs = iter([
         "fuzz",
+        "fuzz wide",
         "more fuzz",
+        "more fuzz wide",
         "quit",
     ])
     monkeypatch.setattr("builtins.input", lambda _=None: next(inputs))
@@ -418,9 +423,13 @@ def test_alias_fuzz_and_more_fuzz_expand_to_canonical_queries(tmp_path, monkeypa
     ask_app.main()
     _ = capsys.readouterr().out
 
-    assert len(prompts) == 2
+    assert len(prompts) == 4
     assert "### Current Question: Write a list of functions that can be used for fuzzing" in prompts[0]
-    assert "### Current Question: Write other functions that are good for fuzzing" in prompts[1]
+    assert "### Current Question: Write a large list (20-30) of functions that can be used for fuzzing." in prompts[1]
+    assert "at most 4 parameters" in prompts[1]
+    assert "### Current Question: Write other functions that are good for fuzzing" in prompts[2]
+    assert "### Current Question: Write other functions in a large list (20-30) that can be used for fuzzing." in prompts[3]
+    assert "Exclude functions already listed previously." in prompts[3]
 
 
 def test_alias_example_function_name_expands_to_example_query(tmp_path, monkeypatch, capsys):
@@ -537,6 +546,37 @@ def test_alias_example_with_path_then_module_is_normalized():
     expanded, used = ask_app.expand_chat_alias("example split from vendor/cpp-httplib/httplib.cpp module")
     assert used is True
     assert "from module vendor/cpp-httplib/httplib.cpp" in expanded
+
+
+def test_alias_explain_function_name_expands_to_parameter_semantics_query():
+    expanded, used = ask_app.expand_chat_alias("explain llama_params_fit")
+    assert used is True
+    assert expanded.startswith("Analyze function parameter semantics for llama_params_fit:")
+    assert "for each parameter, explain its role" in expanded
+    assert "unknown from provided context" in expanded
+
+
+def test_alias_explain_with_module_tail_preserves_module_constraint():
+    expanded, used = ask_app.expand_chat_alias("explain split from module vendor/cpp-httplib")
+    assert used is True
+    assert expanded.startswith("Analyze function parameter semantics for split:")
+    assert "from module vendor/cpp-httplib" in expanded
+
+
+def test_alias_fuzz_wide_expands_to_large_broad_fuzz_query():
+    expanded, used = ask_app.expand_chat_alias("fuzz wide")
+    assert used is True
+    assert expanded.startswith("Write a large list (20-30) of functions that can be used for fuzzing.")
+    assert "at most 4 parameters" in expanded
+    assert "ANY of these is true" in expanded
+
+
+def test_alias_more_fuzz_wide_expands_to_large_novelty_fuzz_query():
+    expanded, used = ask_app.expand_chat_alias("more fuzz wide")
+    assert used is True
+    assert expanded.startswith("Write other functions in a large list (20-30) that can be used for fuzzing.")
+    assert "Exclude functions already listed previously." in expanded
+    assert "at most 4 parameters" in expanded
 
 
 def test_example_generation_does_not_emit_listing_verification_warning(tmp_path, monkeypatch, capsys):

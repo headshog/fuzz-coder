@@ -126,3 +126,75 @@ def test_golden_retrieval_rerank_with_path_filter():
 
     best = max(final_ids, key=lambda i: core.fuzz_target_score(meta[i]))
     assert final_ids[0] == best
+
+
+def test_prefilter_broad_fuzz_listing_applies_max_params_and_or_surface():
+    meta = [
+        _chunk(
+            0,
+            "parse_cfg",
+            "/repo/src/parse.cpp",
+            "int parse_cfg(const char * data){ return 0; }",
+            "parse_cfg(const char * data)",
+            [{"name": "data", "type": "const char *", "raw": "const char * data"}],
+        ),
+        _chunk(
+            1,
+            "too_many_params",
+            "/repo/src/many.cpp",
+            "int too_many_params(int a,int b,int c,int d,int e){ return a+b+c+d+e; }",
+            "too_many_params(int a, int b, int c, int d, int e)",
+            [
+                {"name": "a", "type": "int", "raw": "int a"},
+                {"name": "b", "type": "int", "raw": "int b"},
+                {"name": "c", "type": "int", "raw": "int c"},
+                {"name": "d", "type": "int", "raw": "int d"},
+                {"name": "e", "type": "int", "raw": "int e"},
+            ],
+        ),
+        _chunk(
+            2,
+            "plain_helper",
+            "/repo/src/helper.cpp",
+            "int plain_helper(int x){ return x + 1; }",
+            "plain_helper(int x)",
+            [{"name": "x", "type": "int", "raw": "int x"}],
+        ),
+        _chunk(
+            3,
+            "read_from_stdin",
+            "/repo/src/io.cpp",
+            "int read_from_stdin(){ return getchar(); }",
+            "read_from_stdin()",
+            [],
+            has_stdin=True,
+        ),
+    ]
+
+    analysis = {
+        "query_type": "listing",
+        "is_listing": True,
+        "needs_stdin": False,
+        "needs_file": False,
+        "needs_api": False,
+        "needs_output": False,
+        "needs_memory_mgmt": False,
+        "needs_error_handling": False,
+        "needs_params": False,
+        "requested_types": [],
+        "needs_parse_like": False,
+        "needs_fuzz_targets": False,
+        "needs_broad_fuzz_surface": True,
+        "max_param_count": 4,
+        "constraint_mode": "any",
+        "exclude_output": False,
+        "path_filters": [],
+    }
+
+    ranked_pool = [0, 1, 2, 3]
+    final_ids = core.prefilter_listing_candidates(ranked_pool, meta, analysis)
+
+    assert 0 in final_ids  # parse-like
+    assert 3 in final_ids  # stdin
+    assert 1 not in final_ids  # >4 params
+    assert 2 not in final_ids  # no broad-surface signal

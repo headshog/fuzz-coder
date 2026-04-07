@@ -29,10 +29,39 @@ HELP_QUERIES = {
 
 MAX_HISTORY = 5
 ALIAS_FUZZ = "Write a list of functions that can be used for fuzzing"
+ALIAS_FUZZ_WIDE = (
+    "Write a large list (20-30) of functions that can be used for fuzzing. "
+    "Only include functions with at most 4 parameters. "
+    "A function is eligible if ANY of these is true: "
+    "it parses input (or has parse/decode/split/tokenize in name/logic), "
+    "OR it has path/filepath/file-name parameters, "
+    "OR it has file-handle/stream parameters (FILE*, ifstream/fstream/istream), "
+    "OR it has simple pointer-array parameters (char*, int*, uint8_t*, const variants), "
+    "OR it reads stdin, "
+    "OR it has std::vector/std::array/std::span-like parameters."
+)
+ALIAS_MORE_FUZZ_WIDE = (
+    "Write other functions in a large list (20-30) that can be used for fuzzing. "
+    "Exclude functions already listed previously. "
+    "Only include functions with at most 4 parameters. "
+    "A function is eligible if ANY of these is true: "
+    "it parses input (or has parse/decode/split/tokenize in name/logic), "
+    "OR it has path/filepath/file-name parameters, "
+    "OR it has file-handle/stream parameters (FILE*, ifstream/fstream/istream), "
+    "OR it has simple pointer-array parameters (char*, int*, uint8_t*, const variants), "
+    "OR it reads stdin, "
+    "OR it has std::vector/std::array/std::span-like parameters."
+)
 ALIAS_MORE_FUZZ = "Write other functions that are good for fuzzing"
 ALIAS_EXAMPLE_TEMPLATE = (
     "Write an example of {function_name} function. In the generated snippet, define a standalone main() "
     "and call {function_name} from it. Construct its parameters from data given from file in argv[1]"
+)
+ALIAS_EXPLAIN_TEMPLATE = (
+    "Analyze function parameter semantics for {function_name}: for each parameter, explain its role, "
+    "expected data format/range, whether it is input/output/inout, where values usually come from in the codebase, "
+    "and provide evidence from signature, call sites, and docs (file:line). "
+    "If unknown, say explicitly \"unknown from provided context\"."
 )
 
 
@@ -58,8 +87,37 @@ def expand_chat_alias(q: str):
     normalized = " ".join(raw.split()).lower()
     if normalized == "fuzz":
         return ALIAS_FUZZ, True
+    if normalized in {"fuzz wide", "wide fuzz"}:
+        return ALIAS_FUZZ_WIDE, True
+    if normalized in {"more fuzz wide", "wide more fuzz", "more wide fuzz"}:
+        return ALIAS_MORE_FUZZ_WIDE, True
     if normalized == "more fuzz":
         return ALIAS_MORE_FUZZ, True
+    if normalized.startswith("explain "):
+        parts = raw.split(None, 1)
+        if len(parts) == 2:
+            rest = parts[1].strip()
+            m = re.match(r"^([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)(?:\s+(.*))?$", rest)
+            if m:
+                fn = (m.group(1) or "").strip("`'\"")
+                tail = (m.group(2) or "").strip()
+                if fn:
+                    tail = re.sub(
+                        r"\b(from|in)\s+([^\n,;]+?)\s+(module|directory|subdirectory|folder|path)\b",
+                        r"\1 \3 \2",
+                        tail,
+                        flags=re.IGNORECASE,
+                    )
+                    tail = re.sub(
+                        r"\b(из|в)\s+([^\n,;]+?)\s+(модуле|модуля|директории|поддиректории|папке)\b",
+                        r"\1 \3 \2",
+                        tail,
+                        flags=re.IGNORECASE,
+                    )
+                    expanded = ALIAS_EXPLAIN_TEMPLATE.format(function_name=fn)
+                    if tail:
+                        expanded = f"{expanded} {tail}"
+                    return expanded, True
     if normalized.startswith("example "):
         parts = raw.split(None, 1)
         if len(parts) == 2:
@@ -98,12 +156,16 @@ def render_help_text() -> str:
         "1. List functions by criteria (stdin/file/API/types/parse/fuzz).\n"
         "2. Filter by module/subdirectory (path filter).\n"
         "3. Give examples of function usage.\n"
-        "4. Explain implementation details from indexed code.\n"
-        "5. Handle follow-ups (including 'other functions' without repeats).\n\n"
+        "4. Explain parameter semantics (format/role/source) for a function.\n"
+        "5. Explain implementation details from indexed code.\n"
+        "6. Handle follow-ups (including 'other functions' without repeats).\n\n"
         "Chat aliases:\n"
         "- fuzz -> Write a list of functions that can be used for fuzzing\n"
+        "- fuzz wide -> Large fuzz-target list (20-30) with <=4 params and broad OR input-surface constraints\n"
         "- more fuzz -> Write other functions that are good for fuzzing\n"
+        "- more fuzz wide -> Like fuzz wide, but exclude previously listed functions\n"
         "- example FUNCTION_NAME -> Write an example of FUNCTION_NAME with a standalone main() and argv[1]-based params\n\n"
+        "- explain FUNCTION_NAME -> Analyze parameter semantics/format/source for FUNCTION_NAME with evidence\n\n"
         "Example queries:\n"
         "- List functions good for fuzzing from module src/parsers\n"
         "- Какие функции читают из stdin?\n"
@@ -111,6 +173,7 @@ def render_help_text() -> str:
         "- Дай список других функций для фаззинга из директории src/parsers\n"
         "- Explain how decode_binary_blob works\n"
         "- Give an example calling parse_json_payload\n"
+        "- What parameters does llama_params_fit take and what does each mean?\n"
     )
 
 
@@ -136,7 +199,9 @@ def _load_indices(index_dir: Path):
     symbols = core.load_json(index_dir / "symbols.json")
     call_graph = core.load_json(index_dir / "call_graph.json")
     called_by = core.load_json(index_dir / "called_by.json")
-    return idx, meta, lex, special_indices, symbols, call_graph, called_by
+    function_hints_path = index_dir / "function_hints.json"
+    function_hints = core.load_json(function_hints_path) if function_hints_path.exists() else {}
+    return idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints
 
 
 def _load_models(args):
@@ -166,7 +231,7 @@ def main():
         print("Run index_fuzz_coder.py first to build the project index.")
         return
 
-    idx, meta, lex, special_indices, symbols, call_graph, called_by = _load_indices(index_dir)
+    idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints = _load_indices(index_dir)
     embed_model, reranker = _load_models(args)
     planner = core.QueryPlanner(special_indices, symbols, call_graph, called_by, meta=meta)
 
@@ -181,6 +246,7 @@ def main():
         symbols=symbols,
         call_graph=call_graph,
         called_by=called_by,
+        function_hints=function_hints,
         config=PipelineConfig(
             top_k=args.top_k,
             rerank_top_k=args.rerank_top_k,
