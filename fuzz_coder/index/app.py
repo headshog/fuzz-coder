@@ -235,7 +235,15 @@ def main():
     print(f"  - Functions with error handling: {len(error_handling_indices)}")
     print(f"  - Docs/guide hints linked to functions: {sum(len(v) for v in function_hints.values())}")
     types_count = len(type_init_index.get("types", {})) if isinstance(type_init_index, dict) else 0
+    struct_types_count = len(type_init_index.get("struct_field_writes", {})) if isinstance(type_init_index, dict) else 0
+    effects_functions_count = len(type_init_index.get("function_effects", {})) if isinstance(type_init_index, dict) else 0
+    callsite_flow_count = sum(
+        len(v) for v in type_init_index.get("callsite_arg_flow", {}).values()
+    ) if isinstance(type_init_index, dict) else 0
     print(f"  - Types with observed init patterns: {types_count}")
+    print(f"  - Struct types with field-write evidence: {struct_types_count}")
+    print(f"  - Functions with parameter effects: {effects_functions_count}")
+    print(f"  - Callsites with arg-flow traces: {callsite_flow_count}")
 
 
 if __name__ == "__main__":

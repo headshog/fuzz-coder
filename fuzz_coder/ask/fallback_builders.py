@@ -460,6 +460,29 @@ def _build_required_field_lookup(type_init_index):
     return out
 
 
+def _build_function_effects_lookup(type_init_index):
+    raw = type_init_index or {}
+    if not isinstance(raw, dict):
+        return {}
+    by_function = raw.get("function_effects")
+    if not isinstance(by_function, dict):
+        return {}
+    out = {}
+    for fn, entries in by_function.items():
+        if not isinstance(fn, str) or not fn:
+            continue
+        if not isinstance(entries, list):
+            continue
+        clean = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            clean.append(e)
+        if clean:
+            out[fn] = clean
+    return out
+
+
 def _extract_bound_base_for_field_init(arg_expr, ptype):
     expr = str(arg_expr or "").strip()
     if not expr:
@@ -518,9 +541,8 @@ def _is_self_contained_field_expr(expr):
 
 def _infer_required_field_hints(params, target_name, type_init_index=None):
     by_fn = _build_required_field_lookup(type_init_index)
+    effects_by_fn = _build_function_effects_lookup(type_init_index)
     entries = list(by_fn.get(str(target_name or "").strip(), []))
-    if not entries:
-        return {}
 
     out = {}
     for i, p in enumerate(params or []):
@@ -537,24 +559,77 @@ def _infer_required_field_hints(params, target_name, type_init_index=None):
             if etype and etype.lower() != nominal.lower():
                 continue
             candidates.append(e)
-        if not candidates:
-            continue
 
-        best = sorted(
-            candidates,
-            key=lambda x: int(x.get("call_sites", 0)),
-            reverse=True,
-        )[0]
         fields = []
-        for f in list(best.get("fields") or []):
-            if not isinstance(f, dict):
-                continue
-            path = str(f.get("path", "")).strip()
-            if not path:
-                continue
-            fields.append(f)
+        if candidates:
+            best = sorted(
+                candidates,
+                key=lambda x: int(x.get("call_sites", 0)),
+                reverse=True,
+            )[0]
+            for f in list(best.get("fields") or []):
+                if not isinstance(f, dict):
+                    continue
+                path = str(f.get("path", "")).strip()
+                if not path:
+                    continue
+                fields.append(f)
+
+        if not fields:
+            for e in list(effects_by_fn.get(str(target_name or "").strip(), [])):
+                if int(e.get("arg_index", -1)) != i:
+                    continue
+                etype = str(e.get("type", "")).strip()
+                if etype and etype.lower() != nominal.lower():
+                    continue
+                for w in list(e.get("writes") or []):
+                    path = str((w or {}).get("path", "")).strip()
+                    if not path:
+                        continue
+                    fields.append({
+                        "path": path,
+                        "access": str((w or {}).get("access", "dot")),
+                        "count": int((w or {}).get("count", 1)),
+                        "support": 0.35,
+                        "required": False,
+                        "sample_expr": str((w or {}).get("sample_expr", "")).strip(),
+                        "self_contained": bool((w or {}).get("sample_expr")),
+                        "sources": {"function_effect_write": 1},
+                        "evidence": list((w or {}).get("evidence", [])),
+                    })
+                for r in list(e.get("reads") or []):
+                    path = str((r or {}).get("path", "")).strip()
+                    if not path:
+                        continue
+                    fields.append({
+                        "path": path,
+                        "access": str((r or {}).get("access", "dot")),
+                        "count": int((r or {}).get("count", 1)),
+                        "support": 0.25,
+                        "required": False,
+                        "sample_expr": "",
+                        "self_contained": False,
+                        "sources": {"function_effect_read": 1},
+                        "evidence": list((r or {}).get("evidence", [])),
+                    })
+
         if fields:
-            out[i] = fields
+            dedup = {}
+            for f in fields:
+                k = (str(f.get("path", "")), str(f.get("access", "dot")))
+                if not k[0]:
+                    continue
+                cur = dedup.get(k)
+                if cur is None:
+                    dedup[k] = f
+                    continue
+                if float(f.get("support", 0.0)) > float(cur.get("support", 0.0)):
+                    dedup[k] = f
+            out[i] = sorted(
+                dedup.values(),
+                key=lambda x: (bool(x.get("required")), float(x.get("support", 0.0)), int(x.get("count", 0))),
+                reverse=True,
+            )
     return out
 
 
@@ -1280,5 +1355,4 @@ def build_parameter_analysis_from_context(frags, analysis=None, example_context=
             )
 
     return "\n".join(lines)
-
 

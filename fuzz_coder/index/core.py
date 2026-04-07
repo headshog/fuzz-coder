@@ -1387,6 +1387,54 @@ def _extract_field_assignments(code):
     return out
 
 
+def _extract_field_reads(code):
+    """Extract field reads like cfg.x / cfg->x (excluding direct LHS writes)."""
+    out = []
+    access_pat = re.compile(
+        r"(?P<base>[A-Za-z_]\w*)\s*(?P<tail>(?:(?:\.|->)\s*[A-Za-z_]\w+)+)"
+    )
+    assign_pat = re.compile(
+        r"^\s*(?P<base>[A-Za-z_]\w*)\s*(?P<tail>(?:(?:\.|->)\s*[A-Za-z_]\w+)+)\s*=\s*[^;]+;\s*$"
+    )
+
+    for li, raw in enumerate(str(code or "").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("//") or line.startswith("#"):
+            continue
+
+        write_key = None
+        m_assign = assign_pat.match(line)
+        if m_assign:
+            base = str(m_assign.group("base") or "").strip()
+            tail = str(m_assign.group("tail") or "")
+            pieces = re.findall(r"(\.|->)\s*([A-Za-z_]\w+)", tail)
+            if pieces:
+                access = "arrow" if pieces[0][0] == "->" else "dot"
+                path = ".".join(name for _, name in pieces)
+                write_key = (base, access, path)
+
+        for m in access_pat.finditer(line):
+            base = str(m.group("base") or "").strip()
+            tail = str(m.group("tail") or "")
+            if not base or not tail:
+                continue
+            pieces = re.findall(r"(\.|->)\s*([A-Za-z_]\w+)", tail)
+            if not pieces:
+                continue
+            access = "arrow" if pieces[0][0] == "->" else "dot"
+            path = ".".join(name for _, name in pieces)
+            key = (base, access, path)
+            if write_key is not None and key == write_key:
+                continue
+            out.append({
+                "line": li,
+                "base": base,
+                "access": access,
+                "path": path,
+            })
+    return out
+
+
 def _extract_call_sites(code, control_keywords):
     """Extract call sites with name/arity/args/line from function body."""
     out = []
@@ -1429,6 +1477,66 @@ def _extract_call_sites(code, control_keywords):
     return out
 
 
+def _extract_simple_identifiers(expr):
+    e = str(expr or "").strip()
+    if not e:
+        return []
+    return re.findall(r"[A-Za-z_]\w*", e)
+
+
+def _extract_dependency_chain(code, base_var, before_line, max_steps=8):
+    """Build simple backward dependency chain: tmp -> cfg -> call."""
+    lines = str(code or "").splitlines()
+    upto = max(0, int(before_line) - 1)
+    if not lines or not base_var:
+        return []
+
+    decl_init_pat = re.compile(
+        r"^\s*(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*(?:\s*[*&]\s*)?\s*"
+        r"(?P<lhs>[A-Za-z_]\w*)\s*=\s*(?P<rhs>[^;]+)\s*;\s*$"
+    )
+    assign_pat = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z_]\w*)\s*=\s*(?P<rhs>[^;]+)\s*;\s*$"
+    )
+
+    tracked = {str(base_var)}
+    chain = []
+    seen_stmt = set()
+
+    for li in range(min(upto, len(lines)), 0, -1):
+        if len(chain) >= max_steps:
+            break
+        line = lines[li - 1].strip()
+        if not line or line.startswith("//") or line.startswith("#"):
+            continue
+        if "==" in line or "+=" in line or "-=" in line or "*=" in line or "/=" in line:
+            continue
+
+        m = assign_pat.match(line) or decl_init_pat.match(line)
+        if not m:
+            continue
+        lhs = str(m.group("lhs") or "").strip()
+        rhs = str(m.group("rhs") or "").strip()
+        if lhs not in tracked:
+            continue
+
+        stmt = f"{lhs} = {rhs};"
+        if stmt in seen_stmt:
+            continue
+        seen_stmt.add(stmt)
+        chain.append({
+            "line": li,
+            "statement": stmt,
+        })
+
+        for tok in _extract_simple_identifiers(rhs):
+            if tok != lhs:
+                tracked.add(tok)
+
+    chain.sort(key=lambda x: int(x.get("line", 0)))
+    return chain
+
+
 def _extract_arg_base_var(arg_expr):
     expr = str(arg_expr or "").strip()
     if not expr:
@@ -1454,7 +1562,7 @@ def _field_rhs_score(expr):
 
 
 def build_type_init_index(chunks, max_per_type=16):
-    """Build v2 type initialization/field-chain index for example generation."""
+    """Build v3 structural dataflow index for better example grounding."""
     by_type = defaultdict(dict)  # type -> (kind, expr) -> aggregated record
     by_name = defaultdict(list)
     for c in chunks or []:
@@ -1483,15 +1591,62 @@ def build_type_init_index(chunks, max_per_type=16):
         r"(?P<var>[A-Za-z_]\w*)\s*;\s*$"
     )
 
-    # Pass 1: aggregate init-pattern candidates per nominal type.
+    struct_field_writes_acc = defaultdict(dict)  # nominal -> (path,access) -> rec
+    function_effects_acc = {}  # (fn,sig,arg_i,arg_name,type) -> rec
+    helper_effect_lookup = defaultdict(list)  # (helper_fn,arg_index) -> [{"type","writes"}]
+    callsite_arg_flow = defaultdict(list)
+    req = {}
+
+    def _ensure_req_bucket(target_name, arg_index, arg_name, nominal):
+        key = (str(target_name), int(arg_index), str(arg_name), str(nominal))
+        bucket = req.get(key)
+        if bucket is None:
+            bucket = {
+                "function": key[0],
+                "arg_index": key[1],
+                "arg_name": key[2],
+                "type": key[3],
+                "call_sites": 0,
+                "fields": {},  # (path, access) -> rec
+            }
+            req[key] = bucket
+        return bucket
+
+    def _add_req_field(bucket, *, path, access, rhs, evidence, source_tag):
+        if not path:
+            return
+        fkey = (str(path), str(access or "dot"))
+        rec = bucket["fields"].get(fkey)
+        if rec is None:
+            rec = {
+                "path": fkey[0],
+                "access": fkey[1],
+                "count": 0,
+                "rhs": defaultdict(int),
+                "evidence": [],
+                "sources": defaultdict(int),
+            }
+            bucket["fields"][fkey] = rec
+        rec["count"] += 1
+        rhs_norm = _normalize_expr(rhs) if rhs else ""
+        if rhs_norm:
+            rec["rhs"][rhs_norm] += 1
+        rec["sources"][str(source_tag or "unknown")] += 1
+        if evidence and len(rec["evidence"]) < 4:
+            rec["evidence"].append(dict(evidence))
+
+    # Pass 1: aggregate init patterns + function effects + struct writes.
     for c in chunks or []:
         file_path = str(c.get("file", ""))
+        fn_name = str(c.get("name", "")).strip()
+        signature = str(c.get("signature", "")).strip() or (f"{fn_name}()")
         start_line = int(c.get("start_line", 1) or 1)
         code = str(c.get("code", "") or c.get("body", ""))
         if not code:
             continue
-        lines = code.splitlines()
-        for li, raw in enumerate(lines, start=1):
+
+        # v3/A: init patterns per nominal type (existing logic)
+        for li, raw in enumerate(code.splitlines(), start=1):
             line = (raw or "").strip()
             if not line or line.startswith("//") or line.startswith("#"):
                 continue
@@ -1500,7 +1655,6 @@ def build_type_init_index(chunks, max_per_type=16):
             type_text = None
             expr = None
             match = None
-
             for k, pat in [
                 ("pointer_call", pat_ptr_eq),
                 ("value_call", pat_val_eq),
@@ -1515,14 +1669,11 @@ def build_type_init_index(chunks, max_per_type=16):
                     type_text = m.group("type")
                     expr = (m.groupdict().get("expr") or "").strip()
                     break
-
             if not match or not kind or not type_text:
                 continue
-
             if kind in {"pointer_call", "value_call"}:
                 if not re.fullmatch(r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*\s*\([^;]*\)", expr or ""):
                     continue
-
             nominal = _extract_nominal_type_name_for_init(type_text)
             if not nominal:
                 continue
@@ -1531,27 +1682,140 @@ def build_type_init_index(chunks, max_per_type=16):
             key = (kind, expr_norm)
             rec = by_type[nominal].get(key)
             if rec is None:
-                call_name = _extract_call_name(expr_norm) if kind in {"pointer_call", "value_call"} else None
                 rec = {
                     "kind": kind,
                     "expr": expr_norm,
-                    "function": call_name,
+                    "function": _extract_call_name(expr_norm) if kind in {"pointer_call", "value_call"} else None,
                     "self_contained": _is_self_contained_call_expr(expr_norm) if kind in {"pointer_call", "value_call"} else (kind != "value_default"),
                     "count": 0,
                     "score": 0,
                     "evidence": [],
                 }
                 by_type[nominal][key] = rec
-
             rec["count"] += 1
             rec["score"] += _init_pattern_score(kind, expr_norm)
             if len(rec["evidence"]) < 3:
                 rec["evidence"].append({
                     "file": file_path,
                     "line": start_line + li - 1,
-                    "function": str(c.get("name", "")),
+                    "function": fn_name,
                 })
 
+        var_hints = _extract_variable_type_hints(code)
+        field_writes = _extract_field_assignments(code)
+        field_reads = _extract_field_reads(code)
+        call_sites = _extract_call_sites(code, CONTROL_KEYWORDS)
+
+        # v3/B: global struct field writes by nominal type
+        for fw in field_writes:
+            hint = var_hints.get(str(fw.get("base", "")).strip())
+            if not hint:
+                continue
+            nominal = str(hint.get("nominal_type", "")).strip()
+            if not nominal:
+                continue
+            k = (str(fw.get("path", "")), str(fw.get("access", "dot")))
+            rec = struct_field_writes_acc[nominal].get(k)
+            if rec is None:
+                rec = {
+                    "path": k[0],
+                    "access": k[1],
+                    "count": 0,
+                    "rhs": defaultdict(int),
+                    "functions": set(),
+                    "evidence": [],
+                }
+                struct_field_writes_acc[nominal][k] = rec
+            rec["count"] += 1
+            rhs_norm = _normalize_expr(fw.get("rhs", ""))
+            if rhs_norm:
+                rec["rhs"][rhs_norm] += 1
+            if fn_name:
+                rec["functions"].add(fn_name)
+            if len(rec["evidence"]) < 4:
+                rec["evidence"].append({
+                    "file": file_path,
+                    "line": start_line + int(fw.get("line", 0)),
+                    "function": fn_name,
+                })
+
+        # v3/C: per-function effects on parameter fields (+ helper calls)
+        params = list(c.get("parameters") or [])
+        for pi, param in enumerate(params):
+            pname = str(param.get("name", "")).strip()
+            ptype_nominal = _extract_nominal_type_name_for_init(param.get("type", ""))
+            if not pname or not ptype_nominal:
+                continue
+            key = (fn_name, signature, int(pi), pname, ptype_nominal)
+            eff = function_effects_acc.get(key)
+            if eff is None:
+                eff = {
+                    "function": fn_name,
+                    "signature": signature,
+                    "arg_index": int(pi),
+                    "arg_name": pname,
+                    "type": ptype_nominal,
+                    "writes": {},
+                    "reads": {},
+                    "helper_calls": defaultdict(int),
+                }
+                function_effects_acc[key] = eff
+
+            for fw in field_writes:
+                if str(fw.get("base", "")).strip() != pname:
+                    continue
+                rk = (str(fw.get("path", "")), str(fw.get("access", "dot")))
+                wr = eff["writes"].get(rk)
+                if wr is None:
+                    wr = {
+                        "path": rk[0],
+                        "access": rk[1],
+                        "count": 0,
+                        "rhs": defaultdict(int),
+                        "evidence": [],
+                    }
+                    eff["writes"][rk] = wr
+                wr["count"] += 1
+                rhs_norm = _normalize_expr(fw.get("rhs", ""))
+                if rhs_norm:
+                    wr["rhs"][rhs_norm] += 1
+                if len(wr["evidence"]) < 3:
+                    wr["evidence"].append({
+                        "file": file_path,
+                        "line": start_line + int(fw.get("line", 0)),
+                        "function": fn_name,
+                    })
+
+            for fr in field_reads:
+                if str(fr.get("base", "")).strip() != pname:
+                    continue
+                rk = (str(fr.get("path", "")), str(fr.get("access", "dot")))
+                rr = eff["reads"].get(rk)
+                if rr is None:
+                    rr = {
+                        "path": rk[0],
+                        "access": rk[1],
+                        "count": 0,
+                        "evidence": [],
+                    }
+                    eff["reads"][rk] = rr
+                rr["count"] += 1
+                if len(rr["evidence"]) < 3:
+                    rr["evidence"].append({
+                        "file": file_path,
+                        "line": start_line + int(fr.get("line", 0)),
+                        "function": fn_name,
+                    })
+
+            for cs in call_sites:
+                for ai, a in enumerate(list(cs.get("args") or [])):
+                    if _extract_arg_base_var(a) != pname:
+                        continue
+                    helper_name = str(cs.get("name") or "").strip()
+                    if helper_name:
+                        eff["helper_calls"][(helper_name, int(ai))] += 1
+
+    # finalize types_out
     types_out = {}
     for nominal, variants in by_type.items():
         ranked = sorted(
@@ -1561,34 +1825,181 @@ def build_type_init_index(chunks, max_per_type=16):
         )
         types_out[nominal] = ranked[:max_per_type]
 
-    # Pass 2: infer required field chains before target function calls.
-    # key: (func, arg_index, arg_name, nominal_type)
-    req = {}
+    # finalize struct_field_writes
+    struct_field_writes_out = {}
+    for nominal, fields in struct_field_writes_acc.items():
+        rows = []
+        for _, fr in fields.items():
+            rhs_items = sorted(
+                fr["rhs"].items(),
+                key=lambda x: (_field_rhs_score(x[0]), x[1], len(str(x[0]))),
+                reverse=True,
+            )
+            rows.append({
+                "path": fr["path"],
+                "access": fr["access"],
+                "count": int(fr["count"]),
+                "sample_expr": rhs_items[0][0] if rhs_items else "",
+                "functions": sorted(list(fr["functions"]))[:16],
+                "evidence": list(fr["evidence"]),
+            })
+        rows.sort(key=lambda x: (x.get("count", 0), len(str(x.get("path", "")))), reverse=True)
+        struct_field_writes_out[nominal] = rows[: max(8, max_per_type * 4)]
+
+    # finalize function_effects + helper lookup
+    function_effects_by_name = defaultdict(list)
+    for _, eff in function_effects_acc.items():
+        writes = []
+        for _, wr in eff["writes"].items():
+            rhs_items = sorted(
+                wr["rhs"].items(),
+                key=lambda x: (_field_rhs_score(x[0]), x[1], len(str(x[0]))),
+                reverse=True,
+            )
+            writes.append({
+                "path": wr["path"],
+                "access": wr["access"],
+                "count": int(wr["count"]),
+                "sample_expr": rhs_items[0][0] if rhs_items else "",
+                "evidence": list(wr["evidence"]),
+            })
+        writes.sort(key=lambda x: (x.get("count", 0), len(str(x.get("path", "")))), reverse=True)
+
+        reads = []
+        for _, rr in eff["reads"].items():
+            reads.append({
+                "path": rr["path"],
+                "access": rr["access"],
+                "count": int(rr["count"]),
+                "evidence": list(rr["evidence"]),
+            })
+        reads.sort(key=lambda x: (x.get("count", 0), len(str(x.get("path", "")))), reverse=True)
+
+        helper_calls = []
+        for (hname, hidx), cnt in sorted(eff["helper_calls"].items(), key=lambda x: (x[1], x[0]), reverse=True):
+            helper_calls.append({
+                "name": hname,
+                "arg_index": int(hidx),
+                "count": int(cnt),
+            })
+
+        row = {
+            "signature": eff["signature"],
+            "arg_index": int(eff["arg_index"]),
+            "arg_name": eff["arg_name"],
+            "type": eff["type"],
+            "writes": writes[:24],
+            "reads": reads[:24],
+            "helper_calls": helper_calls[:16],
+        }
+        function_effects_by_name[eff["function"]].append(row)
+        if row["writes"]:
+            helper_effect_lookup[(eff["function"], int(eff["arg_index"]))].append({
+                "type": eff["type"],
+                "writes": row["writes"],
+            })
+
+    function_effects_out = {}
+    for fn, entries in function_effects_by_name.items():
+        function_effects_out[fn] = sorted(
+            entries,
+            key=lambda e: (int(e.get("arg_index", 0)), str(e.get("arg_name", ""))),
+        )
+
+    # Pass 2: callsite flow + required fields from direct dataflow + helper effects.
     for c in chunks or []:
         code = str(c.get("code", "") or c.get("body", ""))
         if not code:
             continue
         file_path = str(c.get("file", ""))
+        caller_name = str(c.get("name", "")).strip()
         start_line = int(c.get("start_line", 1) or 1)
         var_hints = _extract_variable_type_hints(code)
         field_assignments = _extract_field_assignments(code)
-        if not field_assignments:
-            continue
         call_sites = _extract_call_sites(code, CONTROL_KEYWORDS)
         if not call_sites:
             continue
 
         for cs in call_sites:
-            call_name = str(cs.get("name") or "").strip()
-            arity = int(cs.get("arity") or 0)
-            target_candidates = by_name.get(call_name, [])
+            cs_name = str(cs.get("name") or "").strip()
+            cs_line = int(cs.get("line") or 0)
+            cs_args = list(cs.get("args") or [])
+
+            arg_flow_rows = []
+            for ai, arg in enumerate(cs_args):
+                base_var = _extract_arg_base_var(arg)
+                arg_row = {
+                    "arg_index": int(ai),
+                    "arg_expr": str(arg),
+                    "base_var": base_var,
+                }
+                if base_var:
+                    chain = _extract_dependency_chain(code, base_var, before_line=cs_line, max_steps=8)
+                    if chain:
+                        arg_row["dependency_chain"] = chain
+
+                    f_before = []
+                    seen_fb = set()
+                    for fa in field_assignments:
+                        if str(fa.get("base", "")) != base_var:
+                            continue
+                        if int(fa.get("line", 0)) >= cs_line:
+                            continue
+                        k = (str(fa.get("path", "")), str(fa.get("access", "dot")))
+                        if k in seen_fb:
+                            continue
+                        seen_fb.add(k)
+                        f_before.append({
+                            "path": k[0],
+                            "access": k[1],
+                            "rhs": _normalize_expr(fa.get("rhs", "")),
+                            "line": start_line + int(fa.get("line", 0)),
+                        })
+                    if f_before:
+                        arg_row["field_writes_before_call"] = f_before[:12]
+
+                    helper_fields = []
+                    seen_hf = set()
+                    for prev in call_sites:
+                        if int(prev.get("line", 0)) >= cs_line:
+                            continue
+                        p_name = str(prev.get("name") or "").strip()
+                        p_args = list(prev.get("args") or [])
+                        for pj, pa in enumerate(p_args):
+                            if _extract_arg_base_var(pa) != base_var:
+                                continue
+                            for he in helper_effect_lookup.get((p_name, int(pj)), []):
+                                for wr in list(he.get("writes") or []):
+                                    hk = (str(wr.get("path", "")), str(wr.get("access", "dot")), p_name)
+                                    if not hk[0] or hk in seen_hf:
+                                        continue
+                                    seen_hf.add(hk)
+                                    helper_fields.append({
+                                        "path": hk[0],
+                                        "access": hk[1],
+                                        "helper": hk[2],
+                                        "sample_expr": str(wr.get("sample_expr", "")),
+                                    })
+                    if helper_fields:
+                        arg_row["helper_field_writes"] = helper_fields[:12]
+
+                arg_flow_rows.append(arg_row)
+
+            callsite_arg_flow[caller_name].append({
+                "target": cs_name,
+                "arity": int(cs.get("arity") or 0),
+                "line": start_line + cs_line - 1 if cs_line > 0 else start_line,
+                "file": file_path,
+                "args": [str(a) for a in cs_args],
+                "arg_flow": arg_flow_rows,
+            })
+
+            # Required fields inference against resolved target chunks.
+            target_candidates = by_name.get(cs_name, [])
             if not target_candidates:
                 continue
-
-            arity_matches = [
-                tc for tc in target_candidates
-                if len(list(tc.get("parameters") or [])) == arity
-            ]
+            arity = int(cs.get("arity") or 0)
+            arity_matches = [tc for tc in target_candidates if len(list(tc.get("parameters") or [])) == arity]
             if arity_matches:
                 target_candidates = arity_matches
             if not target_candidates:
@@ -1596,11 +2007,10 @@ def build_type_init_index(chunks, max_per_type=16):
 
             for target in target_candidates:
                 params = list(target.get("parameters") or [])
-                args = list(cs.get("args") or [])
                 for i, param in enumerate(params):
-                    if i >= len(args):
+                    if i >= len(cs_args):
                         continue
-                    arg = args[i]
+                    arg = cs_args[i]
                     base_var = _extract_arg_base_var(arg)
                     if not base_var:
                         continue
@@ -1613,57 +2023,87 @@ def build_type_init_index(chunks, max_per_type=16):
                     if str(hint.get("nominal_type", "")).lower() != nominal.lower():
                         continue
 
-                    key = (
+                    bucket = _ensure_req_bucket(
                         str(target.get("name", "")).strip(),
-                        int(i),
+                        i,
                         str(param.get("name", "")).strip() or f"arg{i}",
                         nominal,
                     )
-                    bucket = req.get(key)
-                    if bucket is None:
-                        bucket = {
-                            "function": key[0],
-                            "arg_index": key[1],
-                            "arg_name": key[2],
-                            "type": key[3],
-                            "call_sites": 0,
-                            "fields": {},  # (path, access) -> rec
-                        }
-                        req[key] = bucket
                     bucket["call_sites"] += 1
 
                     seen_fields = set()
                     for fa in field_assignments:
-                        if fa["base"] != base_var:
+                        if str(fa.get("base", "")) != base_var:
                             continue
-                        if int(fa["line"]) >= int(cs["line"]):
+                        if int(fa.get("line", 0)) >= cs_line:
                             continue
-                        fkey = (fa["path"], fa["access"])
-                        if fkey in seen_fields:
+                        k = (str(fa.get("path", "")), str(fa.get("access", "dot")))
+                        if k in seen_fields:
                             continue
-                        seen_fields.add(fkey)
-                        rec = bucket["fields"].get(fkey)
-                        if rec is None:
-                            rec = {
-                                "path": fa["path"],
-                                "access": fa["access"],
-                                "count": 0,
-                                "rhs": defaultdict(int),
-                                "evidence": [],
-                            }
-                            bucket["fields"][fkey] = rec
-                        rec["count"] += 1
-                        rec["rhs"][fa["rhs"]] += 1
-                        if len(rec["evidence"]) < 3:
-                            rec["evidence"].append({
+                        seen_fields.add(k)
+                        _add_req_field(
+                            bucket,
+                            path=k[0],
+                            access=k[1],
+                            rhs=fa.get("rhs", ""),
+                            evidence={
                                 "file": file_path,
-                                "line": start_line + int(fa["line"]) - 1,
-                                "function": str(c.get("name", "")),
-                            })
+                                "line": start_line + int(fa.get("line", 0)),
+                                "function": caller_name,
+                            },
+                            source_tag="direct_field_write",
+                        )
 
+                    for prev in call_sites:
+                        if int(prev.get("line", 0)) >= cs_line:
+                            continue
+                        p_name = str(prev.get("name") or "").strip()
+                        p_args = list(prev.get("args") or [])
+                        for pj, pa in enumerate(p_args):
+                            if _extract_arg_base_var(pa) != base_var:
+                                continue
+                            for he in helper_effect_lookup.get((p_name, int(pj)), []):
+                                for wr in list(he.get("writes") or []):
+                                    _add_req_field(
+                                        bucket,
+                                        path=str(wr.get("path", "")),
+                                        access=str(wr.get("access", "dot")),
+                                        rhs=str(wr.get("sample_expr", "")),
+                                        evidence={
+                                            "file": file_path,
+                                            "line": start_line + int(prev.get("line", 0)),
+                                            "function": caller_name,
+                                        },
+                                        source_tag=f"helper:{p_name}",
+                                    )
+
+    # Pass 3: If no/weak caller dataflow, backfill from callee arg-field reads.
+    for fn, entries in function_effects_out.items():
+        for entry in entries:
+            reads = list(entry.get("reads") or [])
+            if not reads:
+                continue
+            bucket = _ensure_req_bucket(
+                fn,
+                int(entry.get("arg_index", 0)),
+                str(entry.get("arg_name", "")),
+                str(entry.get("type", "")),
+            )
+            for r in reads[:24]:
+                _add_req_field(
+                    bucket,
+                    path=str(r.get("path", "")),
+                    access=str(r.get("access", "dot")),
+                    rhs="",
+                    evidence=(list(r.get("evidence") or [])[:1] or [{}])[0],
+                    source_tag="callee_read",
+                )
+
+    # finalize required_fields_by_function
     required_fields_by_function = defaultdict(list)
     for _, bucket in req.items():
-        call_sites = max(1, int(bucket["call_sites"]))
+        call_sites = int(bucket.get("call_sites", 0))
+        denom = max(1, call_sites)
         fields_out = []
         for _, frec in bucket["fields"].items():
             rhs_items = sorted(
@@ -1671,12 +2111,19 @@ def build_type_init_index(chunks, max_per_type=16):
                 key=lambda x: (_field_rhs_score(x[0]), x[1], len(str(x[0]))),
                 reverse=True,
             )
-            sample_expr = rhs_items[0][0] if rhs_items else "{}"
-            support = float(frec["count"]) / float(call_sites)
-            required = bool(
-                (frec["count"] == call_sites and call_sites >= 1)
-                or (support >= 0.80 and frec["count"] >= 2)
-            )
+            sample_expr = rhs_items[0][0] if rhs_items else ""
+
+            if call_sites > 0:
+                support = float(frec["count"]) / float(denom)
+                required = bool(
+                    (frec["count"] == denom and denom >= 1)
+                    or (support >= 0.80 and frec["count"] >= 2)
+                )
+            else:
+                # Backfilled from callee-read path: informative, but not "required".
+                support = min(0.49, 0.12 * float(frec["count"]))
+                required = False
+
             fields_out.append({
                 "path": frec["path"],
                 "access": frec["access"],
@@ -1684,7 +2131,8 @@ def build_type_init_index(chunks, max_per_type=16):
                 "support": round(support, 4),
                 "required": required,
                 "sample_expr": sample_expr,
-                "self_contained": bool(_is_literal_like_token(sample_expr) or _is_self_contained_call_expr(sample_expr)),
+                "self_contained": bool(sample_expr and (_is_literal_like_token(sample_expr) or _is_self_contained_call_expr(sample_expr))),
+                "sources": {k: int(v) for k, v in sorted(frec["sources"].items(), key=lambda x: (-x[1], x[0]))},
                 "evidence": list(frec["evidence"]),
             })
 
@@ -1692,14 +2140,13 @@ def build_type_init_index(chunks, max_per_type=16):
         if not fields_out:
             continue
         required_fields_by_function[bucket["function"]].append({
-            "arg_index": bucket["arg_index"],
+            "arg_index": int(bucket["arg_index"]),
             "arg_name": bucket["arg_name"],
             "type": bucket["type"],
             "call_sites": int(call_sites),
             "fields": fields_out[:24],
         })
 
-    # deterministic ordering
     req_out = {}
     for fname, entries in required_fields_by_function.items():
         req_out[fname] = sorted(
@@ -1707,8 +2154,15 @@ def build_type_init_index(chunks, max_per_type=16):
             key=lambda e: (int(e.get("arg_index", 0)), str(e.get("arg_name", ""))),
         )
 
+    callsite_arg_flow_out = {}
+    for caller, rows in callsite_arg_flow.items():
+        callsite_arg_flow_out[caller] = rows[:128]
+
     return {
-        "version": 2,
+        "version": 3,
         "types": types_out,
+        "struct_field_writes": struct_field_writes_out,
+        "function_effects": function_effects_out,
+        "callsite_arg_flow": callsite_arg_flow_out,
         "required_fields_by_function": req_out,
     }

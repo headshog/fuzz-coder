@@ -872,8 +872,11 @@ def test_build_type_init_index_collects_struct_init_patterns():
     ]
 
     idx = index_core.build_type_init_index(chunks)
-    assert idx.get("version") == 2
+    assert idx.get("version") == 3
     types = idx.get("types", {})
+    assert isinstance(idx.get("struct_field_writes", {}), dict)
+    assert isinstance(idx.get("function_effects", {}), dict)
+    assert isinstance(idx.get("callsite_arg_flow", {}), dict)
     assert "AVFormatContext" in types
     assert any(
         e.get("kind") == "pointer_call" and "avformat_alloc_context(" in e.get("expr", "")
