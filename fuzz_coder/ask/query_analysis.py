@@ -3,53 +3,26 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Tuple
 
+from fuzz_coder.languages.registry import get_query_language_adapter
 
-TYPE_KEYWORDS = {
-    "byte_array": ["byte", "uint8", "char*", "buffer", "массив байт", "байт", "bytes", "qbytearray"],
-    "string": ["string", "str", "char[]", "строка", "строку", "cstring", "wstring"],
-    "integer": ["int", "integer", "число", "int32", "int64", "цел", "size_t", "ssize_t"],
-    "float": ["float", "double", "веществен", "floating", "плавающ"],
-    "template": ["vector", "array", "список", "массив", "std::vector", "template", "std::array"],
-    "pointer": ["pointer", "указатель"],
-    "reference": ["reference", "ссылка"],
-}
+_QUERY_ADAPTER = get_query_language_adapter("c_cpp")
 
-TYPE_ALIASES = {
-    "int": "integer",
-    "vector": "template",
-}
-
-FUZZ_QUERY_KEYWORDS = [
-    "fuzz", "fuzzer", "fuzzing", "libfuzzer", "afl", "afl++", "honggfuzz",
-    "oss-fuzz", "mutation", "coverage-guided", "asan", "ubsan", "sanitizer",
-    "фазз", "фаззинг", "фузз", "фуззинг",
-]
-
-PATH_FILTER_PATTERNS = [
-    r"\b(?:from|in)\s+(?:the\s+)?(?:module|directory|subdirectory|folder|path)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1",
-    r"\b(?:from|in)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1\s+(?:module|directory|subdirectory|folder|path)\b",
-    r"\bunder\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1",
-    r"\bиз\s+(?:модуля|директории|поддиректории|папки)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1",
-    r"\bв\s+(?:модуле|директории|поддиректории|папке)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1",
-    r"\b(?:из|в)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1\s+(?:модуле|модуля|директории|поддиректории|папке)\b",
-]
-
-COMMON_QUERY_WORDS = {
-    "write", "list", "of", "functions", "that", "can", "be", "used", "for", "fuzzing",
-    "give", "an", "example", "from", "main", "function", "called", "call", "how",
-    "to", "is", "in", "codebase", "show", "me", "the", "a", "and", "or", "with",
-}
-
-QUERY_SYMBOL_BLACKLIST = {
-    "write", "list", "show", "find", "give", "make", "need", "example",
-    "function", "functions", "called", "calling", "from", "for", "with",
-    "that", "this", "these", "those", "can", "used", "use", "is", "are",
-    "of", "in", "on", "to", "an", "a", "the",
-    # High-frequency generic nouns/verbs that often appear in prompts and
-    # should not become target symbols unless explicitly code-like.
+TYPE_KEYWORDS = dict(_QUERY_ADAPTER.type_keywords)
+TYPE_ALIASES = dict(_QUERY_ADAPTER.type_aliases)
+FUZZ_QUERY_KEYWORDS = list(_QUERY_ADAPTER.fuzz_query_keywords)
+PARSE_LIKE_KEYWORDS = list(_QUERY_ADAPTER.parse_like_keywords)
+STDIN_QUERY_KEYWORDS = list(_QUERY_ADAPTER.stdin_query_keywords)
+FILE_QUERY_KEYWORDS = list(_QUERY_ADAPTER.file_query_keywords)
+API_QUERY_KEYWORDS = list(_QUERY_ADAPTER.api_query_keywords)
+OUTPUT_QUERY_KEYWORDS = list(_QUERY_ADAPTER.output_query_keywords)
+MEMORY_QUERY_KEYWORDS = list(_QUERY_ADAPTER.memory_query_keywords)
+ERROR_QUERY_KEYWORDS = list(_QUERY_ADAPTER.error_query_keywords)
+PARAMS_QUERY_KEYWORDS = list(_QUERY_ADAPTER.params_query_keywords)
+PATH_FILTER_PATTERNS = list(_QUERY_ADAPTER.path_filter_patterns)
+COMMON_QUERY_WORDS = set(_QUERY_ADAPTER.common_query_words)
+QUERY_SYMBOL_BLACKLIST = set(_QUERY_ADAPTER.query_symbol_blacklist) | {
     "data", "line", "value", "values", "path", "file", "module", "directory",
-    "input", "output", "request", "response", "process", "format", "context", "range", "role",
-    "construct", "constructed", "build", "built", "define", "generated", "snippet",
+    "input", "output", "request", "response", "process",
 }
 
 
@@ -368,34 +341,23 @@ def analyze_query_v2(
         for w in ["example", "пример", "как вызвать", "как использовать", "usage", "использовани"]
     )
 
-    if any(w in query_lower for w in ["stdin", "standard input", "console", "cin", "scanf", "getchar", "fgets", "ввод"]):
+    if any(w in query_lower for w in STDIN_QUERY_KEYWORDS):
         analysis["needs_stdin"] = True
-    if any(w in query_lower for w in ["file", "fopen", "ifstream", "fstream", "read from file", "файл"]):
+    if any(w in query_lower for w in FILE_QUERY_KEYWORDS):
         analysis["needs_file"] = True
-    if any(w in query_lower for w in ["api", "http", "request", "network", "curl", "socket", "сеть"]):
+    if any(w in query_lower for w in API_QUERY_KEYWORDS):
         analysis["needs_api"] = True
 
-    if any(w in query_lower for w in [
-        "stdout", "stderr", "output", "print", "printf", "fprintf", "cout", "cerr",
-        "clog", "logging", "logger", "log ", "log-", "вывод", "печать", "логг",
-    ]) or re.search(r"\bwrite(s|d|ing)?\s+(to|into)\b", query_lower):
+    if any(w in query_lower for w in OUTPUT_QUERY_KEYWORDS) or re.search(r"\bwrite(s|d|ing)?\s+(to|into)\b", query_lower):
         analysis["needs_output"] = True
 
-    if any(w in query_lower for w in [
-        "memory", "buffer", "malloc", "calloc", "realloc", "free",
-        "new/delete", "memcpy", "memmove", "heap", "stack",
-        "памят", "буфер", "переполн",
-    ]):
+    if any(w in query_lower for w in MEMORY_QUERY_KEYWORDS):
         analysis["needs_memory_mgmt"] = True
 
-    if any(w in query_lower for w in [
-        "error handling", "error", "errors", "exception", "exceptions",
-        "throw", "catch", "assert", "errno", "validation",
-        "ошиб", "исключен", "валидац",
-    ]):
+    if any(w in query_lower for w in ERROR_QUERY_KEYWORDS):
         analysis["needs_error_handling"] = True
 
-    if any(w in query_lower for w in ["param", "argument", "arg", "input", "receive", "accept", "take", "переда", "вход", "параметр"]):
+    if any(w in query_lower for w in PARAMS_QUERY_KEYWORDS):
         analysis["needs_params"] = True
 
     param_semantics_markers = [
@@ -417,10 +379,7 @@ def analyze_query_v2(
         analysis["needs_type_info"] = True
         analysis["needs_types"] = True
 
-    if any(w in query_lower for w in [
-        "parse", "parser", "parsing", "tokenize", "split", "decode", "deserialize",
-        "scan", "lex", "grammar", "peg", "разбор", "парс",
-    ]):
+    if query_has_any_keyword(query_lower, PARSE_LIKE_KEYWORDS):
         analysis["needs_parse_like"] = True
 
     if query_has_any_keyword(query_lower, FUZZ_QUERY_KEYWORDS):

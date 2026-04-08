@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from fuzz_coder.languages.registry import get_prompt_language_adapter
+
 DEFAULT_MAX_PROMPT_CHARS = 20000
 
 
-def _render_function_context(frags, code_char_limit):
+def _render_function_context(frags, code_char_limit, language_name="c_cpp"):
+    fence_lang = get_prompt_language_adapter(language_name or "c_cpp").code_fence_lang
     ctx = ""
     for i, f in enumerate(frags, 1):
         param_info = ""
@@ -25,7 +28,7 @@ def _render_function_context(frags, code_char_limit):
   File: {f["file"]}:{f["start_line"]}-{f["end_line"]}
   Signature: {f["signature"]}{param_info}
   Code:
-```cpp
+```{fence_lang}
 {f["code"][:code_char_limit]}
 ```
 """
@@ -230,15 +233,16 @@ Constraints:
 """.strip()
 
 
-def _build_example_system_block():
-    return """
+def _build_example_system_block(language_name="c_cpp"):
+    adapter = get_prompt_language_adapter(language_name or "c_cpp")
+    return f"""
 ### SYSTEM BLOCK (EXAMPLE_GENERATION)
 MUST:
 - Use the exact target function signature from context (name, arity, types).
 - Ground example in real caller/callee usage from context when available.
 - Include a short "Evidence from codebase" note.
 - Evidence must include at least one `File: path:start-end` and one `Signature: ...`.
-- If query requests argv/file bytes, construct arguments from `argv[1]` bytes.
+- If query requests CLI/file bytes, construct arguments from `{adapter.cli_file_expr}` bytes.
 - If caller evidence is missing, state that explicitly and provide minimal safe scaffold.
 SHOULD:
 - Make the snippet compilable and realistic for the shown signature.
@@ -246,7 +250,7 @@ NICE TO HAVE:
 - Reuse naming/order patterns from observed call-sites.
 
 ### OUTPUT FORMAT (STRICT)
-```cpp
+```{adapter.code_fence_lang}
 <compilable example>
 ```
 Evidence from codebase:
@@ -340,7 +344,7 @@ NICE TO HAVE:
 """.strip()
 
 
-def _build_intent_system_block(analysis, max_items):
+def _build_intent_system_block(analysis, max_items, language_name="c_cpp"):
     if not analysis:
         return _build_generic_system_block({}, max_items)
 
@@ -348,7 +352,7 @@ def _build_intent_system_block(analysis, max_items):
     if query_type == "listing":
         return _build_listing_system_block(analysis, max_items)
     if query_type == "example_generation":
-        return _build_example_system_block()
+        return _build_example_system_block(language_name=language_name)
     if query_type == "parameter_analysis":
         return _build_parameter_analysis_system_block()
     if query_type == "implementation_explanation":
@@ -364,9 +368,10 @@ def _build_thinking_prompt_with_limit(
     code_char_limit=1500,
     example_context=None,
     function_hints=None,
+    language_name="c_cpp",
 ):
     max_items = len(frags)
-    ctx = _render_function_context(frags, code_char_limit=code_char_limit)
+    ctx = _render_function_context(frags, code_char_limit=code_char_limit, language_name=language_name)
     history_ctx = _render_history_context(conversation_history)
     example_ctx_block = ""
     if (analysis or {}).get("query_type") in {"example_generation", "parameter_analysis"}:
@@ -375,7 +380,7 @@ def _build_thinking_prompt_with_limit(
     if (analysis or {}).get("query_type") == "parameter_analysis":
         function_hints_block = _render_function_hints(function_hints)
     policy_block = _build_policy_layers_block()
-    intent_block = _build_intent_system_block(analysis or {}, max_items=max_items)
+    intent_block = _build_intent_system_block(analysis or {}, max_items=max_items, language_name=language_name)
     thinking_instructions = """
 ### RESPONSE MODE
 Think silently. Do not output chain-of-thought.
@@ -399,7 +404,8 @@ Return only final answer in the required format.
 """
 
 
-def _build_simple_prompt_with_limit(frags, q, code_char_limit=2000):
+def _build_simple_prompt_with_limit(frags, q, code_char_limit=2000, language_name="c_cpp"):
+    fence_lang = get_prompt_language_adapter(language_name or "c_cpp").code_fence_lang
     ctx = ""
     for i, f in enumerate(frags, 1):
         param_info = ""
@@ -422,7 +428,9 @@ File: {f["file"]}
 Function: {f["name"]}{param_info}{input_info}
 Signature: {f["signature"]}
 Code:
+```{fence_lang}
 {f["code"][:code_char_limit]}
+```
 
 """
 
@@ -444,6 +452,7 @@ def _build_prompt_with_limits(
     code_char_limit_simple=2000,
     example_context=None,
     function_hints=None,
+    language_name="c_cpp",
 ):
     complex_types = ["listing", "example_generation", "parameter_analysis", "implementation_explanation", "type_specific", "input_specific"]
     use_thinking = (analysis and analysis["query_type"] in complex_types) or (conversation_history and len(conversation_history) > 0)
@@ -457,9 +466,15 @@ def _build_prompt_with_limits(
             code_char_limit=code_char_limit_thinking,
             example_context=example_context,
             function_hints=function_hints,
+            language_name=language_name,
         )
 
-    return _build_simple_prompt_with_limit(frags, q, code_char_limit=code_char_limit_simple)
+    return _build_simple_prompt_with_limit(
+        frags,
+        q,
+        code_char_limit=code_char_limit_simple,
+        language_name=language_name,
+    )
 
 
 def build_prompt(
@@ -470,6 +485,7 @@ def build_prompt(
     max_prompt_chars=DEFAULT_MAX_PROMPT_CHARS,
     example_context=None,
     function_hints=None,
+    language_name="c_cpp",
 ):
     """Build prompt with a total character budget.
 
@@ -494,6 +510,7 @@ def build_prompt(
             code_char_limit_simple=max(250, int(limit * 1.2)),
             example_context=example_context,
             function_hints=function_hints,
+            language_name=language_name,
         )
         last_prompt = prompt
         if len(prompt) <= max_prompt_chars:
@@ -512,6 +529,7 @@ def build_prompt(
             code_char_limit_simple=max(250, int(min_limit * 1.2)),
             example_context=example_context,
             function_hints=function_hints,
+            language_name=language_name,
         )
         last_prompt = prompt
         if len(prompt) <= max_prompt_chars:

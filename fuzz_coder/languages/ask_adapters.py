@@ -129,12 +129,39 @@ def _split_top_level_arguments(args_text: str) -> List[str]:
     return out
 
 
+def _extract_nominal_type_name_default(type_text: str) -> str:
+    t = re.sub(r"\b(const|volatile|restrict|__restrict__|struct|class|enum|final)\b", " ", str(type_text or ""))
+    t = t.replace("*", " ").replace("&", " ").replace("[]", " ")
+    t = re.sub(r"<[^>]*>", " ", t)
+    tokens = re.findall(r"[A-Za-z_]\w*", t)
+    if not tokens:
+        return ""
+    skip = {
+        "unsigned", "signed", "long", "short", "int", "float", "double", "bool", "void",
+        "size_t", "ssize_t", "auto", "typename", "byte", "boolean", "char", "var",
+        "public", "private", "protected", "static", "extends", "super",
+    }
+    for tok in reversed(tokens):
+        if tok.lower() not in skip:
+            return tok
+    return ""
+
+
 @dataclass(frozen=True)
 class AskLanguageAdapter:
     name: str
 
+    def non_function_tokens(self) -> set[str]:
+        return set()
+
     def call_pattern(self, target_name: str) -> re.Pattern:
         raise NotImplementedError
+
+    def find_matching_paren(self, text: str, open_idx: int) -> int:
+        return _find_matching_paren_text(text, open_idx)
+
+    def split_top_level_arguments(self, args_text: str) -> List[str]:
+        return _split_top_level_arguments(args_text)
 
     def extract_call_argument_lists(self, code: str, target_name: str, limit: int = 5) -> List[Dict]:
         if not code or not target_name:
@@ -166,6 +193,10 @@ class AskLanguageAdapter:
             if len(out) >= limit:
                 break
         return out
+
+    def extract_call_arities(self, code: str, target_name: str, limit: int = 64) -> List[int]:
+        calls = self.extract_call_argument_lists(code, target_name, limit=limit)
+        return [int(c.get("arity", 0)) for c in calls]
 
     def classify_param_shape(self, param_type: str, param_name: str) -> str:
         raise NotImplementedError
@@ -240,8 +271,22 @@ class AskLanguageAdapter:
     def is_cli_file_expr(self, expr: str) -> bool:
         raise NotImplementedError
 
+    def extract_nominal_type_name(self, type_text: str) -> str:
+        return _extract_nominal_type_name_default(type_text)
+
 
 class CCppAskLanguageAdapter(AskLanguageAdapter):
+    def non_function_tokens(self) -> set[str]:
+        return {
+            "if", "for", "while", "switch", "return", "sizeof", "catch",
+            "new", "delete", "throw", "else", "do", "class", "struct",
+            "namespace", "template", "typedef", "using", "enum", "union",
+            "printf", "scanf", "malloc", "free", "memset", "memcpy",
+            "std", "vector", "string", "map", "set",
+            "phase", "criteria", "console", "input", "output", "function",
+            "void", "int", "float", "double", "char", "bool", "const", "size_t",
+        }
+
     def call_pattern(self, target_name: str) -> re.Pattern:
         return re.compile(
             rf"(?<![A-Za-z0-9_~])(?:[A-Za-z_]\w*::)*{re.escape(target_name)}\s*\("
@@ -334,8 +379,21 @@ class CCppAskLanguageAdapter(AskLanguageAdapter):
     def is_cli_file_expr(self, expr: str) -> bool:
         return re.search(r"\bargv\s*\[\s*1\s*\]", expr or "") is not None
 
+    def extract_nominal_type_name(self, type_text: str) -> str:
+        return _extract_nominal_type_name_default(type_text)
+
 
 class JavaAskLanguageAdapter(AskLanguageAdapter):
+    def non_function_tokens(self) -> set[str]:
+        return {
+            "if", "for", "while", "switch", "return", "catch",
+            "new", "throw", "else", "do", "class", "interface",
+            "package", "import", "enum", "record",
+            "system", "out", "println", "print", "logger",
+            "phase", "criteria", "console", "input", "output", "function",
+            "void", "int", "float", "double", "char", "boolean", "const", "final",
+        }
+
     def call_pattern(self, target_name: str) -> re.Pattern:
         return re.compile(
             rf"(?<![A-Za-z0-9_])(?:[A-Za-z_]\w*\s*\.)*{re.escape(target_name)}\s*\("
@@ -413,6 +471,9 @@ class JavaAskLanguageAdapter(AskLanguageAdapter):
         return re.search(r"\bargs\s*\[\s*[01]\s*\]", expr or "") is not None or re.search(
             r"\bargv\s*\[\s*1\s*\]", expr or ""
         ) is not None
+
+    def extract_nominal_type_name(self, type_text: str) -> str:
+        return _extract_nominal_type_name_default(type_text)
 
 
 _ASK_ADAPTERS: Dict[str, AskLanguageAdapter] = {

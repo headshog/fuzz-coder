@@ -83,6 +83,7 @@ def build_function_hints(symbols, doc_files, max_hints_per_function=8):
 def apply_language_profile(language_name: str) -> None:
     """Apply language profile to legacy global constants without behavior changes."""
     profile = get_language_profile(language_name)
+    core.ACTIVE_INDEX_LANGUAGE = language_name
     core.SUPPORTED_EXT = set(profile.supported_ext)
     core.CONTROL_KEYWORDS = set(profile.control_keywords)
     core.STDIN_PATTERNS = list(profile.stdin_patterns)

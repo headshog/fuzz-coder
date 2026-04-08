@@ -22,114 +22,38 @@ from .fallback_builders import build_example_answer_from_context as _build_examp
 from .fallback_builders import build_parameter_analysis_from_context as _build_parameter_analysis_from_context_impl
 from .verification import verify_answer_with_context as _verify_answer_with_context_impl
 from .verification import verify_example_answer_with_context as _verify_example_answer_with_context_impl
+from fuzz_coder.languages.registry import get_query_language_adapter
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
-TYPE_KEYWORDS = {
-    "byte_array": ["byte", "uint8", "char*", "buffer", "массив байт", "байт", "bytes", "qbytearray"],
-    "string": ["string", "str", "char[]", "строка", "строку", "cstring", "wstring"],
-    "integer": ["int", "integer", "число", "int32", "int64", "цел", "size_t", "ssize_t"],
-    "float": ["float", "double", "веществен", "floating", "плавающ"],
-    "template": ["vector", "array", "список", "массив", "std::vector", "template", "std::array"],
-    "pointer": ["pointer", "указатель"],
-    "reference": ["reference", "ссылка"],
-}
+_QUERY_ADAPTER = get_query_language_adapter("c_cpp")
 
-# Canonical names used by index_fuzz_coder.py -> special_indices["by_type"]
-TYPE_ALIASES = {
-    "int": "integer",
-    "vector": "template",
-}
-
-TYPE_INDEX_ALIASES = {
-    "integer": ["int"],
-    "template": ["vector"],
-}
-
-WRITE_LIKE_KEYWORDS = [
-    "write", "output", "print", "printf", "fprintf", "cout", "cerr", "clog",
-    "log", "dump", "serialize", "save", "emit", "flush", "store",
-    "запис", "вывод", "печат", "лог",
-]
-
-PARSE_LIKE_KEYWORDS = [
-    "parse", "parser", "token", "tokenize", "split", "decode", "deserialize",
-    "scan", "lex", "grammar", "peg", "readline", "from_string", "parse_",
-    "парс", "разбор",
-]
-
-FUZZ_QUERY_KEYWORDS = [
-    "fuzz", "fuzzer", "fuzzing", "libfuzzer", "afl", "afl++", "honggfuzz",
-    "oss-fuzz", "mutation", "coverage-guided", "asan", "ubsan", "sanitizer",
-    "фазз", "фаззинг", "фузз", "фуззинг",
-]
-
-FUZZ_TARGET_KEYWORDS = [
-    "parse", "decode", "deserialize", "token", "grammar", "load", "read",
-    "json", "xml", "yaml", "gguf", "tensor", "prompt", "chat", "template",
-    "sample", "kv", "buffer", "memcpy", "memmove", "strncpy", "snprintf",
-    "base64", "utf8", "utf-8", "binary", "header", "payload",
-]
-
-SIMPLE_POINTER_TYPE_HINTS = [
-    "char", "signed char", "unsigned char",
-    "short", "unsigned short",
-    "int", "unsigned int",
-    "long", "unsigned long",
-    "long long", "unsigned long long",
-    "int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t", "int64_t", "uint64_t",
-    "size_t", "ssize_t",
-    "float", "double", "bool",
-]
-
-FILE_HANDLE_TYPE_HINTS = [
-    "file *", "file*", "std::file",
-    "ifstream", "ofstream", "fstream",
-    "istream", "ostream", "stream &", "stream&",
-]
-
-PATH_PARAM_NAME_HINTS = [
-    "path", "file", "filename", "fname", "filepath", "dir", "directory",
-]
-
-VECTOR_LIKE_TYPE_HINTS = [
-    "std::vector<", "vector<",
-    "std::array<", "array<",
-    "std::span<", "span<",
-]
-
-PATH_FILTER_PATTERNS = [
-    # English: from/in module|directory|subdirectory|folder|path <value>
-    r"\b(?:from|in)\s+(?:the\s+)?(?:module|directory|subdirectory|folder|path)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1",
-    # English: from/in <value> module|directory|...
-    r"\b(?:from|in)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1\s+(?:module|directory|subdirectory|folder|path)\b",
-    r"\bunder\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1",
-    # Russian: из/в модуля|директории|поддиректории|папки <value>
-    r"\bиз\s+(?:модуля|директории|поддиректории|папки)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1",
-    r"\bв\s+(?:модуле|директории|поддиректории|папке)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1",
-    # Russian: из/в <value> модуле|директории|...
-    r"\b(?:из|в)\s+([`\"']?)([A-Za-z0-9_./\\:-]+)\1\s+(?:модуле|модуля|директории|поддиректории|папке)\b",
-]
-
-COMMON_QUERY_WORDS = {
-    "write", "list", "of", "functions", "that", "can", "be", "used", "for", "fuzzing",
-    "give", "an", "example", "from", "main", "function", "called", "call", "how",
-    "to", "is", "in", "codebase", "show", "me", "the", "a", "and", "or", "with",
-}
-
-# Words that should not become function targets when seen as plain tokens,
-# even if such symbols exist somewhere in the index.
-QUERY_SYMBOL_BLACKLIST = {
-    "write", "list", "show", "find", "give", "make", "need", "example",
-    "function", "functions", "called", "calling", "from", "for", "with",
-    "that", "this", "these", "those", "can", "used", "use", "is", "are",
-    "of", "in", "on", "to", "an", "a", "the",
-    "construct", "constructed", "build", "built", "define", "generated", "snippet",
-    "format", "context", "range", "role",
-}
+TYPE_KEYWORDS = dict(_QUERY_ADAPTER.type_keywords)
+TYPE_ALIASES = dict(_QUERY_ADAPTER.type_aliases)
+TYPE_INDEX_ALIASES = dict(_QUERY_ADAPTER.type_index_aliases)
+TYPE_PARAM_HINTS = dict(_QUERY_ADAPTER.type_param_hints)
+STDIN_QUERY_KEYWORDS = list(_QUERY_ADAPTER.stdin_query_keywords)
+FILE_QUERY_KEYWORDS = list(_QUERY_ADAPTER.file_query_keywords)
+API_QUERY_KEYWORDS = list(_QUERY_ADAPTER.api_query_keywords)
+OUTPUT_QUERY_KEYWORDS = list(_QUERY_ADAPTER.output_query_keywords)
+MEMORY_QUERY_KEYWORDS = list(_QUERY_ADAPTER.memory_query_keywords)
+ERROR_QUERY_KEYWORDS = list(_QUERY_ADAPTER.error_query_keywords)
+PARAMS_QUERY_KEYWORDS = list(_QUERY_ADAPTER.params_query_keywords)
+WRITE_LIKE_KEYWORDS = list(_QUERY_ADAPTER.write_like_keywords)
+PARSE_LIKE_KEYWORDS = list(_QUERY_ADAPTER.parse_like_keywords)
+FUZZ_QUERY_KEYWORDS = list(_QUERY_ADAPTER.fuzz_query_keywords)
+FUZZ_TARGET_KEYWORDS = list(_QUERY_ADAPTER.fuzz_target_keywords)
+PATH_LIKE_TYPE_HINTS = list(_QUERY_ADAPTER.path_like_type_hints)
+SIMPLE_POINTER_TYPE_HINTS = list(_QUERY_ADAPTER.simple_pointer_type_hints)
+FILE_HANDLE_TYPE_HINTS = list(_QUERY_ADAPTER.file_handle_type_hints)
+PATH_PARAM_NAME_HINTS = list(_QUERY_ADAPTER.path_param_name_hints)
+VECTOR_LIKE_TYPE_HINTS = list(_QUERY_ADAPTER.vector_like_type_hints)
+PATH_FILTER_PATTERNS = list(_QUERY_ADAPTER.path_filter_patterns)
+COMMON_QUERY_WORDS = set(_QUERY_ADAPTER.common_query_words)
+QUERY_SYMBOL_BLACKLIST = set(_QUERY_ADAPTER.query_symbol_blacklist)
 
 
 def query_contains_keyword(query_lower, keyword):
@@ -420,14 +344,7 @@ def parameter_matches_type(param, type_name):
     if type_name == "reference":
         return "&" in p_raw
 
-    type_param_hints = {
-        "byte_array": ["uint8", "unsigned char", "char *", "byte", "qbytearray", "vector<uint8"],
-        "string": ["std::string", "string", "char *", "const char *", "qstring", "wstring", "char[]"],
-        "integer": ["int", "long", "short", "int32", "int64", "size_t", "ssize_t", "uint32", "uint64"],
-        "float": ["float", "double", "long double"],
-        "template": ["std::vector", "vector<", "std::array", "array<", "std::map", "map<", "std::set", "set<", "unordered_map"],
-    }
-    return any(h in p_raw for h in type_param_hints.get(type_name, []))
+    return any(h in p_raw for h in TYPE_PARAM_HINTS.get(type_name, []))
 
 
 def chunk_matches_requested_types(chunk, requested_types):
@@ -475,7 +392,7 @@ def has_path_like_param(chunk):
         p_name = str(p.get("name", "")).lower()
         txt = _param_text(p)
         has_name_hint = any(h in p_name for h in PATH_PARAM_NAME_HINTS)
-        has_path_type = any(t in txt for t in ["std::string", "string", "char *", "const char *", "filesystem::path", "path"])
+        has_path_type = any(t in txt for t in PATH_LIKE_TYPE_HINTS)
         if has_name_hint and has_path_type:
             return True
     return False
@@ -751,7 +668,7 @@ def keyword_match_score(query, chunk):
 
 def parameter_match_score(query, chunk):
     """Check if query mentions parameters and if chunk has them"""
-    param_keywords = ["param", "argument", "arg", "input", "receive", "accept", "take", "байт", "массив", "array", "byte"]
+    param_keywords = list(PARAMS_QUERY_KEYWORDS) + ["байт", "массив", "array", "byte"]
     has_param_query = any(kw in query.lower() for kw in param_keywords)
 
     if not has_param_query:
@@ -759,11 +676,15 @@ def parameter_match_score(query, chunk):
 
     if chunk.get("parameters") and len(chunk["parameters"]) > 0:
         # Check if parameter types match query intent
-        query_lower = query.lower()
+        byteish_hints = (
+            TYPE_PARAM_HINTS.get("byte_array", [])
+            + TYPE_PARAM_HINTS.get("template", [])
+            + TYPE_PARAM_HINTS.get("string", [])
+        )
         for p in chunk["parameters"]:
             p_type = p["type"].lower()
             p_name = p["name"].lower()
-            if any(kw in p_type or kw in p_name for kw in ["byte", "uint8", "char", "buffer", "data", "array", "vector", "string"]):
+            if any(kw in p_type or kw in p_name for kw in byteish_hints):
                 return 1.0
         return 0.7  # Has params but not exact match
     return 0.0
@@ -774,10 +695,10 @@ def input_type_match_score(query, chunk):
     query_lower = query.lower()
 
     # Check what input types the query is asking about
-    wants_stdin = any(w in query_lower for w in ["stdin", "standard input", "console input", "cin", "scanf", "getchar", "fgets"])
-    wants_file = any(w in query_lower for w in ["file", "fopen", "ifstream", "fstream", "read from file"])
-    wants_api = any(w in query_lower for w in ["api", "http", "request", "network", "curl", "socket"])
-    wants_param = any(w in query_lower for w in ["param", "argument", "input", "receive", "accept", "pass", "переда", "вход"])
+    wants_stdin = any(w in query_lower for w in STDIN_QUERY_KEYWORDS)
+    wants_file = any(w in query_lower for w in FILE_QUERY_KEYWORDS)
+    wants_api = any(w in query_lower for w in API_QUERY_KEYWORDS)
+    wants_param = any(w in query_lower for w in PARAMS_QUERY_KEYWORDS + ["pass"])
 
     if not (wants_stdin or wants_file or wants_api or wants_param):
         return 0.5  # No specific input type requested
@@ -1064,39 +985,28 @@ class QueryPlanner:
         }
 
         # Detect input type requirements
-        if any(w in query_lower for w in ["stdin", "standard input", "console", "cin", "scanf", "getchar", "fgets", "ввод"]):
+        if any(w in query_lower for w in STDIN_QUERY_KEYWORDS):
             analysis["needs_stdin"] = True
 
-        if any(w in query_lower for w in ["file", "fopen", "ifstream", "fstream", "read from file", "файл"]):
+        if any(w in query_lower for w in FILE_QUERY_KEYWORDS):
             analysis["needs_file"] = True
 
-        if any(w in query_lower for w in ["api", "http", "request", "network", "curl", "socket", "сеть"]):
+        if any(w in query_lower for w in API_QUERY_KEYWORDS):
             analysis["needs_api"] = True
 
         # Detect output/error/memory focused queries (kept conservative to avoid
         # matching imperative phrases like "write a list ...").
-        if any(w in query_lower for w in [
-            "stdout", "stderr", "output", "print", "printf", "fprintf", "cout", "cerr",
-            "clog", "logging", "logger", "log ", "log-", "вывод", "печать", "логг",
-        ]) or re.search(r"\bwrite(s|d|ing)?\s+(to|into)\b", query_lower):
+        if any(w in query_lower for w in OUTPUT_QUERY_KEYWORDS) or re.search(r"\bwrite(s|d|ing)?\s+(to|into)\b", query_lower):
             analysis["needs_output"] = True
 
-        if any(w in query_lower for w in [
-            "memory", "buffer", "malloc", "calloc", "realloc", "free",
-            "new/delete", "memcpy", "memmove", "heap", "stack",
-            "памят", "буфер", "переполн",
-        ]):
+        if any(w in query_lower for w in MEMORY_QUERY_KEYWORDS):
             analysis["needs_memory_mgmt"] = True
 
-        if any(w in query_lower for w in [
-            "error handling", "error", "errors", "exception", "exceptions",
-            "throw", "catch", "assert", "errno", "validation",
-            "ошиб", "исключен", "валидац",
-        ]):
+        if any(w in query_lower for w in ERROR_QUERY_KEYWORDS):
             analysis["needs_error_handling"] = True
 
         # Detect parameter-related queries
-        if any(w in query_lower for w in ["param", "argument", "arg", "input", "receive", "accept", "take", "переда", "вход", "параметр"]):
+        if any(w in query_lower for w in PARAMS_QUERY_KEYWORDS):
             analysis["needs_params"] = True
 
         param_semantics_markers = [
@@ -1118,10 +1028,7 @@ class QueryPlanner:
             analysis["needs_types"] = True
 
         # Detect parse-like intent
-        if any(w in query_lower for w in [
-            "parse", "parser", "parsing", "tokenize", "split", "decode", "deserialize",
-            "scan", "lex", "grammar", "peg", "разбор", "парс"
-        ]):
+        if query_has_any_keyword(query_lower, PARSE_LIKE_KEYWORDS):
             analysis["needs_parse_like"] = True
 
         # Detect fuzzing-target intent
@@ -1486,6 +1393,7 @@ def build_prompt(
     max_prompt_chars=20000,
     example_context=None,
     function_hints=None,
+    language_name="c_cpp",
 ):
     """Main prompt builder with total-character budget."""
     return _build_prompt_impl(
@@ -1496,6 +1404,7 @@ def build_prompt(
         max_prompt_chars=max_prompt_chars,
         example_context=example_context,
         function_hints=function_hints,
+        language_name=language_name,
     )
 
 

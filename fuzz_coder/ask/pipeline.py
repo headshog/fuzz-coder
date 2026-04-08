@@ -261,6 +261,7 @@ def _build_prompt_and_call_llm(
     max_prompt_chars,
     model,
     verbose,
+    language_name=None,
     example_context=None,
     function_hints=None,
 ):
@@ -273,6 +274,7 @@ def _build_prompt_and_call_llm(
         max_prompt_chars=max_prompt_chars,
         example_context=example_context,
         function_hints=function_hints,
+        language_name=language_name or "c_cpp",
     )
 
     if verbose:
@@ -314,6 +316,7 @@ def _verify_answer(
     model,
     prompt,
     question,
+    language_name="c_cpp",
     example_context=None,
     function_hints=None,
     type_init_index=None,
@@ -403,6 +406,7 @@ def _verify_answer(
                 question=question,
                 first_answer=ans,
                 verification=verification,
+                language_name=language_name,
             )
             candidate_evals: List[CandidateEval] = []
             for idx, cprompt in enumerate(candidate_prompts, 1):
@@ -795,6 +799,7 @@ class QueryPipeline:
             max_prompt_chars=self.config.max_prompt_chars,
             model=self.config.model,
             verbose=self.config.verbose,
+            language_name=self.language_name,
             example_context=example_context,
             function_hints=function_hints,
         )
@@ -810,6 +815,7 @@ class QueryPipeline:
             model=self.config.model,
             prompt=prompt,
             question=q,
+            language_name=self.language_name,
             example_context=example_context,
             function_hints=function_hints,
             type_init_index=self.type_init_index,
