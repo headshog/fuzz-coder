@@ -144,3 +144,54 @@ def test_example_context_builder_prefers_higher_quality_target_under_path_filter
     ctx = build_example_context(frags, analysis=analysis)
     assert ctx["target"]["start_line"] == 1309
     assert "size_t m" in ctx["target"]["signature"]
+
+
+def test_example_context_builder_tracks_simple_assignment_flow_chain_to_target_args():
+    frags = [
+        {
+            "id": 40,
+            "name": "main",
+            "file": "/repo/tools/main.cpp",
+            "start_line": 1,
+            "end_line": 120,
+            "signature": "main(int argc, char ** argv)",
+            "parameters": [],
+            "code": (
+                "int main(int argc, char ** argv) {\n"
+                "    std::ifstream file(argv[1]);\n"
+                "    std::string line;\n"
+                "    std::getline(file, line);\n"
+                "    std::string tmp = line;\n"
+                "    Config cfg{};\n"
+                "    cfg.path = tmp;\n"
+                "    return parse_payload(reinterpret_cast<const uint8_t *>(cfg.path.data()), cfg.path.size());\n"
+                "}\n"
+            ),
+        },
+        {
+            "id": 41,
+            "name": "parse_payload",
+            "file": "/repo/src/parser.cpp",
+            "start_line": 10,
+            "end_line": 40,
+            "signature": "parse_payload(const uint8_t * data, size_t n)",
+            "parameters": [
+                {"name": "data", "type": "const uint8_t *"},
+                {"name": "n", "type": "size_t"},
+            ],
+            "code": "int parse_payload(const uint8_t * data, size_t n) { return (int)n; }",
+        },
+    ]
+    analysis = {
+        "primary_function_name": "parse_payload",
+        "function_names": ["parse_payload", "main"],
+        "needs_file": True,
+    }
+
+    ctx = build_example_context(frags, analysis=analysis)
+    assert ctx["target"]["name"] == "parse_payload"
+    assert ctx["caller"]["name"] == "main"
+    assert ctx["file_data_flow_hints"]["caller_reads_argv1"] is True
+    assert "line" in ctx["file_data_flow_hints"]["source_vars"]
+    assert "cfg.path" in ctx["file_data_flow_hints"]["flow_vars"]
+    assert ctx["file_data_flow_hints"]["target_uses_file_data"] is True

@@ -355,3 +355,121 @@ Evidence from codebase:
         example_context={"target": context[0], "caller": None, "observed_call": None, "file_data_flow_hints": {"requires_file_data": False}},
     )
     assert "observed_call_not_target" not in v["consistency_issues"]
+
+
+def test_example_verification_accepts_transitive_file_flow_chain_to_target_args():
+    context = [
+        {
+            "name": "main",
+            "file": "/repo/tools/main.cpp",
+            "start_line": 1,
+            "end_line": 120,
+            "signature": "main(int argc, char ** argv)",
+        },
+        {
+            "name": "parse_payload",
+            "file": "/repo/src/parser.cpp",
+            "start_line": 10,
+            "end_line": 40,
+            "signature": "parse_payload(const uint8_t * data, size_t n)",
+        },
+    ]
+    example_context = {
+        "target": context[1],
+        "caller": context[0],
+        "observed_call": {"expr": "parse_payload(buf, n)", "args": ["buf", "n"], "arity": 2},
+        "arg_shapes": [],
+        "file_data_flow_hints": {
+            "requires_file_data": True,
+            "caller_reads_argv1": True,
+            "source_vars": ["line"],
+        },
+    }
+    answer = """
+```cpp
+int main(int argc, char ** argv) {
+    std::ifstream file(argv[1]);
+    std::string line;
+    std::getline(file, line);
+    std::string tmp = line;
+    Config cfg{};
+    cfg.path = tmp;
+    parse_payload(reinterpret_cast<const uint8_t *>(cfg.path.data()), cfg.path.size());
+    return 0;
+}
+```
+Evidence from codebase:
+- File: `/repo/src/parser.cpp:10-40`
+- Signature: `parse_payload(const uint8_t * data, size_t n)`
+- File: `/repo/tools/main.cpp:1-120`
+- Signature: `main(int argc, char ** argv)`
+- Observed call: `parse_payload(buf, n)`
+"""
+    v = verify_example_answer_with_context(
+        answer,
+        context,
+        target_function="parse_payload",
+        known_functions={"main", "parse_payload"},
+        example_context=example_context,
+    )
+    assert v["is_valid"] is True
+    assert v["target_uses_file_data"] is True
+    assert "file_data_not_used_in_target_call" not in v["consistency_issues"]
+
+
+def test_example_verification_penalizes_default_init_when_strong_recipe_exists():
+    context = [
+        {
+            "name": "foo_run",
+            "file": "/repo/src/foo.c",
+            "start_line": 10,
+            "end_line": 40,
+            "signature": "foo_run(FooCtx * ctx)",
+            "parameters": [
+                {"name": "ctx", "type": "FooCtx *"},
+            ],
+        },
+    ]
+    answer = """
+```cpp
+int main() {
+    FooCtx ctx_obj{};
+    FooCtx * ctx = &ctx_obj;
+    foo_run(ctx);
+    return 0;
+}
+```
+Evidence from codebase:
+- File: `/repo/src/foo.c:10-40`
+- Signature: `foo_run(FooCtx * ctx)`
+"""
+    type_init_index = {
+        "version": 4,
+        "init_recipes_by_type": {
+            "FooCtx": [
+                {
+                    "target_function": "foo_run",
+                    "arg_index": 0,
+                    "arg_name": "ctx",
+                    "score": 10,
+                    "call_sites": 4,
+                    "allocator_expr": "foo_ctx_create()",
+                    "fields": [
+                        {"path": "path", "access": "arrow", "support": 1.0, "sample_expr": "argv[1]"},
+                    ],
+                }
+            ]
+        },
+    }
+
+    v = verify_example_answer_with_context(
+        answer,
+        context,
+        target_function="foo_run",
+        known_functions={"foo_run"},
+        type_init_index=type_init_index,
+    )
+    assert v["is_valid"] is True
+    assert "default_init_used_despite_recipe" in v["consistency_issues"]
+    assert "FooCtx" in v["default_init_penalized_nominals"]
+    assert v["confidence_level"] in {"medium", "low"}

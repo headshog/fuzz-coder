@@ -285,11 +285,184 @@ def _extract_file_source_vars(code_text: str) -> List[str]:
     return out
 
 
+def _normalize_chain_token(token: str) -> str:
+    t = str(token or "").strip()
+    t = re.sub(r"\s+", "", t)
+    return t
+
+
+def _lhs_base_name(lhs_expr: str) -> str:
+    lhs = _normalize_chain_token(lhs_expr)
+    if "->" in lhs:
+        return lhs.split("->", 1)[0]
+    if "." in lhs:
+        return lhs.split(".", 1)[0]
+    return lhs
+
+
+def _extract_simple_assignment_edges(code: str) -> List[tuple[str, str]]:
+    if not code:
+        return []
+    pat = re.compile(
+        r"([A-Za-z_]\w*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)*)\s*"
+        r"(?<![=!<>+\-*/%&|^])=(?!=)\s*"
+        r"([^;]+);"
+    )
+    edges: List[tuple[str, str]] = []
+    for m in pat.finditer(code):
+        lhs_raw = (m.group(1) or "").strip()
+        rhs_raw = (m.group(2) or "").strip()
+        if not lhs_raw or not rhs_raw:
+            continue
+        if lhs_raw.startswith(("return ", "if ", "while ", "for ", "switch ")):
+            continue
+        lhs = _normalize_chain_token(lhs_raw)
+        edges.append((lhs, rhs_raw))
+    return edges
+
+
+def _extract_file_data_flow_symbols(code_text: str, source_vars: List[str]) -> List[str]:
+    derived = {_normalize_chain_token(v) for v in (source_vars or []) if v}
+    code = code_text or ""
+    if not code:
+        return sorted({v for v in derived if v})
+
+    for v in list(derived):
+        base = _lhs_base_name(v)
+        if base:
+            derived.add(base)
+
+    edges = _extract_simple_assignment_edges(code)
+    for _ in range(6):
+        changed = False
+        names = [v for v in derived if v]
+        for lhs, rhs in edges:
+            if not names:
+                break
+            if _arg_uses_any_var(rhs, names):
+                if lhs not in derived:
+                    derived.add(lhs)
+                    changed = True
+                base = _lhs_base_name(lhs)
+                if base and base not in derived:
+                    derived.add(base)
+                    changed = True
+        if not changed:
+            break
+
+    return sorted({v for v in derived if v})
+
+
 def _arg_uses_any_var(arg_expr: str, names: List[str]) -> bool:
     expr = arg_expr or ""
     for name in names:
-        if re.search(rf"\b{re.escape(name)}\b", expr):
+        n = _normalize_chain_token(name)
+        if not n:
+            continue
+        if "." in n or "->" in n:
+            pat = rf"(?<![A-Za-z0-9_]){re.escape(n)}(?![A-Za-z0-9_])"
+        else:
+            pat = rf"\b{re.escape(n)}\b"
+        if re.search(pat, expr):
             return True
+    return False
+
+
+def _extract_nominal_type_name(type_text: str) -> str:
+    t = re.sub(r"\b(const|volatile|restrict|__restrict__|struct|class|enum)\b", " ", str(type_text or ""))
+    t = t.replace("*", " ").replace("&", " ")
+    tokens = re.findall(r"[A-Za-z_]\w*", t)
+    if not tokens:
+        return ""
+    skip = {
+        "unsigned", "signed", "long", "short", "int", "float", "double", "bool", "void",
+        "size_t", "ssize_t", "auto", "typename",
+    }
+    for tok in reversed(tokens):
+        if tok.lower() not in skip:
+            return tok
+    return ""
+
+
+def _build_strong_recipe_expectations(type_init_index, target_function, target_params):
+    raw = type_init_index or {}
+    if not isinstance(raw, dict):
+        return []
+    by_type = raw.get("init_recipes_by_type")
+    if not isinstance(by_type, dict):
+        return []
+    expected = []
+    target = str(target_function or "").strip()
+    for i, p in enumerate(target_params or []):
+        ptype = str((p or {}).get("type", ""))
+        nominal = _extract_nominal_type_name(ptype)
+        if not nominal:
+            continue
+        entries = list(by_type.get(nominal, [])) + list(by_type.get(nominal.lower(), []))
+        if not entries:
+            continue
+        best = None
+        best_key = None
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            etarget = str(e.get("target_function", "")).strip()
+            eidx = int(e.get("arg_index", -1))
+            priority = 0
+            if target and etarget == target and eidx == i:
+                priority = 3
+            elif target and etarget == target:
+                priority = 2
+            elif eidx == i:
+                priority = 1
+            score = int(e.get("score", 0))
+            call_sites = int(e.get("call_sites", 0))
+            has_alloc = bool(str(e.get("allocator_expr", "")).strip())
+            key = (priority, score, call_sites, has_alloc)
+            if best is None or key > best_key:
+                best = e
+                best_key = key
+        if best is None:
+            continue
+        if best_key[0] <= 0:
+            continue
+        if int(best.get("score", 0)) < 4 and int(best.get("call_sites", 0)) < 1:
+            continue
+        expected.append({
+            "arg_index": i,
+            "nominal": nominal,
+            "allocator_expr": str(best.get("allocator_expr", "")).strip(),
+            "fields": list(best.get("fields") or []),
+            "score": int(best.get("score", 0)),
+            "call_sites": int(best.get("call_sites", 0)),
+        })
+    return expected
+
+
+def _code_uses_default_init_for_nominal(code_text: str, nominal: str) -> bool:
+    code = code_text or ""
+    n = re.escape(str(nominal or "").strip())
+    if not n:
+        return False
+    patterns = [
+        rf"\b{n}\b\s+[A-Za-z_]\w*\s*\{{\s*\}}\s*;",
+        rf"\b{n}\b\s+[A-Za-z_]\w*\s*=\s*\{{\s*\}}\s*;",
+        rf"\b{n}\b\s*\*\s*[A-Za-z_]\w*\s*=\s*&\s*[A-Za-z_]\w+\s*;",
+    ]
+    return any(re.search(p, code) is not None for p in patterns)
+
+
+def _code_contains_allocator_expr(code_text: str, allocator_expr: str) -> bool:
+    expr = str(allocator_expr or "").strip()
+    if not expr:
+        return False
+    call_name = _extract_name_from_signature(f"{expr};") or ""
+    if call_name:
+        return re.search(rf"\b{re.escape(call_name)}\s*\(", code_text or "") is not None
+    m = re.match(r"\s*((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*\(", expr)
+    if m:
+        call_name = str(m.group(1) or "").split("::")[-1]
+        return re.search(rf"\b{re.escape(call_name)}\s*\(", code_text or "") is not None
     return False
 
 
@@ -552,6 +725,7 @@ def verify_example_answer_with_context(
     target_function=None,
     known_functions=None,
     example_context=None,
+    type_init_index=None,
 ):
     """Verify example-generation answer against current context.
 
@@ -620,6 +794,18 @@ def verify_example_answer_with_context(
                 expected_arities.add(ar)
         if expected_arities and target_call_arities:
             target_call_arity_match = any(a in expected_arities for a in target_call_arities)
+
+    target_params = []
+    if target_function:
+        for c in context_frags:
+            if c.get("name") == target_function and isinstance(c.get("parameters"), list):
+                target_params = list(c.get("parameters") or [])
+                break
+    recipe_expectations = _build_strong_recipe_expectations(
+        type_init_index=type_init_index,
+        target_function=target_function,
+        target_params=target_params,
+    )
 
     missing_requirements = set()
     if not file_refs:
@@ -699,13 +885,14 @@ def verify_example_answer_with_context(
 
     has_argv1 = re.search(r"argv\s*\[\s*1\s*\]", text_for_calls) is not None
     file_source_vars = _extract_file_source_vars(text_for_calls)
+    file_flow_vars = _extract_file_data_flow_symbols(text_for_calls, file_source_vars)
     target_uses_file_data = False
     for arg_list in target_call_arg_lists:
         for arg in arg_list:
             if re.search(r"argv\s*\[\s*1\s*\]", arg):
                 target_uses_file_data = True
                 break
-            if _arg_uses_any_var(arg, file_source_vars):
+            if _arg_uses_any_var(arg, file_flow_vars):
                 target_uses_file_data = True
                 break
         if target_uses_file_data:
@@ -717,6 +904,20 @@ def verify_example_answer_with_context(
         if not target_uses_file_data:
             missing_requirements.add("file_data_flow_to_target")
             consistency_issues.add("file_data_not_used_in_target_call")
+
+    default_init_penalized_nominals = []
+    if recipe_expectations and code_block_present:
+        for exp in recipe_expectations:
+            nominal = str(exp.get("nominal", "")).strip()
+            if not nominal:
+                continue
+            alloc_expr = str(exp.get("allocator_expr", "")).strip()
+            if alloc_expr and _code_contains_allocator_expr(text_for_calls, alloc_expr):
+                continue
+            if _code_uses_default_init_for_nominal(text_for_calls, nominal):
+                default_init_penalized_nominals.append(nominal)
+        if default_init_penalized_nominals:
+            consistency_issues.add("default_init_used_despite_recipe")
 
     score = float(base.get("confidence_score", 1.0))
     score -= 0.16 * len(missing_requirements)
@@ -735,6 +936,8 @@ def verify_example_answer_with_context(
         score += 0.03
     if requires_file_data and target_uses_file_data:
         score += 0.05
+    if default_init_penalized_nominals:
+        score -= min(0.20, 0.08 * len(set(default_init_penalized_nominals)))
 
     # Keep confidence conservative when consistency checks fail.
     if consistency_issues:
@@ -745,6 +948,8 @@ def verify_example_answer_with_context(
         score = min(score, 0.54)
     if "file_data_not_used_in_target_call" in consistency_issues:
         score = min(score, 0.45)
+    if "default_init_used_despite_recipe" in consistency_issues:
+        score = min(score, 0.60)
 
     score = max(0.0, min(1.0, score))
 
@@ -772,6 +977,10 @@ def verify_example_answer_with_context(
         "requires_file_data": requires_file_data,
         "target_uses_file_data": target_uses_file_data,
         "has_argv1_in_code": has_argv1,
+        "file_source_vars": file_source_vars,
+        "file_flow_vars": file_flow_vars,
+        "default_init_penalized_nominals": sorted(set(default_init_penalized_nominals)),
+        "recipe_expectations_count": len(recipe_expectations),
         "consistency_issues": consistency_issues,
         "missing_requirements": missing_requirements,
         "confidence_score": score,

@@ -71,7 +71,9 @@ def _load_indices(index_dir: Path):
     called_by = core.load_json(index_dir / "called_by.json")
     function_hints_path = index_dir / "function_hints.json"
     function_hints = core.load_json(function_hints_path) if function_hints_path.exists() else {}
-    return idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints
+    type_init_index_path = index_dir / "type_init_index.json"
+    type_init_index = core.load_json(type_init_index_path) if type_init_index_path.exists() else {}
+    return idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index
 
 
 def _load_models(args):
@@ -422,7 +424,7 @@ def _run_index_build(
 
 
 def _build_pipeline_for_index(index_dir: Path, args, embed_model, reranker):
-    idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints = _load_indices(index_dir)
+    idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index = _load_indices(index_dir)
     planner = core.QueryPlanner(special_indices, symbols, call_graph, called_by, meta=meta)
     return QueryPipeline(
         core_module=core,
@@ -436,6 +438,7 @@ def _build_pipeline_for_index(index_dir: Path, args, embed_model, reranker):
         call_graph=call_graph,
         called_by=called_by,
         function_hints=function_hints,
+        type_init_index=type_init_index,
         config=PipelineConfig(
             top_k=args.top_k,
             rerank_top_k=args.rerank_top_k,
@@ -450,9 +453,12 @@ def _build_pipeline_for_index(index_dir: Path, args, embed_model, reranker):
 def _create_chatbot():
     """Create Chatbot and infer its effective history mode from the instance itself."""
     try:
-        chatbot = gr.Chatbot(height=820, type="messages")
+        chatbot = gr.Chatbot(type="messages", elem_id="main_chatbot")
     except TypeError:
-        chatbot = gr.Chatbot(height=820)
+        try:
+            chatbot = gr.Chatbot(elem_id="main_chatbot")
+        except TypeError:
+            chatbot = gr.Chatbot()
 
     mode = getattr(chatbot, "type", None)
     if isinstance(mode, str):
@@ -1012,6 +1018,16 @@ def main():
       background: #2563eb !important;
       border-color: #2563eb !important;
       color: white !important;
+    }
+    #main_chatbot {
+      height: calc(100vh - 340px) !important;
+      min-height: 360px !important;
+    }
+    @media (max-width: 980px) {
+      #main_chatbot {
+        height: calc(100vh - 390px) !important;
+        min-height: 300px !important;
+      }
     }
     """
 

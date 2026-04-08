@@ -3,7 +3,7 @@ import pytest
 from fuzz_coder.ask import core as ask_core
 from fuzz_coder.index import app as index_app
 from fuzz_coder.index import core as index_core
-from fuzz_coder.languages.registry import get_language_profile
+from fuzz_coder.languages.registry import get_language_frontend, get_language_profile
 
 
 def test_call_llm_returns_structured_status(monkeypatch):
@@ -573,6 +573,25 @@ def test_language_registry_returns_java_profile_with_expected_surface():
     assert any("readAllBytes" in p for p in java_profile.file_input_patterns)
 
 
+def test_language_registry_returns_frontends_with_expected_names():
+    cpp_frontend = get_language_frontend("c_cpp")
+    java_frontend = get_language_frontend("java")
+    assert cpp_frontend.name == "c_cpp"
+    assert java_frontend.name == "java"
+
+
+def test_extract_functions_regex_java_strips_annotation_via_frontend_hook():
+    text = (
+        "@Deprecated\n"
+        "public static int parseHeader(String line) {\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    funcs = index_core.extract_functions_regex("Sample.java", text, language_name="java")
+    names = [f["name"] for f in funcs]
+    assert "parseHeader" in names
+
+
 def test_deterministic_example_fallback_does_not_cast_file_bytes_to_std_function():
     frags = [
         {
@@ -611,3 +630,561 @@ def test_deterministic_example_fallback_does_not_cast_file_bytes_to_std_function
     assert "std::function<void(const char *, const char *)>" in ans
     assert "input_bytes.data() + input_bytes.size()" in ans
     assert "static_cast<size_t>(input_bytes.size())" in ans
+
+
+def test_regex_parameter_parser_treats_void_parameter_list_as_empty():
+    parsed = index_core.parse_parameters_simple("void")
+    assert parsed == []
+
+
+def test_regex_parameter_parser_handles_attributes_and_top_level_defaults():
+    params_text = (
+        "const std::vector<int> & xs [[maybe_unused]], "
+        "int limit = std::max(1, 2), "
+        "const char * label = \"x,y\""
+    )
+    parsed = index_core.parse_parameters_simple(params_text)
+    assert [p["name"] for p in parsed] == ["xs", "limit", "label"]
+
+
+def test_deterministic_example_fallback_preserves_reference_inside_std_function_template():
+    frags = [
+        {
+            "id": 0,
+            "name": "process_request",
+            "file": "/repo/vendor/cpp-httplib/httplib.cpp",
+            "start_line": 7990,
+            "end_line": 8242,
+            "signature": "process_request(Stream &strm, const std::function<void(Request &)> &setup_request)",
+            "parameters": [
+                {"name": "strm", "type": "Stream &", "raw": "Stream & strm"},
+                {
+                    "name": "setup_request",
+                    "type": "const std::function<void(Request &)> &",
+                    "raw": "const std::function<void(Request &)> & setup_request",
+                },
+            ],
+            "code": "bool process_request(Stream &strm, const std::function<void(Request &)> &setup_request) { return true; }",
+            "has_stdin": False,
+            "has_file_input": False,
+            "has_api_call": False,
+            "has_output": False,
+            "uses_memory_management": False,
+            "has_error_handling": False,
+        },
+    ]
+    analysis = {
+        "query_type": "example_generation",
+        "needs_file": True,
+        "primary_function_name": "process_request",
+        "function_names": ["process_request"],
+    }
+
+    ans = ask_core.build_example_answer_from_context(frags, analysis=analysis)
+    assert "Request )" not in ans
+    assert "std::function<void(Request &)>" in ans
+
+
+def test_deterministic_example_fallback_sanitizes_multiline_observed_call_comment():
+    frags = [
+        {
+            "id": 0,
+            "name": "open_output_file",
+            "file": "/repo/src/ffmpeg/doc/examples/transcode_aac.c",
+            "start_line": 146,
+            "end_line": 247,
+            "signature": "open_output_file(const char *filename, AVCodecContext *input_codec_context, AVFormatContext **output_format_context, AVCodecContext **output_codec_context)",
+            "parameters": [
+                {"name": "filename", "type": "const char *", "raw": "const char * filename"},
+                {"name": "input_codec_context", "type": "AVCodecContext *", "raw": "AVCodecContext * input_codec_context"},
+                {"name": "output_format_context", "type": "AVFormatContext **", "raw": "AVFormatContext ** output_format_context"},
+                {"name": "output_codec_context", "type": "AVCodecContext **", "raw": "AVCodecContext ** output_codec_context"},
+            ],
+            "code": "int open_output_file(...) { return 0; }",
+            "has_stdin": False,
+            "has_file_input": False,
+            "has_api_call": False,
+        },
+        {
+            "id": 1,
+            "name": "main",
+            "file": "/repo/src/ffmpeg/doc/examples/transcode_aac.c",
+            "start_line": 778,
+            "end_line": 883,
+            "signature": "main(int argc, char **argv)",
+            "parameters": [],
+            "code": "int main(int argc, char **argv) { return 0; }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+        },
+    ]
+    analysis = {
+        "query_type": "example_generation",
+        "needs_file": True,
+        "primary_function_name": "open_output_file",
+        "function_names": ["open_output_file", "main"],
+    }
+    observed = (
+        "open_output_file(argv[2], input_codec_context,\n"
+        "                         &output_format_context, &output_codec_context)"
+    )
+    example_context = {
+        "target": frags[0],
+        "caller": frags[1],
+        "observed_call": {
+            "expr": observed,
+            "args": ["argv[2]", "input_codec_context", "&output_format_context", "&output_codec_context"],
+        },
+    }
+
+    ans = ask_core.build_example_answer_from_context(frags, analysis=analysis, example_context=example_context)
+
+    assert (
+        "// Observed call pattern in codebase: open_output_file(argv[2], input_codec_context, "
+        "&output_format_context, &output_codec_context)"
+    ) in ans
+    assert "\n                         &output_format_context" not in ans
+    assert "- Observed call: `open_output_file(argv[2], input_codec_context, &output_format_context, &output_codec_context)`" in ans
+
+
+def test_deterministic_example_fallback_reuses_caller_decls_and_prefers_argv1_for_filename():
+    frags = [
+        {
+            "id": 0,
+            "name": "open_output_file",
+            "file": "/repo/src/ffmpeg/doc/examples/transcode_aac.c",
+            "start_line": 146,
+            "end_line": 247,
+            "signature": "open_output_file(const char *filename, AVCodecContext *input_codec_context, AVFormatContext **output_format_context, AVCodecContext **output_codec_context)",
+            "parameters": [
+                {"name": "filename", "type": "const char *", "raw": "const char * filename"},
+                {"name": "input_codec_context", "type": "AVCodecContext *", "raw": "AVCodecContext * input_codec_context"},
+                {"name": "output_format_context", "type": "AVFormatContext **", "raw": "AVFormatContext ** output_format_context"},
+                {"name": "output_codec_context", "type": "AVCodecContext **", "raw": "AVCodecContext ** output_codec_context"},
+            ],
+            "code": "int open_output_file(...) { return 0; }",
+            "has_stdin": False,
+            "has_file_input": False,
+            "has_api_call": False,
+        },
+        {
+            "id": 1,
+            "name": "main",
+            "file": "/repo/src/ffmpeg/doc/examples/transcode_aac.c",
+            "start_line": 778,
+            "end_line": 883,
+            "signature": "main(int argc, char **argv)",
+            "parameters": [],
+            "code": (
+                "int main(int argc, char **argv) {\n"
+                "    AVCodecContext *input_codec_context = NULL;\n"
+                "    AVFormatContext *output_format_context = NULL;\n"
+                "    AVCodecContext *output_codec_context = NULL;\n"
+                "    open_output_file(argv[2], input_codec_context,\n"
+                "                     &output_format_context, &output_codec_context);\n"
+                "    return 0;\n"
+                "}\n"
+            ),
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+        },
+    ]
+    analysis = {
+        "query_type": "example_generation",
+        "needs_file": True,
+        "primary_function_name": "open_output_file",
+        "function_names": ["open_output_file", "main"],
+    }
+    example_context = {
+        "target": frags[0],
+        "caller": frags[1],
+        "observed_call": {
+            "expr": "open_output_file(argv[2], input_codec_context, &output_format_context, &output_codec_context)",
+            "args": ["argv[2]", "input_codec_context", "&output_format_context", "&output_codec_context"],
+        },
+    }
+
+    ans = ask_core.build_example_answer_from_context(frags, analysis=analysis, example_context=example_context)
+
+    assert "AVCodecContext * input_codec_context = NULL;" in ans
+    assert "AVFormatContext * output_format_context = NULL;" in ans
+    assert "AVCodecContext * output_codec_context = NULL;" in ans
+    assert "open_output_file(argv[1], input_codec_context, &output_format_context, &output_codec_context);" in ans
+    assert "AVFormatContext ** output_format_context" not in ans
+    assert "AVCodecContext ** output_codec_context" not in ans
+
+
+def test_deterministic_example_fallback_uses_allocator_for_context_pointer_when_available():
+    frags = [
+        {
+            "id": 0,
+            "name": "avi_read_header",
+            "file": "/repo/src/ffmpeg/libavformat/avidec.c",
+            "start_line": 508,
+            "end_line": 1114,
+            "signature": "avi_read_header(AVFormatContext *s)",
+            "parameters": [
+                {"name": "s", "type": "AVFormatContext *", "raw": "AVFormatContext * s"},
+            ],
+            "code": "int avi_read_header(AVFormatContext *s) { return 0; }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+        },
+    ]
+    analysis = {
+        "query_type": "example_generation",
+        "needs_file": True,
+        "primary_function_name": "avi_read_header",
+        "function_names": ["avi_read_header"],
+    }
+    symbols = {
+        "avi_read_header": [0],
+        "avformat_alloc_context": [1],
+    }
+
+    ans = ask_core.build_example_answer_from_context(frags, analysis=analysis, symbols=symbols)
+
+    assert "#include <libavformat/avformat.h>" in ans
+    assert "AVFormatContext * s = avformat_alloc_context();" in ans
+    assert "if (!s) {" in ans
+    assert "Failed to initialize s" in ans
+    assert "AVFormatContext s_obj{};" not in ans
+
+
+def test_build_type_init_index_collects_struct_init_patterns():
+    chunks = [
+        {
+            "id": 0,
+            "name": "main",
+            "file": "/repo/src/demo.c",
+            "start_line": 10,
+            "code": (
+                "int main() {\n"
+                "    AVFormatContext *s = avformat_alloc_context();\n"
+                "    FooConfig cfg = foo_config_default();\n"
+                "    return 0;\n"
+                "}\n"
+            ),
+        }
+    ]
+
+    idx = index_core.build_type_init_index(chunks)
+    assert idx.get("version") == 4
+    types = idx.get("types", {})
+    assert isinstance(idx.get("struct_field_writes", {}), dict)
+    assert isinstance(idx.get("function_effects", {}), dict)
+    assert isinstance(idx.get("callsite_arg_flow", {}), dict)
+    assert isinstance(idx.get("init_recipes_by_type", {}), dict)
+    assert "AVFormatContext" in types
+    assert any(
+        e.get("kind") == "pointer_call" and "avformat_alloc_context(" in e.get("expr", "")
+        for e in types["AVFormatContext"]
+    )
+    assert "FooConfig" in types
+    assert any(
+        e.get("kind") == "value_call" and "foo_config_default(" in e.get("expr", "")
+        for e in types["FooConfig"]
+    )
+
+
+def test_deterministic_example_fallback_uses_type_init_index_for_non_pointer_struct_param():
+    frags = [
+        {
+            "id": 0,
+            "name": "foo_open",
+            "file": "/repo/src/foo.c",
+            "start_line": 20,
+            "end_line": 80,
+            "signature": "foo_open(FooConfig cfg)",
+            "parameters": [
+                {"name": "cfg", "type": "FooConfig", "raw": "FooConfig cfg"},
+            ],
+            "code": "int foo_open(FooConfig cfg) { return 0; }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+        },
+    ]
+    analysis = {
+        "query_type": "example_generation",
+        "needs_file": True,
+        "primary_function_name": "foo_open",
+        "function_names": ["foo_open"],
+    }
+    type_init_index = {
+        "version": 2,
+        "types": {
+            "FooConfig": [
+                {
+                    "kind": "value_call",
+                    "expr": "foo_config_default()",
+                    "function": "foo_config_default",
+                    "self_contained": True,
+                    "count": 3,
+                    "score": 18,
+                }
+            ]
+        },
+        "required_fields_by_function": {},
+    }
+
+    ans = ask_core.build_example_answer_from_context(
+        frags,
+        analysis=analysis,
+        type_init_index=type_init_index,
+    )
+
+    assert "FooConfig cfg = foo_config_default();" in ans
+    assert "foo_open(cfg);" in ans
+
+
+def test_build_type_init_index_collects_required_field_chains_before_target_call():
+    chunks = [
+        {
+            "id": 0,
+            "name": "main",
+            "file": "/repo/src/demo.c",
+            "start_line": 1,
+            "signature": "main(int argc, char ** argv)",
+            "parameters": [
+                {"name": "argc", "type": "int"},
+                {"name": "argv", "type": "char **"},
+            ],
+            "code": (
+                "int main(int argc, char ** argv) {\n"
+                "    FooConfig cfg = foo_config_default();\n"
+                "    cfg.path = argv[1];\n"
+                "    cfg.enable = 1;\n"
+                "    return foo_open(cfg);\n"
+                "}\n"
+            ),
+        },
+        {
+            "id": 1,
+            "name": "foo_open",
+            "file": "/repo/src/foo.c",
+            "start_line": 20,
+            "signature": "foo_open(FooConfig cfg)",
+            "parameters": [
+                {"name": "cfg", "type": "FooConfig"},
+            ],
+            "code": "int foo_open(FooConfig cfg) { return 0; }",
+        },
+    ]
+
+    idx = index_core.build_type_init_index(chunks)
+    req = idx.get("required_fields_by_function", {})
+    assert "foo_open" in req
+    assert req["foo_open"]
+    first = req["foo_open"][0]
+    fields = list(first.get("fields", []))
+    assert any(f.get("path") == "path" for f in fields)
+    assert any(f.get("path") == "enable" for f in fields)
+    assert any(bool(f.get("required")) for f in fields)
+
+
+def test_build_type_init_index_collects_init_recipes_by_type():
+    chunks = [
+        {
+            "id": 0,
+            "name": "main",
+            "file": "/repo/src/demo.c",
+            "start_line": 1,
+            "signature": "main(int argc, char ** argv)",
+            "parameters": [
+                {"name": "argc", "type": "int"},
+                {"name": "argv", "type": "char **"},
+            ],
+            "code": (
+                "int main(int argc, char ** argv) {\n"
+                "    FooCtx *ctx = foo_ctx_create();\n"
+                "    ctx->path = argv[1];\n"
+                "    return foo_run(ctx);\n"
+                "}\n"
+            ),
+        },
+        {
+            "id": 1,
+            "name": "foo_run",
+            "file": "/repo/src/foo.c",
+            "start_line": 30,
+            "signature": "foo_run(FooCtx * ctx)",
+            "parameters": [
+                {"name": "ctx", "type": "FooCtx *"},
+            ],
+            "code": "int foo_run(FooCtx * ctx) { return 0; }",
+        },
+    ]
+
+    idx = index_core.build_type_init_index(chunks)
+    recipes = idx.get("init_recipes_by_type", {})
+    assert "FooCtx" in recipes
+    assert recipes["FooCtx"]
+    rec = recipes["FooCtx"][0]
+    assert rec.get("target_function") == "foo_run"
+    assert int(rec.get("arg_index", -1)) == 0
+    assert "foo_ctx_create(" in str(rec.get("allocator_expr", ""))
+    assert any(str(f.get("path", "")) == "path" for f in list(rec.get("fields") or []))
+
+
+def test_deterministic_example_fallback_prefers_init_recipe_allocator_and_fields():
+    frags = [
+        {
+            "id": 0,
+            "name": "foo_run",
+            "file": "/repo/src/foo.c",
+            "start_line": 20,
+            "end_line": 80,
+            "signature": "foo_run(FooCtx * ctx)",
+            "parameters": [
+                {"name": "ctx", "type": "FooCtx *", "raw": "FooCtx * ctx"},
+            ],
+            "code": "int foo_run(FooCtx * ctx) { return 0; }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+        },
+    ]
+    analysis = {
+        "query_type": "example_generation",
+        "needs_file": True,
+        "primary_function_name": "foo_run",
+        "function_names": ["foo_run"],
+    }
+    type_init_index = {
+        "version": 4,
+        "types": {},
+        "required_fields_by_function": {},
+        "init_recipes_by_type": {
+            "FooCtx": [
+                {
+                    "target_function": "foo_run",
+                    "arg_index": 0,
+                    "arg_name": "ctx",
+                    "score": 9,
+                    "call_sites": 3,
+                    "allocator_expr": "foo_ctx_create()",
+                    "fields": [
+                        {"path": "path", "access": "arrow", "support": 1.0, "sample_expr": "argv[1]"},
+                    ],
+                }
+            ]
+        },
+    }
+
+    ans = ask_core.build_example_answer_from_context(
+        frags,
+        analysis=analysis,
+        type_init_index=type_init_index,
+    )
+
+    assert "FooCtx * ctx = foo_ctx_create();" in ans
+    assert "ctx->path = argv[1];" in ans
+    assert "foo_run(ctx);" in ans
+
+
+def test_deterministic_example_fallback_applies_required_field_hints():
+    frags = [
+        {
+            "id": 0,
+            "name": "foo_open",
+            "file": "/repo/src/foo.c",
+            "start_line": 20,
+            "end_line": 80,
+            "signature": "foo_open(FooConfig cfg)",
+            "parameters": [
+                {"name": "cfg", "type": "FooConfig", "raw": "FooConfig cfg"},
+            ],
+            "code": "int foo_open(FooConfig cfg) { return 0; }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+        },
+    ]
+    analysis = {
+        "query_type": "example_generation",
+        "needs_file": True,
+        "primary_function_name": "foo_open",
+        "function_names": ["foo_open"],
+    }
+    type_init_index = {
+        "version": 2,
+        "types": {
+            "FooConfig": [
+                {
+                    "kind": "value_default",
+                    "expr": "",
+                    "function": None,
+                    "self_contained": True,
+                    "count": 1,
+                    "score": 1,
+                }
+            ]
+        },
+        "required_fields_by_function": {
+            "foo_open": [
+                {
+                    "arg_index": 0,
+                    "arg_name": "cfg",
+                    "type": "FooConfig",
+                    "call_sites": 3,
+                    "fields": [
+                        {
+                            "path": "path",
+                            "access": "dot",
+                            "count": 3,
+                            "support": 1.0,
+                            "required": True,
+                            "sample_expr": "argv[1]",
+                            "self_contained": True,
+                            "evidence": [],
+                        },
+                        {
+                            "path": "enable",
+                            "access": "dot",
+                            "count": 3,
+                            "support": 1.0,
+                            "required": True,
+                            "sample_expr": "1",
+                            "self_contained": True,
+                            "evidence": [],
+                        },
+                    ],
+                }
+            ]
+        },
+    }
+
+    ans = ask_core.build_example_answer_from_context(
+        frags,
+        analysis=analysis,
+        type_init_index=type_init_index,
+    )
+
+    assert "FooConfig cfg{};" in ans
+    assert "cfg.path = argv[1];" in ans
+    assert "cfg.enable = 1;" in ans
+
+
+def test_regex_parameter_parser_handles_qualified_function_pointer_and_parameter_pack():
+    params_text = "void (* const cb)(int), Args&&... args"
+    parsed = index_core.parse_parameters_simple(params_text)
+    assert [p["name"] for p in parsed] == ["cb", "args"]
+
+
+def test_regex_extractor_handles_very_long_signature_over_100_lines():
+    params = ",\n".join([f"    int p{i}" for i in range(1, 121)])
+    text = (
+        "int huge_signature(\n"
+        f"{params}\n"
+        ") {\n"
+        "    return p1;\n"
+        "}\n"
+    )
+    funcs = index_core.extract_functions_regex("sample.cpp", text)
+    by_name = {f["name"]: f for f in funcs}
+    assert "huge_signature" in by_name
+    assert len(by_name["huge_signature"]["parameters"]) == 120
