@@ -4,6 +4,7 @@ import re
 from typing import Any, Dict, List, Set
 
 from .base import LanguageFrontend, LanguageProfile
+from .java_calls import detect_call_details as _detect_call_details_impl
 
 
 JAVA_PROFILE = LanguageProfile(
@@ -121,6 +122,9 @@ class JavaFrontend(LanguageFrontend):
 
     def extra_regex_bad_prefixes(self):
         return ("interface ", "enum ", "record ", "package ", "import ")
+
+    def detect_call_details(self, body: str, control_keywords: Set[str]) -> List[Dict[str, Any]]:
+        return _detect_call_details_impl(body or "", control_keywords)
 
 
 JAVA_FRONTEND = JavaFrontend()

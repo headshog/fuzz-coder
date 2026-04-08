@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from .base import LanguageFrontend, LanguageProfile
+from .ask_adapters import (
+    AskLanguageAdapter,
+    get_ask_language_adapter as _get_ask_language_adapter_impl,
+    infer_ask_language_from_fragments as _infer_ask_language_from_fragments_impl,
+)
 from .c_cpp import C_CPP_FRONTEND, C_CPP_PROFILE
 from .java import JAVA_FRONTEND, JAVA_PROFILE
 
@@ -33,3 +38,13 @@ def get_language_frontend(name: str) -> LanguageFrontend:
 def get_supported_language_names():
     """Return supported language profile names."""
     return sorted(_PROFILES.keys())
+
+
+def get_ask_language_adapter(name: str) -> AskLanguageAdapter:
+    """Lookup ask-time language adapter (call/dataflow heuristics)."""
+    return _get_ask_language_adapter_impl(name)
+
+
+def infer_ask_language_from_fragments(frags, default: str = "c_cpp") -> str:
+    """Infer language name from retrieved fragments."""
+    return _infer_ask_language_from_fragments_impl(frags, default=default)

@@ -203,7 +203,10 @@ def _load_indices(index_dir: Path):
     function_hints = core.load_json(function_hints_path) if function_hints_path.exists() else {}
     type_init_index_path = index_dir / "type_init_index.json"
     type_init_index = core.load_json(type_init_index_path) if type_init_index_path.exists() else {}
-    return idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index
+    index_meta_path = index_dir / "index_meta.json"
+    index_meta = core.load_json(index_meta_path) if index_meta_path.exists() else {}
+    language_name = (index_meta or {}).get("language")
+    return idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index, language_name
 
 
 def _load_models(args):
@@ -233,7 +236,7 @@ def main():
         print("Run index_fuzz_coder.py first to build the project index.")
         return
 
-    idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index = _load_indices(index_dir)
+    idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index, language_name = _load_indices(index_dir)
     embed_model, reranker = _load_models(args)
     planner = core.QueryPlanner(special_indices, symbols, call_graph, called_by, meta=meta)
 
@@ -250,6 +253,7 @@ def main():
         called_by=called_by,
         function_hints=function_hints,
         type_init_index=type_init_index,
+        language_name=language_name,
         config=PipelineConfig(
             top_k=args.top_k,
             rerank_top_k=args.rerank_top_k,

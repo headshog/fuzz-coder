@@ -566,6 +566,7 @@ class QueryPipeline:
         called_by=None,
         function_hints=None,
         type_init_index=None,
+        language_name: Optional[str] = None,
         shadow_runner: Optional[Callable[[str, List[Any]], PipelineResult]] = None,
     ):
         self.core = core_module
@@ -580,6 +581,7 @@ class QueryPipeline:
         self.called_by = called_by or {}
         self.function_hints = function_hints or {}
         self.type_init_index = type_init_index or {}
+        self.language_name = language_name
         self.config = config
         self._shadow_runner = shadow_runner
 
@@ -705,7 +707,11 @@ class QueryPipeline:
 
             v1_context = None
             if not use_grounding_v2 or grounding_shadow:
-                v1_context = self.core.build_example_context(frags, analysis=analysis)
+                v1_context = self.core.build_example_context(
+                    frags,
+                    analysis=analysis,
+                    language_name=self.language_name,
+                )
 
             v2_context = None
             if use_grounding_v2 or grounding_shadow:

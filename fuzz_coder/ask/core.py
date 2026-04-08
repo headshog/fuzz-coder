@@ -1449,9 +1449,9 @@ def build_thinking_prompt(frags, q, analysis=None, conversation_history=None):
     return _build_thinking_prompt_impl(frags, q, analysis=analysis, conversation_history=conversation_history)
 
 
-def build_example_context(frags, analysis=None):
+def build_example_context(frags, analysis=None, language_name=None):
     """Build structured context facts for example-generation."""
-    return _build_example_context_impl(frags, analysis=analysis)
+    return _build_example_context_impl(frags, analysis=analysis, language_name=language_name)
 
 
 def build_example_context_grounded(

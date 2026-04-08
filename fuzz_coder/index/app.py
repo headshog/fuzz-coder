@@ -126,7 +126,7 @@ def main():
 
         for fn in funcs:
             fn["file"] = str(f)
-            fn["calls"] = core.detect_calls(fn["body"])
+            fn["calls"] = core.detect_calls(fn["body"], language_name=args.language)
 
             # Detect input type
             input_info = core.detect_input_type(fn["code"])
@@ -146,7 +146,7 @@ def main():
 
     # Build call graph
     print("Building call graph...")
-    call_graph, called_by = core.build_call_graph(chunks)
+    call_graph, called_by = core.build_call_graph(chunks, language_name=args.language)
 
     # Build embeddings
     print("Building semantic embeddings...")
@@ -194,6 +194,10 @@ def main():
     # Save reverse call index (called_by)
     with open(out/"called_by.json", "w") as f:
         json.dump(dict(called_by), f)
+
+    # Save index metadata for ask/runtime language-aware behavior.
+    with open(out/"index_meta.json", "w") as f:
+        json.dump({"language": args.language}, f)
 
     # Create special indices for different query types
     stdin_indices = [i for i, c in enumerate(chunks) if c.get("has_stdin")]

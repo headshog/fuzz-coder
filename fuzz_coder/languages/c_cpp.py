@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Set
 
 from .base import LanguageFrontend, LanguageProfile
+from .c_cpp_calls import detect_call_details as _detect_call_details_impl
 
 
 C_CPP_PROFILE = LanguageProfile(
@@ -129,6 +130,9 @@ class CCppFrontend(LanguageFrontend):
                 "parser": "tree-sitter",
             })
         return functions
+
+    def detect_call_details(self, body: str, control_keywords: Set[str]) -> List[Dict[str, Any]]:
+        return _detect_call_details_impl(body or "", control_keywords)
 
 
 C_CPP_FRONTEND = CCppFrontend()

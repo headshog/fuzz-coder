@@ -1150,14 +1150,14 @@ def find_matching_paren(text, pos):
     return -1
 
 
-def detect_calls(body):
-    """Detect function calls in code body"""
-    return _detect_calls_impl(body, CONTROL_KEYWORDS)
+def detect_calls(body, language_name="c_cpp"):
+    """Detect function calls in code body."""
+    return _detect_calls_impl(body, CONTROL_KEYWORDS, language_name=language_name)
 
 
-def build_call_graph(chunks):
-    """Build a call graph from function chunks"""
-    return _build_call_graph_impl(chunks, CONTROL_KEYWORDS)
+def build_call_graph(chunks, language_name="c_cpp"):
+    """Build a call graph from function chunks."""
+    return _build_call_graph_impl(chunks, CONTROL_KEYWORDS, language_name=language_name)
 
 
 def build_embeddings(chunks, model_name, embedding_backend=None):

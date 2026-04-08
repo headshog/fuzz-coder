@@ -328,6 +328,48 @@ def test_build_call_graph_called_by_is_correct_for_same_name_same_arity_in_diffe
     assert called_by["1"] == [3]
 
 
+def test_build_call_graph_java_uses_member_qualifier_and_arity_for_overload_resolution():
+    chunks = [
+        {
+            "id": 0,
+            "name": "parsePayload",
+            "signature": "parsePayload(byte[] data)",
+            "file": "/repo/src/parser/Parser.java",
+            "body": "return data.length;",
+        },
+        {
+            "id": 1,
+            "name": "parsePayload",
+            "signature": "parsePayload(byte[] data, int n)",
+            "file": "/repo/src/parser/Parser.java",
+            "body": "return n;",
+        },
+        {
+            "id": 2,
+            "name": "callerOne",
+            "signature": "callerOne(byte[] data)",
+            "file": "/repo/src/parser/Parser.java",
+            "body": "return Parser.parsePayload(data);",
+        },
+        {
+            "id": 3,
+            "name": "callerTwo",
+            "signature": "callerTwo(byte[] data, int n)",
+            "file": "/repo/src/parser/Parser.java",
+            "body": "return Parser.parsePayload(data, n);",
+        },
+    ]
+
+    call_graph, called_by = index_core.build_call_graph(chunks, language_name="java")
+
+    assert call_graph[2]["resolved_calls"] == [0]
+    assert call_graph[3]["resolved_calls"] == [1]
+    assert any(d["qualified"] == "Parser.parsePayload" and d["arity"] == 1 for d in call_graph[2]["call_details"])
+    assert any(d["qualified"] == "Parser.parsePayload" and d["arity"] == 2 for d in call_graph[3]["call_details"])
+    assert 2 in called_by["0"]
+    assert 3 in called_by["1"]
+
+
 def test_regex_extractor_skips_prototypes_and_uses_local_body_brace():
     text = """
     LLAMA_API struct llama_sampler * llama_sampler_init_penalties(int32_t penalty_last_n, float penalty_repeat, float penalty_freq, float penalty_present);
@@ -852,6 +894,83 @@ def test_deterministic_example_fallback_uses_allocator_for_context_pointer_when_
     assert "if (!s) {" in ans
     assert "Failed to initialize s" in ans
     assert "AVFormatContext s_obj{};" not in ans
+
+
+def test_deterministic_example_fallback_uses_java_generator_when_language_is_java():
+    frags = [
+        {
+            "id": 0,
+            "name": "parsePayload",
+            "file": "/repo/src/parser/Parser.java",
+            "start_line": 10,
+            "end_line": 60,
+            "signature": "parsePayload(byte[] data, int n)",
+            "parameters": [
+                {"name": "data", "type": "byte[]", "raw": "byte[] data"},
+                {"name": "n", "type": "int", "raw": "int n"},
+            ],
+            "code": "static int parsePayload(byte[] data, int n) { return n; }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+        },
+    ]
+    analysis = {
+        "query_type": "example_generation",
+        "needs_file": True,
+        "primary_function_name": "parsePayload",
+        "function_names": ["parsePayload"],
+    }
+    example_context = {
+        "target": frags[0],
+        "caller": None,
+        "observed_call": None,
+        "language": "java",
+    }
+
+    ans = ask_core.build_example_answer_from_context(
+        frags,
+        analysis=analysis,
+        example_context=example_context,
+    )
+
+    assert "```java" in ans
+    assert "import java.nio.file.Files;" in ans
+    assert "Path.of(args[0])" in ans
+    assert "std::ifstream" not in ans
+    assert "parsePayload(" in ans
+
+
+def test_deterministic_example_fallback_auto_detects_java_from_fragment_paths():
+    frags = [
+        {
+            "id": 0,
+            "name": "decodeHeader",
+            "file": "/repo/src/parser/HeaderDecoder.java",
+            "start_line": 10,
+            "end_line": 40,
+            "signature": "decodeHeader(String line)",
+            "parameters": [
+                {"name": "line", "type": "String", "raw": "String line"},
+            ],
+            "code": "static int decodeHeader(String line) { return line.length(); }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+        },
+    ]
+    analysis = {
+        "query_type": "example_generation",
+        "needs_file": True,
+        "primary_function_name": "decodeHeader",
+        "function_names": ["decodeHeader"],
+    }
+
+    ans = ask_core.build_example_answer_from_context(frags, analysis=analysis)
+
+    assert "```java" in ans
+    assert "public static void main(String[] args) throws Exception" in ans
+    assert "decodeHeader(" in ans
 
 
 def test_build_type_init_index_collects_struct_init_patterns():
