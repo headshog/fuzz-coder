@@ -391,20 +391,85 @@ def _candidate_allocators_for_type(type_name):
     lowered = nominal.lower()
     if lowered.endswith("context") and len(lowered) > len("context"):
         _add_base(lowered[: -len("context")])
+    if lowered.endswith("ctx") and len(lowered) > len("ctx"):
+        _add_base(lowered[: -len("ctx")])
+    if lowered.endswith("state") and len(lowered) > len("state"):
+        _add_base(lowered[: -len("state")])
+    if lowered.endswith("config") and len(lowered) > len("config"):
+        _add_base(lowered[: -len("config")])
+    if lowered.endswith("params") and len(lowered) > len("params"):
+        _add_base(lowered[: -len("params")])
+    if lowered.endswith("param") and len(lowered) > len("param"):
+        _add_base(lowered[: -len("param")])
 
     parts = [p.lower() for p in _split_camel_type_tokens(nominal) if p]
     if parts and parts[-1] in {"context", "ctx", "state", "config", "params", "param"}:
         parts = parts[:-1]
     if parts:
         _add_base("".join(parts))
+        _add_base("_".join(parts))
+        if len(parts) >= 2:
+            _add_base(parts[0] + parts[1])
+            _add_base(parts[0])
+
+    if "_" in lowered:
+        segments = [s for s in lowered.split("_") if s]
+        if segments and segments[-1] in {"context", "ctx", "state", "config", "params", "param"}:
+            segments = segments[:-1]
+        if segments:
+            _add_base("_".join(segments))
+            _add_base("".join(segments))
+            _add_base(segments[0])
 
     out = []
     seen_fn = set()
+    suffixes = [
+        "_alloc_context",
+        "_context_alloc",
+        "_context_create",
+        "_ctx_alloc",
+        "_ctx_create",
+        "_alloc",
+        "_create",
+        "_new",
+        "_open",
+        "_init",
+        "_default",
+        "_defaults",
+        "_default_config",
+        "_default_params",
+    ]
     for base in bases:
-        fn = f"{base}_alloc_context"
-        if fn not in seen_fn:
-            seen_fn.add(fn)
-            out.append(fn)
+        for suffix in suffixes:
+            fn = f"{base}{suffix}"
+            if fn not in seen_fn:
+                seen_fn.add(fn)
+                out.append(fn)
+
+    # Extra compact naming patterns to catch APIs like DGifOpenFileName.
+    compact_suffixes = [
+        "open",
+        "openfile",
+        "openfilename",
+        "openfilepath",
+        "create",
+        "init",
+        "alloc",
+        "new",
+        "contextcreate",
+        "contextalloc",
+        "alloccontext",
+    ]
+    for base in bases:
+        compact_base = base.replace("_", "")
+        for stem in [base, compact_base]:
+            for prefix in ["", "d", "e"]:
+                s = f"{prefix}{stem}"
+                for suffix in compact_suffixes:
+                    for fn in [f"{s}{suffix}", f"{s}_{suffix}"]:
+                        if fn not in seen_fn:
+                            seen_fn.add(fn)
+                            out.append(fn)
     return out
 
 
@@ -480,6 +545,157 @@ def _build_function_effects_lookup(type_init_index):
             clean.append(e)
         if clean:
             out[fn] = clean
+    return out
+
+
+def _build_init_recipe_lookup(type_init_index):
+    raw = type_init_index or {}
+    if not isinstance(raw, dict):
+        return {}
+    by_type = raw.get("init_recipes_by_type")
+    if not isinstance(by_type, dict):
+        return {}
+    out = {}
+    for tname, entries in by_type.items():
+        if not isinstance(tname, str) or not tname:
+            continue
+        if not isinstance(entries, list):
+            continue
+        clean = []
+        for e in entries:
+            if isinstance(e, dict):
+                clean.append(e)
+        if clean:
+            out[tname.lower()] = clean
+    return out
+
+
+def _is_self_contained_call_expr(expr):
+    """Conservative check for call expressions that can be reused in fallback code."""
+    e = str(expr or "").strip()
+    if not e:
+        return False
+    m = re.fullmatch(r"((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*\((.*)\)", e)
+    if not m:
+        return False
+
+    args_text = (m.group(2) or "").strip()
+    if not args_text:
+        return True
+
+    args = _split_top_level_arguments(args_text)
+    if not args:
+        return True
+
+    for raw_arg in args:
+        arg = str(raw_arg or "").strip()
+        if not arg:
+            continue
+        if _is_simple_literal(arg):
+            continue
+        if re.search(r"\bargv\s*\[\s*1\s*\]", arg):
+            continue
+        if re.search(r"\binput_bytes\b", arg):
+            continue
+        if re.fullmatch(r"(?:[A-Za-z_]\w*::)*[A-Z_][A-Z0-9_]*", arg):
+            continue
+        if _is_self_contained_call_expr(arg):
+            continue
+        return False
+    return True
+
+
+def _is_recipe_expr_self_contained(expr):
+    e = str(expr or "").strip()
+    if not e:
+        return False
+    if _is_self_contained_field_expr(e):
+        return True
+    if _is_self_contained_call_expr(e):
+        return True
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", e):
+        return True
+    if re.fullmatch(r"(?:[A-Za-z_]\w*::)*[A-Z_][A-Z0-9_]*", e):
+        return True
+    return False
+
+
+def _pick_init_recipe_candidate(entries, target_name, arg_index):
+    if not entries:
+        return None
+    target = str(target_name or "").strip()
+    ranked = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        etarget = str(e.get("target_function", "")).strip()
+        eidx = int(e.get("arg_index", -1))
+        priority = 0
+        if target and etarget == target and eidx == int(arg_index):
+            priority = 3
+        elif target and etarget == target:
+            priority = 2
+        elif eidx == int(arg_index):
+            priority = 1
+        score = int(e.get("score", 0))
+        call_sites = int(e.get("call_sites", 0))
+        fields_len = len(list(e.get("fields") or []))
+        has_alloc = bool(str(e.get("allocator_expr", "")).strip())
+        ranked.append((priority, score, call_sites, has_alloc, fields_len, e))
+    if not ranked:
+        return None
+    # Do not sort raw tuples containing dict payloads; ties would compare dicts.
+    best = max(ranked, key=lambda row: (row[0], row[1], row[2], row[3], row[4]))
+    return best[-1]
+
+
+def _infer_init_recipe_hints(params, target_name, type_init_index=None):
+    recipe_lookup = _build_init_recipe_lookup(type_init_index)
+    out = {}
+    for i, p in enumerate(params or []):
+        pname = str(p.get("name", "")).strip() or f"arg{i}"
+        ptype = _infer_effective_param_type(p, pname)
+        nominal = _extract_nominal_type_name(ptype)
+        if not nominal:
+            continue
+        candidate = _pick_init_recipe_candidate(
+            recipe_lookup.get(nominal.lower(), []),
+            target_name=target_name,
+            arg_index=i,
+        )
+        if not candidate:
+            continue
+
+        allocator_expr = str(candidate.get("allocator_expr", "")).strip()
+        if allocator_expr and not _is_recipe_expr_self_contained(allocator_expr):
+            allocator_expr = ""
+
+        fields = []
+        for f in list(candidate.get("fields") or []):
+            if not isinstance(f, dict):
+                continue
+            path = str(f.get("path", "")).strip()
+            if not path:
+                continue
+            rhs = str(f.get("sample_expr", "")).strip()
+            if rhs and not _is_recipe_expr_self_contained(rhs):
+                rhs = ""
+            fields.append({
+                "path": path,
+                "access": str(f.get("access", "dot")),
+                "support": float(f.get("support", 0.0)),
+                "sample_expr": rhs,
+            })
+        fields.sort(key=lambda x: float(x.get("support", 0.0)), reverse=True)
+
+        out[i] = {
+            "nominal_type": nominal,
+            "allocator_expr": allocator_expr,
+            "fields": fields[:12],
+            "score": int(candidate.get("score", 0)),
+            "call_sites": int(candidate.get("call_sites", 0)),
+            "source": "init_recipe_index",
+        }
     return out
 
 
@@ -676,6 +892,40 @@ def _build_required_field_init_lines(required_field_hints, params, arg_exprs, an
     return lines
 
 
+def _build_recipe_field_init_lines(recipe_hints, params, arg_exprs, analysis):
+    lines = []
+    seen = set()
+    for i, hint in (recipe_hints or {}).items():
+        if i >= len(params) or i >= len(arg_exprs):
+            continue
+        p = params[i]
+        pname = str(p.get("name", "")).strip() or f"arg{i}"
+        ptype = _infer_effective_param_type(p, pname)
+        base, op = _extract_bound_base_for_field_init(arg_exprs[i], ptype)
+        if not base or not op:
+            continue
+
+        picked = sorted(
+            list((hint or {}).get("fields") or []),
+            key=lambda x: float(x.get("support", 0.0)),
+            reverse=True,
+        )[:6]
+        for f in picked:
+            path = str(f.get("path", "")).strip()
+            if not path:
+                continue
+            lhs = f"{base}{op}{path}"
+            rhs = str(f.get("sample_expr", "")).strip()
+            if not _is_self_contained_field_expr(rhs):
+                rhs = _default_rhs_for_field_path(path, analysis)
+            stmt = f"{lhs} = {rhs};"
+            if stmt in seen:
+                continue
+            seen.add(stmt)
+            lines.append(stmt)
+    return lines
+
+
 def _pick_type_init_candidate(entries, want_pointer):
     if not entries:
         return None
@@ -693,18 +943,57 @@ def _pick_type_init_candidate(entries, want_pointer):
         expr = str(e.get("expr") or "").strip()
         if not expr and kind != "value_default":
             continue
-        if kind in {"pointer_call", "value_call"} and not bool(e.get("self_contained")):
-            continue
+        self_contained = bool(e.get("self_contained"))
         score = int(e.get("score", 0)) + int(e.get("count", 0))
-        candidates.append((prioritized_kinds.index(kind), -score, len(expr), e))
+        quality_rank = 0 if self_contained else 1
+        candidates.append((prioritized_kinds.index(kind), quality_rank, -score, len(expr), e))
 
     if not candidates:
         return None
     candidates.sort()
-    return candidates[0][3]
+    return candidates[0][4]
 
 
-def _infer_type_init_hints(params, symbols, type_init_index=None):
+def _default_call_arg_for_fallback(arg_expr, analysis):
+    arg = str(arg_expr or "").strip()
+    if not arg:
+        return "0"
+    if _is_simple_literal(arg):
+        return arg
+    if re.search(r"\bargv\s*\[\s*1\s*\]", arg):
+        return "argv[1]"
+    if "input_bytes" in arg:
+        return "input_bytes.data()"
+    if re.fullmatch(r"&\s*[A-Za-z_]\w*", arg):
+        return "0"
+    if _is_simple_identifier(arg):
+        low = arg.lower()
+        if bool((analysis or {}).get("needs_file")) and any(
+            k in low for k in ["path", "file", "filename", "fname", "name", "model"]
+        ):
+            return "argv[1]"
+        return "0"
+    if re.search(r"\b(path|file|filename|name|model)\b", arg, flags=re.IGNORECASE):
+        if bool((analysis or {}).get("needs_file")):
+            return "argv[1]"
+    return "0"
+
+
+def _sanitize_call_expr_for_fallback(expr, analysis):
+    e = str(expr or "").strip()
+    m = re.fullmatch(r"((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*\((.*)\)", e)
+    if not m:
+        return e
+    fn = str(m.group(1) or "").strip()
+    args_text = (m.group(2) or "").strip()
+    args = _split_top_level_arguments(args_text) if args_text else []
+    if not args:
+        return f"{fn}()"
+    safe_args = [_default_call_arg_for_fallback(a, analysis) for a in args]
+    return f"{fn}({', '.join(safe_args)})"
+
+
+def _infer_type_init_hints(params, symbols, type_init_index=None, analysis=None):
     lookup = _build_symbol_lookup(symbols)
     type_lookup = _build_type_init_lookup(type_init_index)
     if not lookup:
@@ -722,12 +1011,18 @@ def _infer_type_init_hints(params, symbols, type_init_index=None):
 
         from_type_index = _pick_type_init_candidate(type_lookup.get(nominal.lower(), []), want_pointer=is_pointer)
         if from_type_index:
+            kind = str(from_type_index.get("kind") or "")
+            expr = str(from_type_index.get("expr") or "").strip()
+            self_contained = bool(from_type_index.get("self_contained"))
+            if kind in {"pointer_call", "value_call"} and expr and not self_contained:
+                expr = _sanitize_call_expr_for_fallback(expr, analysis=analysis)
             hints[idx] = {
-                "kind": str(from_type_index.get("kind") or ""),
-                "expr": str(from_type_index.get("expr") or "").strip(),
+                "kind": kind,
+                "expr": expr,
                 "function": str(from_type_index.get("function") or "").strip() or None,
                 "nominal_type": nominal,
                 "source": "type_init_index",
+                "self_contained": self_contained,
             }
             continue
 
@@ -746,6 +1041,13 @@ def _infer_type_init_hints(params, symbols, type_init_index=None):
                 }
                 break
     return hints
+
+
+def _extract_call_name_from_expr(expr):
+    m = re.match(r"\s*((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*\(", str(expr or "").strip())
+    if not m:
+        return ""
+    return str(m.group(1) or "").split("::")[-1]
 
 
 def _headers_from_type_init_hints(type_init_hints):
@@ -770,6 +1072,17 @@ def _headers_from_type_init_hints(type_init_hints):
             seen.add(h)
             out.append(h)
     return out
+
+
+def _headers_from_recipe_hints(recipe_hints):
+    fake = {}
+    for i, hint in (recipe_hints or {}).items():
+        alloc = str((hint or {}).get("allocator_expr") or "").strip()
+        fn = _extract_call_name_from_expr(alloc)
+        if not fn:
+            continue
+        fake[i] = {"function": fn}
+    return _headers_from_type_init_hints(fake)
 
 
 def _format_file_loc(chunk):
@@ -929,7 +1242,15 @@ def _extract_caller_flow_statements(caller_code, observed_args, max_lines=8):
     return out
 
 
-def _build_param_binding(param, analysis, arg_hint, used_names, caller_decl_hints=None, type_init_hint=None):
+def _build_param_binding(
+    param,
+    analysis,
+    arg_hint,
+    used_names,
+    caller_decl_hints=None,
+    type_init_hint=None,
+    recipe_hint=None,
+):
     pname = str(param.get("name", "")).strip() or "arg"
     ptype = _infer_effective_param_type(param, pname)
     ptype_lower = ptype.lower()
@@ -1022,6 +1343,16 @@ def _build_param_binding(param, analysis, arg_hint, used_names, caller_decl_hint
             decls.append(f"{value_type} {var} = '\\n';")
             return decls, var
 
+    recipe_allocator_expr = str((recipe_hint or {}).get("allocator_expr") or "").strip()
+    if is_pointer and _pointer_depth(ptype) == 1 and recipe_allocator_expr:
+        ptr_name = _next_unique_name(pname, used_names)
+        decls.append(f"{ptype} {ptr_name} = {recipe_allocator_expr};")
+        decls.append(f"if (!{ptr_name}) {{")
+        decls.append(f"    std::cerr << \"Failed to initialize {pname}\\n\";")
+        decls.append("    return 1;")
+        decls.append("}")
+        return decls, ptr_name
+
     hint_kind = str((type_init_hint or {}).get("kind") or "")
     hint_expr = str((type_init_hint or {}).get("expr") or "").strip()
     if is_pointer and _pointer_depth(ptype) == 1 and hint_kind in {"allocator_call", "pointer_call", "value_call"} and hint_expr:
@@ -1107,7 +1438,17 @@ def build_example_answer_from_context(frags, analysis=None, example_context=None
     target_name = str(target.get("name", "")).strip() or "target_function"
     target_sig = target.get("signature") or f"{target_name}()"
     params = list(target.get("parameters") or [])
-    type_init_hints = _infer_type_init_hints(params, symbols, type_init_index=type_init_index)
+    recipe_hints = _infer_init_recipe_hints(
+        params,
+        target_name=target_name,
+        type_init_index=type_init_index,
+    )
+    type_init_hints = _infer_type_init_hints(
+        params,
+        symbols,
+        type_init_index=type_init_index,
+        analysis=analysis,
+    )
     required_field_hints = _infer_required_field_hints(
         params,
         target_name=target_name,
@@ -1145,6 +1486,7 @@ def build_example_answer_from_context(frags, analysis=None, example_context=None
         "#include <iterator>",
         "#include <iostream>",
     ]
+    include_lines.extend(_headers_from_recipe_hints(recipe_hints))
     include_lines.extend(_headers_from_type_init_hints(type_init_hints))
     if include_target_header:
         include_lines.append(f"#include \"{header_name}\"")
@@ -1182,21 +1524,31 @@ def build_example_answer_from_context(frags, analysis=None, example_context=None
             used_names,
             caller_decl_hints=caller_decl_hints,
             type_init_hint=type_init_hints.get(i),
+            recipe_hint=recipe_hints.get(i),
         )
         decl_lines.extend(d)
         arg_exprs.append(arg)
     body_lines.extend(decl_lines)
+    recipe_field_lines = _build_recipe_field_init_lines(
+        recipe_hints=recipe_hints,
+        params=params,
+        arg_exprs=arg_exprs,
+        analysis=analysis,
+    )
     required_field_lines = _build_required_field_init_lines(
         required_field_hints=required_field_hints,
         params=params,
         arg_exprs=arg_exprs,
         analysis=analysis,
     )
+    if recipe_field_lines:
+        body_lines.extend(recipe_field_lines)
     if required_field_lines:
-        body_lines.extend(required_field_lines)
+        existing = set(recipe_field_lines)
+        body_lines.extend([ln for ln in required_field_lines if ln not in existing])
     if caller_flow_lines:
         body_lines.extend(caller_flow_lines)
-    if decl_lines or required_field_lines or caller_flow_lines:
+    if decl_lines or recipe_field_lines or required_field_lines or caller_flow_lines:
         body_lines.append("")
 
     args_joined = ", ".join(arg_exprs)
@@ -1355,4 +1707,3 @@ def build_parameter_analysis_from_context(frags, analysis=None, example_context=
             )
 
     return "\n".join(lines)
-

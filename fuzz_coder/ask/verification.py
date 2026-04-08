@@ -368,6 +368,104 @@ def _arg_uses_any_var(arg_expr: str, names: List[str]) -> bool:
     return False
 
 
+def _extract_nominal_type_name(type_text: str) -> str:
+    t = re.sub(r"\b(const|volatile|restrict|__restrict__|struct|class|enum)\b", " ", str(type_text or ""))
+    t = t.replace("*", " ").replace("&", " ")
+    tokens = re.findall(r"[A-Za-z_]\w*", t)
+    if not tokens:
+        return ""
+    skip = {
+        "unsigned", "signed", "long", "short", "int", "float", "double", "bool", "void",
+        "size_t", "ssize_t", "auto", "typename",
+    }
+    for tok in reversed(tokens):
+        if tok.lower() not in skip:
+            return tok
+    return ""
+
+
+def _build_strong_recipe_expectations(type_init_index, target_function, target_params):
+    raw = type_init_index or {}
+    if not isinstance(raw, dict):
+        return []
+    by_type = raw.get("init_recipes_by_type")
+    if not isinstance(by_type, dict):
+        return []
+    expected = []
+    target = str(target_function or "").strip()
+    for i, p in enumerate(target_params or []):
+        ptype = str((p or {}).get("type", ""))
+        nominal = _extract_nominal_type_name(ptype)
+        if not nominal:
+            continue
+        entries = list(by_type.get(nominal, [])) + list(by_type.get(nominal.lower(), []))
+        if not entries:
+            continue
+        best = None
+        best_key = None
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            etarget = str(e.get("target_function", "")).strip()
+            eidx = int(e.get("arg_index", -1))
+            priority = 0
+            if target and etarget == target and eidx == i:
+                priority = 3
+            elif target and etarget == target:
+                priority = 2
+            elif eidx == i:
+                priority = 1
+            score = int(e.get("score", 0))
+            call_sites = int(e.get("call_sites", 0))
+            has_alloc = bool(str(e.get("allocator_expr", "")).strip())
+            key = (priority, score, call_sites, has_alloc)
+            if best is None or key > best_key:
+                best = e
+                best_key = key
+        if best is None:
+            continue
+        if best_key[0] <= 0:
+            continue
+        if int(best.get("score", 0)) < 4 and int(best.get("call_sites", 0)) < 1:
+            continue
+        expected.append({
+            "arg_index": i,
+            "nominal": nominal,
+            "allocator_expr": str(best.get("allocator_expr", "")).strip(),
+            "fields": list(best.get("fields") or []),
+            "score": int(best.get("score", 0)),
+            "call_sites": int(best.get("call_sites", 0)),
+        })
+    return expected
+
+
+def _code_uses_default_init_for_nominal(code_text: str, nominal: str) -> bool:
+    code = code_text or ""
+    n = re.escape(str(nominal or "").strip())
+    if not n:
+        return False
+    patterns = [
+        rf"\b{n}\b\s+[A-Za-z_]\w*\s*\{{\s*\}}\s*;",
+        rf"\b{n}\b\s+[A-Za-z_]\w*\s*=\s*\{{\s*\}}\s*;",
+        rf"\b{n}\b\s*\*\s*[A-Za-z_]\w*\s*=\s*&\s*[A-Za-z_]\w+\s*;",
+    ]
+    return any(re.search(p, code) is not None for p in patterns)
+
+
+def _code_contains_allocator_expr(code_text: str, allocator_expr: str) -> bool:
+    expr = str(allocator_expr or "").strip()
+    if not expr:
+        return False
+    call_name = _extract_name_from_signature(f"{expr};") or ""
+    if call_name:
+        return re.search(rf"\b{re.escape(call_name)}\s*\(", code_text or "") is not None
+    m = re.match(r"\s*((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*\(", expr)
+    if m:
+        call_name = str(m.group(1) or "").split("::")[-1]
+        return re.search(rf"\b{re.escape(call_name)}\s*\(", code_text or "") is not None
+    return False
+
+
 def _confidence_level(score: float) -> str:
     if score >= 0.80:
         return "high"
@@ -627,6 +725,7 @@ def verify_example_answer_with_context(
     target_function=None,
     known_functions=None,
     example_context=None,
+    type_init_index=None,
 ):
     """Verify example-generation answer against current context.
 
@@ -695,6 +794,18 @@ def verify_example_answer_with_context(
                 expected_arities.add(ar)
         if expected_arities and target_call_arities:
             target_call_arity_match = any(a in expected_arities for a in target_call_arities)
+
+    target_params = []
+    if target_function:
+        for c in context_frags:
+            if c.get("name") == target_function and isinstance(c.get("parameters"), list):
+                target_params = list(c.get("parameters") or [])
+                break
+    recipe_expectations = _build_strong_recipe_expectations(
+        type_init_index=type_init_index,
+        target_function=target_function,
+        target_params=target_params,
+    )
 
     missing_requirements = set()
     if not file_refs:
@@ -794,6 +905,20 @@ def verify_example_answer_with_context(
             missing_requirements.add("file_data_flow_to_target")
             consistency_issues.add("file_data_not_used_in_target_call")
 
+    default_init_penalized_nominals = []
+    if recipe_expectations and code_block_present:
+        for exp in recipe_expectations:
+            nominal = str(exp.get("nominal", "")).strip()
+            if not nominal:
+                continue
+            alloc_expr = str(exp.get("allocator_expr", "")).strip()
+            if alloc_expr and _code_contains_allocator_expr(text_for_calls, alloc_expr):
+                continue
+            if _code_uses_default_init_for_nominal(text_for_calls, nominal):
+                default_init_penalized_nominals.append(nominal)
+        if default_init_penalized_nominals:
+            consistency_issues.add("default_init_used_despite_recipe")
+
     score = float(base.get("confidence_score", 1.0))
     score -= 0.16 * len(missing_requirements)
     score -= 0.10 * len(consistency_issues)
@@ -811,6 +936,8 @@ def verify_example_answer_with_context(
         score += 0.03
     if requires_file_data and target_uses_file_data:
         score += 0.05
+    if default_init_penalized_nominals:
+        score -= min(0.20, 0.08 * len(set(default_init_penalized_nominals)))
 
     # Keep confidence conservative when consistency checks fail.
     if consistency_issues:
@@ -821,6 +948,8 @@ def verify_example_answer_with_context(
         score = min(score, 0.54)
     if "file_data_not_used_in_target_call" in consistency_issues:
         score = min(score, 0.45)
+    if "default_init_used_despite_recipe" in consistency_issues:
+        score = min(score, 0.60)
 
     score = max(0.0, min(1.0, score))
 
@@ -850,6 +979,8 @@ def verify_example_answer_with_context(
         "has_argv1_in_code": has_argv1,
         "file_source_vars": file_source_vars,
         "file_flow_vars": file_flow_vars,
+        "default_init_penalized_nominals": sorted(set(default_init_penalized_nominals)),
+        "recipe_expectations_count": len(recipe_expectations),
         "consistency_issues": consistency_issues,
         "missing_requirements": missing_requirements,
         "confidence_score": score,

@@ -240,10 +240,12 @@ def main():
     callsite_flow_count = sum(
         len(v) for v in type_init_index.get("callsite_arg_flow", {}).values()
     ) if isinstance(type_init_index, dict) else 0
+    recipe_type_count = len(type_init_index.get("init_recipes_by_type", {})) if isinstance(type_init_index, dict) else 0
     print(f"  - Types with observed init patterns: {types_count}")
     print(f"  - Struct types with field-write evidence: {struct_types_count}")
     print(f"  - Functions with parameter effects: {effects_functions_count}")
     print(f"  - Callsites with arg-flow traces: {callsite_flow_count}")
+    print(f"  - Types with initialization recipes: {recipe_type_count}")
 
 
 if __name__ == "__main__":

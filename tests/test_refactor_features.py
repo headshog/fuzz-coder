@@ -872,11 +872,12 @@ def test_build_type_init_index_collects_struct_init_patterns():
     ]
 
     idx = index_core.build_type_init_index(chunks)
-    assert idx.get("version") == 3
+    assert idx.get("version") == 4
     types = idx.get("types", {})
     assert isinstance(idx.get("struct_field_writes", {}), dict)
     assert isinstance(idx.get("function_effects", {}), dict)
     assert isinstance(idx.get("callsite_arg_flow", {}), dict)
+    assert isinstance(idx.get("init_recipes_by_type", {}), dict)
     assert "AVFormatContext" in types
     assert any(
         e.get("kind") == "pointer_call" and "avformat_alloc_context(" in e.get("expr", "")
@@ -983,6 +984,106 @@ def test_build_type_init_index_collects_required_field_chains_before_target_call
     assert any(f.get("path") == "path" for f in fields)
     assert any(f.get("path") == "enable" for f in fields)
     assert any(bool(f.get("required")) for f in fields)
+
+
+def test_build_type_init_index_collects_init_recipes_by_type():
+    chunks = [
+        {
+            "id": 0,
+            "name": "main",
+            "file": "/repo/src/demo.c",
+            "start_line": 1,
+            "signature": "main(int argc, char ** argv)",
+            "parameters": [
+                {"name": "argc", "type": "int"},
+                {"name": "argv", "type": "char **"},
+            ],
+            "code": (
+                "int main(int argc, char ** argv) {\n"
+                "    FooCtx *ctx = foo_ctx_create();\n"
+                "    ctx->path = argv[1];\n"
+                "    return foo_run(ctx);\n"
+                "}\n"
+            ),
+        },
+        {
+            "id": 1,
+            "name": "foo_run",
+            "file": "/repo/src/foo.c",
+            "start_line": 30,
+            "signature": "foo_run(FooCtx * ctx)",
+            "parameters": [
+                {"name": "ctx", "type": "FooCtx *"},
+            ],
+            "code": "int foo_run(FooCtx * ctx) { return 0; }",
+        },
+    ]
+
+    idx = index_core.build_type_init_index(chunks)
+    recipes = idx.get("init_recipes_by_type", {})
+    assert "FooCtx" in recipes
+    assert recipes["FooCtx"]
+    rec = recipes["FooCtx"][0]
+    assert rec.get("target_function") == "foo_run"
+    assert int(rec.get("arg_index", -1)) == 0
+    assert "foo_ctx_create(" in str(rec.get("allocator_expr", ""))
+    assert any(str(f.get("path", "")) == "path" for f in list(rec.get("fields") or []))
+
+
+def test_deterministic_example_fallback_prefers_init_recipe_allocator_and_fields():
+    frags = [
+        {
+            "id": 0,
+            "name": "foo_run",
+            "file": "/repo/src/foo.c",
+            "start_line": 20,
+            "end_line": 80,
+            "signature": "foo_run(FooCtx * ctx)",
+            "parameters": [
+                {"name": "ctx", "type": "FooCtx *", "raw": "FooCtx * ctx"},
+            ],
+            "code": "int foo_run(FooCtx * ctx) { return 0; }",
+            "has_stdin": False,
+            "has_file_input": True,
+            "has_api_call": False,
+        },
+    ]
+    analysis = {
+        "query_type": "example_generation",
+        "needs_file": True,
+        "primary_function_name": "foo_run",
+        "function_names": ["foo_run"],
+    }
+    type_init_index = {
+        "version": 4,
+        "types": {},
+        "required_fields_by_function": {},
+        "init_recipes_by_type": {
+            "FooCtx": [
+                {
+                    "target_function": "foo_run",
+                    "arg_index": 0,
+                    "arg_name": "ctx",
+                    "score": 9,
+                    "call_sites": 3,
+                    "allocator_expr": "foo_ctx_create()",
+                    "fields": [
+                        {"path": "path", "access": "arrow", "support": 1.0, "sample_expr": "argv[1]"},
+                    ],
+                }
+            ]
+        },
+    }
+
+    ans = ask_core.build_example_answer_from_context(
+        frags,
+        analysis=analysis,
+        type_init_index=type_init_index,
+    )
+
+    assert "FooCtx * ctx = foo_ctx_create();" in ans
+    assert "ctx->path = argv[1];" in ans
+    assert "foo_run(ctx);" in ans
 
 
 def test_deterministic_example_fallback_applies_required_field_hints():

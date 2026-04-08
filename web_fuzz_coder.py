@@ -453,9 +453,12 @@ def _build_pipeline_for_index(index_dir: Path, args, embed_model, reranker):
 def _create_chatbot():
     """Create Chatbot and infer its effective history mode from the instance itself."""
     try:
-        chatbot = gr.Chatbot(height=820, type="messages")
+        chatbot = gr.Chatbot(type="messages", elem_id="main_chatbot")
     except TypeError:
-        chatbot = gr.Chatbot(height=820)
+        try:
+            chatbot = gr.Chatbot(elem_id="main_chatbot")
+        except TypeError:
+            chatbot = gr.Chatbot()
 
     mode = getattr(chatbot, "type", None)
     if isinstance(mode, str):
@@ -1015,6 +1018,16 @@ def main():
       background: #2563eb !important;
       border-color: #2563eb !important;
       color: white !important;
+    }
+    #main_chatbot {
+      height: calc(100vh - 340px) !important;
+      min-height: 360px !important;
+    }
+    @media (max-width: 980px) {
+      #main_chatbot {
+        height: calc(100vh - 390px) !important;
+        min-height: 300px !important;
+      }
     }
     """
 

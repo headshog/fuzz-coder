@@ -385,6 +385,7 @@ def _verify_answer(
             target_function=analysis.get("primary_function_name"),
             known_functions=set(symbols.keys()),
             example_context=example_context,
+            type_init_index=type_init_index,
         )
         _print_confidence(verification, verbose, "Example")
         force_fallback = False
@@ -417,6 +418,7 @@ def _verify_answer(
                     target_function=analysis.get("primary_function_name"),
                     known_functions=set(symbols.keys()),
                     example_context=example_context,
+                    type_init_index=type_init_index,
                 )
                 _print_confidence(cand_ver, verbose, f"Example(candidate {idx})")
                 candidate_evals.append(

@@ -1561,6 +1561,19 @@ def _field_rhs_score(expr):
     return 1
 
 
+def _recipe_rhs_score(expr):
+    e = _normalize_expr(expr)
+    if _is_self_contained_call_expr(e):
+        return 8
+    if _is_literal_like_token(e):
+        return 6
+    if re.fullmatch(r"(?:[A-Za-z_]\w*::)*[A-Z_][A-Z0-9_]*", e):
+        return 5
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", e):
+        return 4
+    return 1
+
+
 def build_type_init_index(chunks, max_per_type=16):
     """Build v3 structural dataflow index for better example grounding."""
     by_type = defaultdict(dict)  # type -> (kind, expr) -> aggregated record
@@ -1596,6 +1609,7 @@ def build_type_init_index(chunks, max_per_type=16):
     helper_effect_lookup = defaultdict(list)  # (helper_fn,arg_index) -> [{"type","writes"}]
     callsite_arg_flow = defaultdict(list)
     req = {}
+    recipe_acc = {}
 
     def _ensure_req_bucket(target_name, arg_index, arg_name, nominal):
         key = (str(target_name), int(arg_index), str(arg_name), str(nominal))
@@ -1625,6 +1639,47 @@ def build_type_init_index(chunks, max_per_type=16):
                 "rhs": defaultdict(int),
                 "evidence": [],
                 "sources": defaultdict(int),
+            }
+            bucket["fields"][fkey] = rec
+        rec["count"] += 1
+        rhs_norm = _normalize_expr(rhs) if rhs else ""
+        if rhs_norm:
+            rec["rhs"][rhs_norm] += 1
+        rec["sources"][str(source_tag or "unknown")] += 1
+        if evidence and len(rec["evidence"]) < 4:
+            rec["evidence"].append(dict(evidence))
+
+    def _ensure_recipe_bucket(nominal, target_name, arg_index, arg_name, is_pointer):
+        key = (str(nominal), str(target_name), int(arg_index), str(arg_name))
+        bucket = recipe_acc.get(key)
+        if bucket is None:
+            bucket = {
+                "type": key[0],
+                "target_function": key[1],
+                "arg_index": key[2],
+                "arg_name": key[3],
+                "is_pointer": bool(is_pointer),
+                "call_sites": 0,
+                "var_assign": defaultdict(int),  # rhs -> count
+                "fields": {},  # (path,access) -> rec
+                "evidence": [],
+            }
+            recipe_acc[key] = bucket
+        return bucket
+
+    def _add_recipe_field(bucket, *, path, access, rhs, evidence, source_tag):
+        if not path:
+            return
+        fkey = (str(path), str(access or "dot"))
+        rec = bucket["fields"].get(fkey)
+        if rec is None:
+            rec = {
+                "path": fkey[0],
+                "access": fkey[1],
+                "count": 0,
+                "rhs": defaultdict(int),
+                "sources": defaultdict(int),
+                "evidence": [],
             }
             bucket["fields"][fkey] = rec
         rec["count"] += 1
@@ -1934,6 +1989,10 @@ def build_type_init_index(chunks, max_per_type=16):
                     "base_var": base_var,
                 }
                 if base_var:
+                    hint = var_hints.get(base_var)
+                    if hint and str(hint.get("nominal_type", "")).strip():
+                        arg_row["nominal_type"] = str(hint.get("nominal_type", "")).strip()
+
                     chain = _extract_dependency_chain(code, base_var, before_line=cs_line, max_steps=8)
                     if chain:
                         arg_row["dependency_chain"] = chain
@@ -2031,6 +2090,34 @@ def build_type_init_index(chunks, max_per_type=16):
                     )
                     bucket["call_sites"] += 1
 
+                    recipe_bucket = _ensure_recipe_bucket(
+                        nominal,
+                        str(target.get("name", "")).strip(),
+                        i,
+                        str(param.get("name", "")).strip() or f"arg{i}",
+                        bool(hint.get("is_pointer")),
+                    )
+                    recipe_bucket["call_sites"] += 1
+                    if len(recipe_bucket["evidence"]) < 4:
+                        recipe_bucket["evidence"].append({
+                            "file": file_path,
+                            "line": start_line + cs_line - 1 if cs_line > 0 else start_line,
+                            "function": caller_name,
+                        })
+
+                    chain = _extract_dependency_chain(code, base_var, before_line=cs_line, max_steps=8)
+                    for ch in chain:
+                        stmt = str(ch.get("statement", "")).strip()
+                        m_assign = re.match(r"^\s*(?P<lhs>[A-Za-z_]\w*)\s*=\s*(?P<rhs>[^;]+)\s*;\s*$", stmt)
+                        if not m_assign:
+                            continue
+                        if str(m_assign.group("lhs") or "").strip() != base_var:
+                            continue
+                        rhs_norm = _normalize_expr(m_assign.group("rhs") or "")
+                        if not rhs_norm:
+                            continue
+                        recipe_bucket["var_assign"][rhs_norm] += 1
+
                     seen_fields = set()
                     for fa in field_assignments:
                         if str(fa.get("base", "")) != base_var:
@@ -2043,6 +2130,18 @@ def build_type_init_index(chunks, max_per_type=16):
                         seen_fields.add(k)
                         _add_req_field(
                             bucket,
+                            path=k[0],
+                            access=k[1],
+                            rhs=fa.get("rhs", ""),
+                            evidence={
+                                "file": file_path,
+                                "line": start_line + int(fa.get("line", 0)),
+                                "function": caller_name,
+                            },
+                            source_tag="direct_field_write",
+                        )
+                        _add_recipe_field(
+                            recipe_bucket,
                             path=k[0],
                             access=k[1],
                             rhs=fa.get("rhs", ""),
@@ -2066,6 +2165,18 @@ def build_type_init_index(chunks, max_per_type=16):
                                 for wr in list(he.get("writes") or []):
                                     _add_req_field(
                                         bucket,
+                                        path=str(wr.get("path", "")),
+                                        access=str(wr.get("access", "dot")),
+                                        rhs=str(wr.get("sample_expr", "")),
+                                        evidence={
+                                            "file": file_path,
+                                            "line": start_line + int(prev.get("line", 0)),
+                                            "function": caller_name,
+                                        },
+                                        source_tag=f"helper:{p_name}",
+                                    )
+                                    _add_recipe_field(
+                                        recipe_bucket,
                                         path=str(wr.get("path", "")),
                                         access=str(wr.get("access", "dot")),
                                         rhs=str(wr.get("sample_expr", "")),
@@ -2158,11 +2269,98 @@ def build_type_init_index(chunks, max_per_type=16):
     for caller, rows in callsite_arg_flow.items():
         callsite_arg_flow_out[caller] = rows[:128]
 
+    init_recipes_by_type = defaultdict(list)
+    for _, bucket in recipe_acc.items():
+        fields = []
+        nontrivial_field_count = 0
+        for _, frec in bucket["fields"].items():
+            rhs_items = sorted(
+                frec["rhs"].items(),
+                key=lambda x: (_recipe_rhs_score(x[0]), x[1], len(str(x[0]))),
+                reverse=True,
+            )
+            sample_expr = rhs_items[0][0] if rhs_items else ""
+            if sample_expr and _recipe_rhs_score(sample_expr) >= 4:
+                nontrivial_field_count += 1
+            fields.append({
+                "path": frec["path"],
+                "access": frec["access"],
+                "count": int(frec["count"]),
+                "support": round(float(frec["count"]) / max(1, int(bucket.get("call_sites", 0))), 4),
+                "sample_expr": sample_expr,
+                "sources": {k: int(v) for k, v in sorted(frec["sources"].items(), key=lambda x: (-x[1], x[0]))},
+                "evidence": list(frec["evidence"]),
+            })
+        fields.sort(key=lambda x: (x.get("support", 0.0), x.get("count", 0), len(str(x.get("path", ""))), _recipe_rhs_score(x.get("sample_expr", ""))), reverse=True)
+
+        var_assign_items = sorted(
+            bucket["var_assign"].items(),
+            key=lambda x: (_recipe_rhs_score(x[0]), x[1], len(str(x[0]))),
+            reverse=True,
+        )
+        allocator_expr = ""
+        for expr, _ in var_assign_items:
+            if _is_self_contained_call_expr(expr):
+                allocator_expr = expr
+                break
+        if not allocator_expr and var_assign_items:
+            allocator_expr = var_assign_items[0][0]
+
+        step_statements = []
+        if allocator_expr:
+            step_statements.append({
+                "statement": f"$arg = {allocator_expr};",
+                "kind": "value_assign",
+            })
+        for f in fields[:12]:
+            access_op = "->" if str(f.get("access")) == "arrow" else "."
+            rhs = str(f.get("sample_expr", "")).strip() or "{}"
+            step_statements.append({
+                "statement": f"$arg{access_op}{f.get('path', '')} = {rhs};",
+                "kind": "field_write",
+            })
+
+        recipe_score = (
+            int(bucket.get("call_sites", 0)) * 3
+            + (4 if allocator_expr else 0)
+            + min(6, nontrivial_field_count * 2)
+            + min(6, len(fields))
+        )
+
+        row = {
+            "target_function": bucket["target_function"],
+            "arg_index": int(bucket["arg_index"]),
+            "arg_name": bucket["arg_name"],
+            "is_pointer": bool(bucket.get("is_pointer")),
+            "call_sites": int(bucket.get("call_sites", 0)),
+            "score": int(recipe_score),
+            "allocator_expr": allocator_expr,
+            "fields": fields[:16],
+            "steps": step_statements[:16],
+            "evidence": list(bucket.get("evidence", []))[:6],
+        }
+        if row["allocator_expr"] or row["fields"]:
+            init_recipes_by_type[bucket["type"]].append(row)
+
+    init_recipes_out = {}
+    for nominal, rows in init_recipes_by_type.items():
+        rows.sort(
+            key=lambda r: (
+                int(r.get("score", 0)),
+                int(r.get("call_sites", 0)),
+                bool(r.get("allocator_expr")),
+                len(list(r.get("fields") or [])),
+            ),
+            reverse=True,
+        )
+        init_recipes_out[nominal] = rows[: max(8, max_per_type * 3)]
+
     return {
-        "version": 3,
+        "version": 4,
         "types": types_out,
         "struct_field_writes": struct_field_writes_out,
         "function_effects": function_effects_out,
         "callsite_arg_flow": callsite_arg_flow_out,
         "required_fields_by_function": req_out,
+        "init_recipes_by_type": init_recipes_out,
     }

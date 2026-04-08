@@ -1515,6 +1515,7 @@ def verify_example_answer_with_context(
     target_function=None,
     known_functions=None,
     example_context=None,
+    type_init_index=None,
 ):
     """Verify example-generation answer against file/signature/line evidence and context."""
     return _verify_example_answer_with_context_impl(
@@ -1523,4 +1524,5 @@ def verify_example_answer_with_context(
         target_function=target_function,
         known_functions=known_functions,
         example_context=example_context,
+        type_init_index=type_init_index,
     )

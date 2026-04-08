@@ -415,3 +415,61 @@ Evidence from codebase:
     assert v["is_valid"] is True
     assert v["target_uses_file_data"] is True
     assert "file_data_not_used_in_target_call" not in v["consistency_issues"]
+
+
+def test_example_verification_penalizes_default_init_when_strong_recipe_exists():
+    context = [
+        {
+            "name": "foo_run",
+            "file": "/repo/src/foo.c",
+            "start_line": 10,
+            "end_line": 40,
+            "signature": "foo_run(FooCtx * ctx)",
+            "parameters": [
+                {"name": "ctx", "type": "FooCtx *"},
+            ],
+        },
+    ]
+    answer = """
+```cpp
+int main() {
+    FooCtx ctx_obj{};
+    FooCtx * ctx = &ctx_obj;
+    foo_run(ctx);
+    return 0;
+}
+```
+Evidence from codebase:
+- File: `/repo/src/foo.c:10-40`
+- Signature: `foo_run(FooCtx * ctx)`
+"""
+    type_init_index = {
+        "version": 4,
+        "init_recipes_by_type": {
+            "FooCtx": [
+                {
+                    "target_function": "foo_run",
+                    "arg_index": 0,
+                    "arg_name": "ctx",
+                    "score": 10,
+                    "call_sites": 4,
+                    "allocator_expr": "foo_ctx_create()",
+                    "fields": [
+                        {"path": "path", "access": "arrow", "support": 1.0, "sample_expr": "argv[1]"},
+                    ],
+                }
+            ]
+        },
+    }
+
+    v = verify_example_answer_with_context(
+        answer,
+        context,
+        target_function="foo_run",
+        known_functions={"foo_run"},
+        type_init_index=type_init_index,
+    )
+    assert v["is_valid"] is True
+    assert "default_init_used_despite_recipe" in v["consistency_issues"]
+    assert "FooCtx" in v["default_init_penalized_nominals"]
+    assert v["confidence_level"] in {"medium", "low"}
