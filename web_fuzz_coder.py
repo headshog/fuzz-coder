@@ -422,6 +422,25 @@ def _normalize_uploaded_zip_path(zip_file) -> str:
     return str(zip_file).strip()
 
 
+def _clean_index_log_line(line: str) -> str:
+    txt = str(line or "").replace("\r", "").rstrip("\n")
+    # Strip ANSI escape sequences.
+    txt = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", txt)
+    return txt.strip()
+
+
+def _build_index_status_text(project_name: str, log_lines: List[str]) -> str:
+    tail = list(log_lines[-120:])
+    if not tail:
+        return f"Indexing `{project_name}`..."
+    return (
+        f"Indexing `{project_name}`...\n\n"
+        "```text\n"
+        + "\n".join(tail)
+        + "\n```"
+    )
+
+
 def _run_index_build(
     zip_path: Path,
     out_dir: Path,
@@ -817,72 +836,147 @@ def main():
             keep_zip: bool = True,
             keep_ready: bool = True,
             next_project_name: str | None = None,
+            show_cancel: bool | None = None,
+            show_add: bool | None = None,
+            update_zip_value: bool = False,
         ):
             zip_still_selected = bool(keep_zip and zip_value)
+            add_update = gr.update(interactive=(zip_ready if keep_ready else False))
+            cancel_update = gr.update()
+            zip_update = gr.update()
+            if show_add is not None:
+                add_update = gr.update(
+                    interactive=(zip_ready if keep_ready else False),
+                    visible=show_add,
+                )
+            if show_cancel is not None:
+                cancel_update = gr.update(visible=show_cancel)
+            if update_zip_value:
+                zip_update = gr.update(value=(zip_value if keep_zip else None))
             return (
                 (next_project_name or current_project_name),
                 histories,
                 status_text,
-                gr.update(value=(zip_value if keep_zip else None)),
-                gr.update(interactive=(zip_ready if keep_ready else False), visible=True),
-                gr.update(visible=False),
+                zip_update,
+                add_update,
+                cancel_update,
                 gr.update(visible=zip_still_selected),
                 gr.update(visible=zip_still_selected),
             )
 
         if args.index_dir:
-            return _resp("Adding projects is disabled when started with --index_dir (single-project mode).")
+            yield _resp("Adding projects is disabled when started with --index_dir (single-project mode).")
+            return
 
         if not zip_value:
-            return _resp("Please select a .zip archive first.", keep_zip=False, keep_ready=False)
+            yield _resp("Please select a .zip archive first.", keep_zip=False, keep_ready=False)
+            return
 
         zip_path = Path(zip_value).expanduser().resolve()
         if not zip_path.exists():
-            return _resp(f"Uploaded file is not accessible on server: {zip_path}")
+            yield _resp(f"Uploaded file is not accessible on server: {zip_path}")
+            return
 
         if zip_path.suffix.lower() != ".zip":
-            return _resp(f"Only .zip archives are supported, got: {zip_path.name}")
+            yield _resp(f"Only .zip archives are supported, got: {zip_path.name}")
+            return
 
         base_name = _derive_project_name(zip_path, project_name_input or "")
         if not base_name:
-            return _resp("Unable to derive project name. Please set Project Name explicitly.")
+            yield _resp("Unable to derive project name. Please set Project Name explicitly.")
+            return
         if base_name in project_names or (index_base_dir / f"index_data_{base_name}").exists():
-            return _resp(
+            yield _resp(
                 f"Project `{base_name}` already exists. Choose another project name.",
                 keep_zip=True,
                 keep_ready=True,
             )
+            return
 
         new_project_name = base_name
         new_index_dir = index_base_dir / f"index_data_{new_project_name}"
 
-        ok, details = _run_index_build(
-            zip_path,
-            new_index_dir,
-            language_name,
-            args,
-            active_builds=active_builds,
-            build_key=username,
+        index_entry = Path(__file__).resolve().parent / "index_fuzz_coder.py"
+        cmd = [
+            sys.executable,
+            str(index_entry),
+            "--src",
+            str(zip_path),
+            "--out",
+            str(new_index_dir),
+            "--embed_model",
+            str(args.embed_model),
+            "--embedding_backend",
+            str(args.embedding_backend),
+            "--language",
+            str(language_name),
+        ]
+
+        log_lines: List[str] = []
+        yield _resp(
+            _build_index_status_text(new_project_name, log_lines),
+            keep_zip=True,
+            keep_ready=True,
+            show_cancel=True,
+            show_add=False,
         )
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        active_builds[username] = {"proc": proc, "out_dir": new_index_dir}
+        try:
+            if proc.stdout is not None:
+                for raw in iter(proc.stdout.readline, ""):
+                    clean = _clean_index_log_line(raw)
+                    if not clean:
+                        if proc.poll() is not None:
+                            break
+                        continue
+                    log_lines.append(clean)
+                    if len(log_lines) > 500:
+                        log_lines = log_lines[-300:]
+                    yield _resp(
+                        _build_index_status_text(new_project_name, log_lines),
+                        keep_zip=True,
+                        keep_ready=True,
+                        show_cancel=True,
+                        show_add=False,
+                    )
+            return_code = proc.wait()
+        finally:
+            active_builds.pop(username, None)
+
+        details = "\n".join(log_lines).strip()
+        ok = return_code == 0
         if not ok:
             short_details = (details or "").strip()
             short_details = short_details.splitlines()[-1] if short_details else "unknown indexer error"
             if args.verbose and details:
                 print("[Add Project] Index build failed:")
                 print(details[-4000:])
-            return _resp(
+            yield _resp(
                 f"Failed to build index for `{zip_path.name}`.\n\nReason: `{short_details}`",
                 keep_zip=True,
                 keep_ready=True,
+                show_cancel=False,
+                show_add=True,
             )
+            return
 
         if not _looks_like_index_dir(new_index_dir):
-            return _resp(
+            yield _resp(
                 f"Indexer finished but output is incomplete: {new_index_dir}\n"
                 "Expected semantic.faiss/meta.jsonl/indices files.",
                 keep_zip=True,
                 keep_ready=True,
+                show_cancel=False,
+                show_add=True,
             )
+            return
 
         projects[new_project_name] = new_index_dir.resolve()
         if new_project_name not in project_names:
@@ -903,12 +997,16 @@ def main():
         if args.verbose and details:
             print("[Add Project] Index build output:")
             print(details[-2000:])
-        return _resp(
+        yield _resp(
             f"Added project `{new_project_name}`.",
             keep_zip=False,
             keep_ready=False,
             next_project_name=new_project_name,
+            show_cancel=False,
+            show_add=True,
+            update_zip_value=True,
         )
+        return
 
     def _on_zip_change(zip_file):
         zip_value = _normalize_uploaded_zip_path(zip_file)
@@ -1368,7 +1466,7 @@ def main():
                 clear_zip_select_btn,
                 clear_zip_row,
             ],
-            show_progress="full",
+            show_progress="minimal",
         )
         add_project_evt.then(
             fn=_finalize_add_project_ui,
