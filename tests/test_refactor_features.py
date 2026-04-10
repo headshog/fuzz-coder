@@ -1149,6 +1149,106 @@ def test_build_type_init_index_collects_init_recipes_by_type():
     assert any(str(f.get("path", "")) == "path" for f in list(rec.get("fields") or []))
 
 
+def test_build_type_init_index_collects_init_recipe_when_call_arg_is_function_parameter():
+    chunks = [
+        {
+            "id": 0,
+            "name": "caller",
+            "file": "/repo/src/demo.c",
+            "start_line": 1,
+            "signature": "caller(FooCtx * ctx)",
+            "parameters": [
+                {"name": "ctx", "type": "FooCtx *", "raw": "FooCtx * ctx"},
+            ],
+            "code": (
+                "int caller(FooCtx * ctx) {\n"
+                "    ctx->path = argv[1];\n"
+                "    return foo_run(ctx);\n"
+                "}\n"
+            ),
+        },
+        {
+            "id": 1,
+            "name": "foo_run",
+            "file": "/repo/src/foo.c",
+            "start_line": 30,
+            "signature": "foo_run(FooCtx * ctx)",
+            "parameters": [
+                {"name": "ctx", "type": "FooCtx *", "raw": "FooCtx * ctx"},
+            ],
+            "code": "int foo_run(FooCtx * ctx) { return 0; }",
+        },
+    ]
+
+    idx = index_core.build_type_init_index(chunks)
+    recipes = idx.get("init_recipes_by_type", {})
+    assert "FooCtx" in recipes
+    assert recipes["FooCtx"]
+    rec = recipes["FooCtx"][0]
+    assert rec.get("target_function") == "foo_run"
+    assert int(rec.get("arg_index", -1)) == 0
+    assert any(str(f.get("path", "")) == "path" for f in list(rec.get("fields") or []))
+
+
+def test_build_type_init_index_synthesizes_recipe_from_required_fields_when_direct_recipe_missing():
+    chunks = [
+        {
+            "id": 0,
+            "name": "foo_run",
+            "file": "/repo/src/foo.c",
+            "start_line": 1,
+            "signature": "foo_run(FooCtx * ctx)",
+            "parameters": [
+                {"name": "ctx", "type": "FooCtx *", "raw": "FooCtx * ctx"},
+            ],
+            "code": (
+                "int foo_run(FooCtx * ctx) {\n"
+                "    if (ctx->path) return 0;\n"
+                "    return -1;\n"
+                "}\n"
+            ),
+        },
+    ]
+
+    idx = index_core.build_type_init_index(chunks)
+    recipes = idx.get("init_recipes_by_type", {})
+    assert "FooCtx" in recipes
+    assert recipes["FooCtx"]
+    rec = recipes["FooCtx"][0]
+    assert rec.get("target_function") == "foo_run"
+    assert int(rec.get("arg_index", -1)) == 0
+    assert any(str(f.get("path", "")) == "path" for f in list(rec.get("fields") or []))
+
+
+def test_build_type_init_index_synthesizes_recipe_from_struct_field_writes_when_other_sources_missing():
+    chunks = [
+        {
+            "id": 0,
+            "name": "configure_ctx",
+            "file": "/repo/src/foo.c",
+            "start_line": 1,
+            "signature": "configure_ctx(FooCtx * ctx)",
+            "parameters": [
+                {"name": "ctx", "type": "FooCtx *", "raw": "FooCtx * ctx"},
+            ],
+            "code": (
+                "void configure_ctx(FooCtx * ctx) {\n"
+                "    ctx->path = argv[1];\n"
+                "    ctx->enabled = 0;\n"
+                "}\n"
+            ),
+        },
+    ]
+
+    idx = index_core.build_type_init_index(chunks)
+    recipes = idx.get("init_recipes_by_type", {})
+    assert "FooCtx" in recipes
+    assert recipes["FooCtx"]
+    rec = recipes["FooCtx"][0]
+    assert rec.get("target_function", None) in {"", "configure_ctx"}
+    assert any(str(f.get("path", "")) == "path" for f in list(rec.get("fields") or []))
+
+
 def test_deterministic_example_fallback_prefers_init_recipe_allocator_and_fields():
     frags = [
         {

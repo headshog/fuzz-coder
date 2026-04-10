@@ -704,6 +704,27 @@ def build_type_init_index(chunks, max_per_type=16, language_name=None):
     req = {}
     recipe_acc = {}
 
+    def _augment_var_hints_with_params(var_hints, chunk, *, chunk_language):
+        hints = dict(var_hints or {})
+        for p in list(chunk.get("parameters") or []):
+            pname = str(p.get("name", "")).strip()
+            if not pname:
+                continue
+            ptype = str(p.get("type", "") or p.get("raw", "")).strip()
+            nominal = _extract_nominal_type_name_for_init(ptype, language_name=chunk_language)
+            if not nominal:
+                continue
+            raw = str(p.get("raw", "")).strip()
+            is_ptr = bool(p.get("is_pointer")) or ("*" in ptype) or ("*" in raw)
+            hints.setdefault(
+                pname,
+                {
+                    "nominal_type": nominal,
+                    "is_pointer": is_ptr,
+                },
+            )
+        return hints
+
     def _ensure_req_bucket(target_name, arg_index, arg_name, nominal):
         key = (str(target_name), int(arg_index), str(arg_name), str(nominal))
         bucket = req.get(key)
@@ -835,6 +856,11 @@ def build_type_init_index(chunks, max_per_type=16, language_name=None):
                 })
 
         var_hints = _extract_variable_type_hints(code, language_name=chunk_language)
+        var_hints = _augment_var_hints_with_params(
+            var_hints,
+            c,
+            chunk_language=chunk_language,
+        )
         field_writes = _extract_field_assignments(code, language_name=chunk_language)
         field_reads = _extract_field_reads(code, language_name=chunk_language)
         call_sites = _extract_call_sites(code, chunk_control_keywords, language_name=chunk_language)
@@ -1051,6 +1077,11 @@ def build_type_init_index(chunks, max_per_type=16, language_name=None):
         caller_name = str(c.get("name", "")).strip()
         start_line = int(c.get("start_line", 1) or 1)
         var_hints = _extract_variable_type_hints(code, language_name=chunk_language)
+        var_hints = _augment_var_hints_with_params(
+            var_hints,
+            c,
+            chunk_language=chunk_language,
+        )
         field_assignments = _extract_field_assignments(code, language_name=chunk_language)
         call_sites = _extract_call_sites(code, chunk_control_keywords, language_name=chunk_language)
         if not call_sites:
@@ -1450,6 +1481,162 @@ def build_type_init_index(chunks, max_per_type=16, language_name=None):
             reverse=True,
         )
         init_recipes_out[nominal] = rows[: max(8, max_per_type * 3)]
+
+    # Fallback: synthesize recipe rows from required-field evidence for tuples
+    # that do not yet have direct caller-trace recipes.
+    existing_recipe_keys = set()
+    for nominal, rows in init_recipes_out.items():
+        for row in rows:
+            existing_recipe_keys.add(
+                (
+                    str(nominal),
+                    str(row.get("target_function", "")),
+                    int(row.get("arg_index", -1)),
+                    str(row.get("arg_name", "")),
+                )
+            )
+
+    for target_fn, req_entries in req_out.items():
+        for req_entry in list(req_entries or []):
+            nominal = str(req_entry.get("type", "")).strip()
+            arg_index = int(req_entry.get("arg_index", -1))
+            arg_name = str(req_entry.get("arg_name", "")).strip()
+            if not nominal or arg_index < 0:
+                continue
+
+            rkey = (nominal, str(target_fn), arg_index, arg_name)
+            if rkey in existing_recipe_keys:
+                continue
+
+            req_fields = list(req_entry.get("fields") or [])
+            if not req_fields:
+                continue
+
+            recipe_fields = []
+            nontrivial_field_count = 0
+            evidence = []
+            for f in req_fields[:16]:
+                sample_expr = str(f.get("sample_expr", "")).strip()
+                if sample_expr and _recipe_rhs_score(sample_expr, language_name=default_language) >= 4:
+                    nontrivial_field_count += 1
+                f_evidence = list(f.get("evidence") or [])
+                if f_evidence:
+                    evidence.extend(f_evidence[:1])
+                recipe_fields.append(
+                    {
+                        "path": str(f.get("path", "")),
+                        "access": str(f.get("access", "dot")),
+                        "count": int(f.get("count", 0)),
+                        "support": float(f.get("support", 0.0) or 0.0),
+                        "sample_expr": sample_expr,
+                        "sources": dict(f.get("sources") or {}),
+                        "evidence": list(f_evidence),
+                    }
+                )
+
+            if not recipe_fields:
+                continue
+
+            steps = []
+            for f in recipe_fields[:12]:
+                access_op = "->" if str(f.get("access")) == "arrow" else "."
+                rhs = str(f.get("sample_expr", "")).strip() or "{}"
+                steps.append(
+                    {
+                        "statement": f"$arg{access_op}{f.get('path', '')} = {rhs};",
+                        "kind": "field_write",
+                    }
+                )
+
+            call_sites = int(req_entry.get("call_sites", 0))
+            synthetic_score = (
+                int(call_sites) * 2
+                + min(6, nontrivial_field_count * 2)
+                + min(4, len(recipe_fields))
+            )
+            synthesized = {
+                "target_function": str(target_fn),
+                "arg_index": int(arg_index),
+                "arg_name": arg_name,
+                "is_pointer": any(str(f.get("access")) == "arrow" for f in recipe_fields),
+                "call_sites": int(call_sites),
+                "score": int(synthetic_score),
+                "allocator_expr": "",
+                "fields": recipe_fields,
+                "steps": steps,
+                "evidence": evidence[:6],
+            }
+            init_recipes_out.setdefault(nominal, []).append(synthesized)
+            existing_recipe_keys.add(rkey)
+
+    for nominal, rows in list(init_recipes_out.items()):
+        rows.sort(
+            key=lambda r: (
+                int(r.get("score", 0)),
+                int(r.get("call_sites", 0)),
+                bool(r.get("allocator_expr")),
+                len(list(r.get("fields") or [])),
+            ),
+            reverse=True,
+        )
+        init_recipes_out[nominal] = rows[: max(8, max_per_type * 3)]
+
+    # Last-resort fallback: if a type has field-write evidence but still no recipe,
+    # synthesize a generic type recipe so ask-side can avoid total recipe starvation.
+    for nominal, rows in struct_field_writes_out.items():
+        if not nominal:
+            continue
+        if init_recipes_out.get(nominal):
+            continue
+        if not rows:
+            continue
+
+        top = list(rows)[:16]
+        max_count = max(1, max(int(r.get("count", 0)) for r in top))
+        fields = []
+        for r in top:
+            sample_expr = str(r.get("sample_expr", "")).strip()
+            fields.append(
+                {
+                    "path": str(r.get("path", "")),
+                    "access": str(r.get("access", "dot")),
+                    "count": int(r.get("count", 0)),
+                    "support": round(float(int(r.get("count", 0))) / float(max_count), 4),
+                    "sample_expr": sample_expr,
+                    "sources": {"struct_field_writes": int(r.get("count", 0))},
+                    "evidence": list(r.get("evidence", [])),
+                }
+            )
+        fields = [f for f in fields if str(f.get("path", "")).strip()]
+        if not fields:
+            continue
+
+        steps = []
+        for f in fields[:12]:
+            access_op = "->" if str(f.get("access")) == "arrow" else "."
+            rhs = str(f.get("sample_expr", "")).strip() or "{}"
+            steps.append(
+                {
+                    "statement": f"$arg{access_op}{f.get('path', '')} = {rhs};",
+                    "kind": "field_write",
+                }
+            )
+
+        score = min(16, sum(int(f.get("count", 0)) for f in fields[:4]))
+        init_recipes_out[nominal] = [
+            {
+                "target_function": "",
+                "arg_index": -1,
+                "arg_name": "",
+                "is_pointer": any(str(f.get("access")) == "arrow" for f in fields),
+                "call_sites": 0,
+                "score": int(score),
+                "allocator_expr": "",
+                "fields": fields[:16],
+                "steps": steps,
+                "evidence": [e for f in fields for e in list(f.get("evidence", []))][:6],
+            }
+        ]
 
     return {
         "version": 4,
