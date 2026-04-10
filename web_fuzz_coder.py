@@ -482,7 +482,14 @@ def _run_index_build(
 
 def _build_pipeline_for_index(index_dir: Path, args, embed_model, reranker):
     idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index, language_name = _load_indices(index_dir)
-    planner = core.QueryPlanner(special_indices, symbols, call_graph, called_by, meta=meta)
+    planner = core.QueryPlanner(
+        special_indices,
+        symbols,
+        call_graph,
+        called_by,
+        meta=meta,
+        language_name=language_name or ask_app.DEFAULT_CHAT_LANGUAGE,
+    )
     return QueryPipeline(
         core_module=core,
         planner=planner,

@@ -7,11 +7,6 @@ import re
 from fuzz_coder.ask.example_context import build_example_context as _build_example_context_impl
 
 
-PATH_PARAM_NAME_HINTS = [
-    "path", "file", "filename", "fname", "filepath", "dir", "directory",
-]
-
-
 def is_valid_function_chunk(chunk):
     if not isinstance(chunk, dict):
         return False
@@ -43,83 +38,6 @@ def is_valid_function_chunk(chunk):
         return False
 
     return True
-
-def _find_matching_paren_text(text, open_idx):
-    """Find matching ')' for '(' with nested bracket and literal awareness."""
-    if open_idx < 0 or open_idx >= len(text) or text[open_idx] != "(":
-        return -1
-
-    depth = 0
-    i = open_idx
-    n = len(text)
-    in_str = False
-    in_char = False
-    in_line_comment = False
-    in_block_comment = False
-    escape = False
-
-    while i < n:
-        ch = text[i]
-        nxt = text[i + 1] if i + 1 < n else ""
-
-        if in_line_comment:
-            if ch == "\n":
-                in_line_comment = False
-            i += 1
-            continue
-
-        if in_block_comment:
-            if ch == "*" and nxt == "/":
-                in_block_comment = False
-                i += 2
-                continue
-            i += 1
-            continue
-
-        if in_str:
-            if not escape and ch == '"':
-                in_str = False
-            escape = (ch == "\\" and not escape)
-            i += 1
-            continue
-
-        if in_char:
-            if not escape and ch == "'":
-                in_char = False
-            escape = (ch == "\\" and not escape)
-            i += 1
-            continue
-
-        if ch == "/" and nxt == "/":
-            in_line_comment = True
-            i += 2
-            continue
-        if ch == "/" and nxt == "*":
-            in_block_comment = True
-            i += 2
-            continue
-        if ch == '"':
-            in_str = True
-            escape = False
-            i += 1
-            continue
-        if ch == "'":
-            in_char = True
-            escape = False
-            i += 1
-            continue
-
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                return i
-
-        i += 1
-
-    return -1
-
 
 def _split_top_level_arguments(args_text):
     out = []
@@ -203,38 +121,6 @@ def _split_top_level_arguments(args_text):
     tail = "".join(cur).strip()
     if tail:
         out.append(tail)
-    return out
-
-
-def _extract_call_argument_lists(code, target_name, limit=3):
-    if not code or not target_name:
-        return []
-
-    pattern = re.compile(
-        rf"(?<![A-Za-z0-9_~])(?:[A-Za-z_]\w*::)*{re.escape(target_name)}\s*\("
-    )
-    out = []
-    seen = set()
-    for m in pattern.finditer(code):
-        open_idx = code.find("(", m.start())
-        if open_idx == -1:
-            continue
-        close_idx = _find_matching_paren_text(code, open_idx)
-        if close_idx == -1:
-            continue
-
-        args_text = code[open_idx + 1:close_idx]
-        args = _split_top_level_arguments(args_text)
-        expr = code[m.start():close_idx + 1].strip()
-
-        key = (expr, tuple(args))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({"expr": expr, "args": args})
-        if len(out) >= limit:
-            break
-
     return out
 
 
@@ -1241,6 +1127,49 @@ def _extract_caller_flow_statements(caller_code, observed_args, max_lines=8):
     return out
 
 
+def _infer_callsite_arg_hints(target_name, expected_arity, type_init_index=None):
+    raw = type_init_index or {}
+    callsite_flow = raw.get("callsite_arg_flow") if isinstance(raw, dict) else {}
+    if not isinstance(callsite_flow, dict):
+        return []
+
+    target = str(target_name or "").strip()
+    arity = int(expected_arity or 0)
+    best = None
+    best_key = None
+
+    for _caller, rows in callsite_flow.items():
+        for row in list(rows or []):
+            if not isinstance(row, dict):
+                continue
+            row_target = str(row.get("target", "")).strip()
+            if not row_target or row_target != target:
+                continue
+            row_args = [str(a) for a in list(row.get("args") or [])]
+            row_arity = int(row.get("arity", len(row_args)) or len(row_args))
+            if arity > 0 and row_arity != arity:
+                continue
+            arg_flow = list(row.get("arg_flow") or [])
+            flow_score = 0
+            for af in arg_flow:
+                if not isinstance(af, dict):
+                    continue
+                if af.get("base_var"):
+                    flow_score += 2
+                flow_score += min(2, len(list(af.get("dependency_chain") or [])))
+                flow_score += min(2, len(list(af.get("field_writes_before_call") or [])))
+            rank_key = (flow_score, len(row_args), int(row.get("line", 0)))
+            if best is None or rank_key > best_key:
+                best = row_args
+                best_key = rank_key
+
+    if not best:
+        return []
+    if arity > 0:
+        return best[:arity]
+    return best
+
+
 def _build_param_binding(
     param,
     analysis,
@@ -1462,6 +1391,12 @@ def build_example_answer_from_context_c_cpp(frags, analysis=None, example_contex
     observed_call = observed_call_obj.get("expr")
     if isinstance(observed_call_obj.get("args"), list):
         call_hint_args = observed_call_obj.get("args", [])
+    if not call_hint_args:
+        call_hint_args = _infer_callsite_arg_hints(
+            target_name=target_name,
+            expected_arity=len(params),
+            type_init_index=type_init_index,
+        )
     observed_call_inline = _normalize_inline_snippet(observed_call)
     caller_decl_hints = _extract_caller_decl_hints(
         str((caller or {}).get("code", "")),
@@ -1591,4 +1526,3 @@ def build_example_answer_from_context_c_cpp(frags, analysis=None, example_contex
         lines.append("- Note: direct caller context for target function was not found in selected fragments.")
 
     return "\n".join(lines)
-

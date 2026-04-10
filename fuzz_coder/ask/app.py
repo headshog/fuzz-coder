@@ -208,7 +208,14 @@ def main():
 
     idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index, language_name = _load_indices(index_dir)
     embed_model, reranker = _load_models(args)
-    planner = core.QueryPlanner(special_indices, symbols, call_graph, called_by, meta=meta)
+    planner = core.QueryPlanner(
+        special_indices,
+        symbols,
+        call_graph,
+        called_by,
+        meta=meta,
+        language_name=language_name or DEFAULT_CHAT_LANGUAGE,
+    )
 
     pipeline = QueryPipeline(
         core_module=core,

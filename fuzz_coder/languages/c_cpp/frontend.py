@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Set
 
-from .base import LanguageFrontend, LanguageProfile
-from .c_cpp_calls import detect_call_details as _detect_call_details_impl
+from ..base import LanguageFrontend, LanguageProfile
+from .calls import detect_call_details as _detect_call_details_impl
 
 
 C_CPP_PROFILE = LanguageProfile(
@@ -89,9 +89,53 @@ class CCppFrontend(LanguageFrontend):
         root: Any,
         control_keywords: Set[str],
     ) -> List[Dict[str, Any]]:
+        def _extract_function_name_node(func_node):
+            declarator = func_node.child_by_field_name("declarator")
+            if declarator is None:
+                return None
+
+            current = declarator
+            for _ in range(32):
+                if current.type in {"identifier", "field_identifier"}:
+                    return current
+
+                if current.type == "qualified_identifier":
+                    name_node = current.child_by_field_name("name")
+                    if name_node is not None:
+                        if name_node.type in {"identifier", "field_identifier"}:
+                            return name_node
+                        current = name_node
+                        continue
+
+                next_decl = current.child_by_field_name("declarator")
+                if next_decl is None:
+                    break
+                current = next_decl
+
+            return None
+
+        def _extract_function_params_node(func_node):
+            declarator = func_node.child_by_field_name("declarator")
+            if declarator is None:
+                return None
+
+            current = declarator
+            for _ in range(32):
+                if current.type == "function_declarator":
+                    params = current.child_by_field_name("parameters")
+                    if params is not None:
+                        return params
+
+                next_decl = current.child_by_field_name("declarator")
+                if next_decl is None:
+                    break
+                current = next_decl
+
+            return None
+
         functions: List[Dict[str, Any]] = []
         for func_node in parser_utils._iter_nodes_by_type(root, "function_definition"):
-            name_node = parser_utils._extract_function_name_node(func_node)
+            name_node = _extract_function_name_node(func_node)
             if name_node is None:
                 continue
 
@@ -102,7 +146,7 @@ class CCppFrontend(LanguageFrontend):
                 continue
 
             params = []
-            params_node = parser_utils._extract_function_params_node(func_node)
+            params_node = _extract_function_params_node(func_node)
             if params_node:
                 params_text = source_bytes[params_node.start_byte:params_node.end_byte].decode(
                     "utf-8", errors="ignore"

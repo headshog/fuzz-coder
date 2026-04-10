@@ -215,62 +215,7 @@ class TreeSitterParser:
 
     def _parse_parameters(self, params_text):
         """Parse parameter list into structured format"""
-        params = []
-        # Remove parentheses
-        params_text = params_text.strip("()")
-        if not params_text.strip():
-            return params
-
-        # Split by comma (handling nested templates)
-        depth = 0
-        current = ""
-        for char in params_text:
-            if char in "<(":
-                depth += 1
-            elif char in ">)":
-                depth -= 1
-            elif char == "," and depth == 0:
-                if current.strip():
-                    params.append(self._parse_single_param(current.strip()))
-                current = ""
-                continue
-            current += char
-
-        if current.strip():
-            params.append(self._parse_single_param(current.strip()))
-
-        return params
-
-    def _parse_single_param(self, param_text):
-        """Parse a single parameter"""
-        parts = param_text.split()
-        if len(parts) >= 2:
-            # Try to identify type and name
-            name = parts[-1].split("&")[-1].split("*")[-1].strip()
-            param_type = " ".join(parts[:-1])
-
-            # Check if it's a reference or pointer
-            is_reference = "&" in param_text
-            is_pointer = "*" in param_text
-            is_const = "const" in param_text.lower()
-
-            return {
-                "name": name,
-                "type": param_type,
-                "is_reference": is_reference,
-                "is_pointer": is_pointer,
-                "is_const": is_const,
-                "raw": param_text
-            }
-        else:
-            return {
-                "name": param_text,
-                "type": "unknown",
-                "is_reference": False,
-                "is_pointer": False,
-                "is_const": False,
-                "raw": param_text
-            }
+        return parse_parameters_simple(params_text, language_name=self.language_name)
 
     def _iter_nodes_by_type(self, root_node, node_type):
         """Yield nodes of a specific type via DFS traversal."""
@@ -281,52 +226,6 @@ class TreeSitterParser:
                 yield node
             # Reverse children to keep left-to-right traversal order.
             stack.extend(reversed(node.children))
-
-    def _extract_function_name_node(self, func_node):
-        """Extract function name node from function_definition declarator chain."""
-        declarator = func_node.child_by_field_name("declarator")
-        if declarator is None:
-            return None
-
-        current = declarator
-        for _ in range(32):
-            if current.type in {"identifier", "field_identifier"}:
-                return current
-
-            if current.type == "qualified_identifier":
-                name_node = current.child_by_field_name("name")
-                if name_node is not None:
-                    if name_node.type in {"identifier", "field_identifier"}:
-                        return name_node
-                    current = name_node
-                    continue
-
-            next_decl = current.child_by_field_name("declarator")
-            if next_decl is None:
-                break
-            current = next_decl
-
-        return None
-
-    def _extract_function_params_node(self, func_node):
-        """Extract parameter list node from function_definition declarator chain."""
-        declarator = func_node.child_by_field_name("declarator")
-        if declarator is None:
-            return None
-
-        current = declarator
-        for _ in range(32):
-            if current.type == "function_declarator":
-                params = current.child_by_field_name("parameters")
-                if params is not None:
-                    return params
-
-            next_decl = current.child_by_field_name("declarator")
-            if next_decl is None:
-                break
-            current = next_decl
-
-        return None
 
     def _build_signature(self, name, params):
         """Build function signature string"""
@@ -668,34 +567,16 @@ def _split_call_args_top_level(args_text, language_name=None):
     return split_top_level_params(args_text, language_name=language_name)
 
 
-def _is_literal_like_token(token):
-    t = str(token or "").strip()
-    if not t:
-        return False
-    if re.fullmatch(r"(?:[-+]?\d+(?:\.\d+)?(?:[uUlLfF]*)|nullptr|NULL|true|false)", t):
-        return True
-    if re.fullmatch(r"'(?:\\.|[^'])+'", t):
-        return True
-    if re.fullmatch(r"\"(?:\\.|[^\"])*\"", t):
-        return True
-    # allow namespaced/UPPERCASE constants
-    if re.fullmatch(r"(?:[A-Za-z_]\w*::)*[A-Z_][A-Z0-9_]*", t):
-        return True
-    return False
+def _is_literal_like_token(token, language_name=None):
+    lang = language_name or ACTIVE_INDEX_LANGUAGE
+    adapter = get_index_language_adapter(lang)
+    return adapter.is_literal_like_token(token)
 
 
-def _is_self_contained_call_expr(expr):
-    e = str(expr or "").strip()
-    m = re.fullmatch(r"(?P<fn>(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*\((?P<args>.*)\)", e)
-    if not m:
-        return False
-    args = _split_call_args_top_level(m.group("args") or "")
-    if not args:
-        return True
-    for a in args:
-        if not _is_literal_like_token(a):
-            return False
-    return True
+def _is_self_contained_call_expr(expr, language_name=None):
+    lang = language_name or ACTIVE_INDEX_LANGUAGE
+    adapter = get_index_language_adapter(lang)
+    return adapter.is_self_contained_call_expr(expr)
 
 
 def _extract_nominal_type_name_for_init(type_text, language_name=None):
@@ -711,15 +592,13 @@ def _normalize_expr(expr, max_len=240):
     return e[: max_len - 3].rstrip() + "..."
 
 
-def _extract_call_name(expr):
-    e = str(expr or "").strip()
-    m = re.match(r"((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*\(", e)
-    if not m:
-        return None
-    return m.group(1).split("::")[-1]
+def _extract_call_name(expr, language_name=None):
+    lang = language_name or ACTIVE_INDEX_LANGUAGE
+    adapter = get_index_language_adapter(lang)
+    return adapter.extract_call_name(expr)
 
 
-def _init_pattern_score(kind, expr):
+def _init_pattern_score(kind, expr, language_name=None):
     score = 0
     e = str(expr or "").lower()
     if kind == "pointer_call":
@@ -734,7 +613,7 @@ def _init_pattern_score(kind, expr):
     for kw in ["alloc", "create", "init", "default", "open", "new"]:
         if kw in e:
             score += 2
-    if _is_self_contained_call_expr(expr):
+    if _is_self_contained_call_expr(expr, language_name=language_name):
         score += 3
     return score
 
@@ -743,6 +622,12 @@ def _extract_variable_type_hints(code, language_name=None):
     lang = language_name or ACTIVE_INDEX_LANGUAGE
     adapter = get_index_language_adapter(lang)
     return adapter.extract_variable_type_hints(code or "")
+
+
+def _extract_init_patterns(code, language_name=None):
+    lang = language_name or ACTIVE_INDEX_LANGUAGE
+    adapter = get_index_language_adapter(lang)
+    return adapter.extract_init_patterns(code or "")
 
 
 def _extract_field_assignments(code, language_name=None):
@@ -782,59 +667,35 @@ def _extract_arg_base_var(arg_expr, language_name=None):
     return adapter.extract_arg_base_var(arg_expr)
 
 
-def _field_rhs_score(expr):
+def _field_rhs_score(expr, language_name=None):
     e = _normalize_expr(expr)
-    if _is_literal_like_token(e):
+    if _is_literal_like_token(e, language_name=language_name):
         return 6
-    if _is_self_contained_call_expr(e):
+    if _is_self_contained_call_expr(e, language_name=language_name):
         return 5
-    if re.fullmatch(r"(?:[A-Za-z_]\w*::)*[A-Z_][A-Z0-9_]*", e):
-        return 4
     return 1
 
 
-def _recipe_rhs_score(expr):
+def _recipe_rhs_score(expr, language_name=None):
     e = _normalize_expr(expr)
-    if _is_self_contained_call_expr(e):
+    if _is_self_contained_call_expr(e, language_name=language_name):
         return 8
-    if _is_literal_like_token(e):
+    if _is_literal_like_token(e, language_name=language_name):
         return 6
-    if re.fullmatch(r"(?:[A-Za-z_]\w*::)*[A-Z_][A-Z0-9_]*", e):
-        return 5
     if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", e):
         return 4
     return 1
 
 
-def build_type_init_index(chunks, max_per_type=16):
+def build_type_init_index(chunks, max_per_type=16, language_name=None):
     """Build v3 structural dataflow index for better example grounding."""
+    default_language = language_name or ACTIVE_INDEX_LANGUAGE
     by_type = defaultdict(dict)  # type -> (kind, expr) -> aggregated record
     by_name = defaultdict(list)
     for c in chunks or []:
         name = str(c.get("name", "")).strip()
         if name:
             by_name[name].append(c)
-
-    pat_ptr_eq = re.compile(
-        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*\*\s*"
-        r"(?P<var>[A-Za-z_]\w*)\s*=\s*(?P<expr>[^;]+)\s*;\s*$"
-    )
-    pat_val_eq = re.compile(
-        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+"
-        r"(?P<var>[A-Za-z_]\w*)\s*=\s*(?P<expr>[^;]+)\s*;\s*$"
-    )
-    pat_val_ctor = re.compile(
-        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+"
-        r"(?P<var>[A-Za-z_]\w*)\s*\((?P<expr>[^;]*)\)\s*;\s*$"
-    )
-    pat_val_brace = re.compile(
-        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+"
-        r"(?P<var>[A-Za-z_]\w*)\s*(?P<expr>\{[^;]*\})\s*;\s*$"
-    )
-    pat_val_default = re.compile(
-        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+"
-        r"(?P<var>[A-Za-z_]\w*)\s*;\s*$"
-    )
 
     struct_field_writes_acc = defaultdict(dict)  # nominal -> (path,access) -> rec
     function_effects_acc = {}  # (fn,sig,arg_i,arg_name,type) -> rec
@@ -925,7 +786,7 @@ def build_type_init_index(chunks, max_per_type=16):
     # Pass 1: aggregate init patterns + function effects + struct writes.
     for c in chunks or []:
         file_path = str(c.get("file", ""))
-        chunk_language = infer_index_language_from_path(file_path, default=ACTIVE_INDEX_LANGUAGE)
+        chunk_language = infer_index_language_from_path(file_path, default=default_language)
         chunk_profile = get_language_profile(chunk_language)
         chunk_control_keywords = set(chunk_profile.control_keywords)
         fn_name = str(c.get("name", "")).strip()
@@ -935,34 +796,16 @@ def build_type_init_index(chunks, max_per_type=16):
         if not code:
             continue
 
-        # v3/A: init patterns per nominal type (existing logic)
-        for li, raw in enumerate(code.splitlines(), start=1):
-            line = (raw or "").strip()
-            if not line or line.startswith("//") or line.startswith("#"):
-                continue
-
-            kind = None
-            type_text = None
-            expr = None
-            match = None
-            for k, pat in [
-                ("pointer_call", pat_ptr_eq),
-                ("value_call", pat_val_eq),
-                ("value_call", pat_val_ctor),
-                ("value_brace", pat_val_brace),
-                ("value_default", pat_val_default),
-            ]:
-                m = pat.match(line)
-                if m:
-                    match = m
-                    kind = k
-                    type_text = m.group("type")
-                    expr = (m.groupdict().get("expr") or "").strip()
-                    break
-            if not match or not kind or not type_text:
+        # v3/A: language-adapter init patterns per nominal type.
+        for init_item in _extract_init_patterns(code, language_name=chunk_language):
+            kind = str((init_item or {}).get("kind") or "").strip()
+            type_text = str((init_item or {}).get("type_text") or "").strip()
+            expr = str((init_item or {}).get("expr") or "").strip()
+            li = int((init_item or {}).get("line") or 0)
+            if not kind or not type_text or li <= 0:
                 continue
             if kind in {"pointer_call", "value_call"}:
-                if not re.fullmatch(r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*\s*\([^;]*\)", expr or ""):
+                if not _extract_call_name(expr or "", language_name=chunk_language):
                     continue
             nominal = _extract_nominal_type_name_for_init(type_text, language_name=chunk_language)
             if not nominal:
@@ -975,15 +818,15 @@ def build_type_init_index(chunks, max_per_type=16):
                 rec = {
                     "kind": kind,
                     "expr": expr_norm,
-                    "function": _extract_call_name(expr_norm) if kind in {"pointer_call", "value_call"} else None,
-                    "self_contained": _is_self_contained_call_expr(expr_norm) if kind in {"pointer_call", "value_call"} else (kind != "value_default"),
+                    "function": _extract_call_name(expr_norm, language_name=chunk_language) if kind in {"pointer_call", "value_call"} else None,
+                    "self_contained": _is_self_contained_call_expr(expr_norm, language_name=chunk_language) if kind in {"pointer_call", "value_call"} else (kind != "value_default"),
                     "count": 0,
                     "score": 0,
                     "evidence": [],
                 }
                 by_type[nominal][key] = rec
             rec["count"] += 1
-            rec["score"] += _init_pattern_score(kind, expr_norm)
+            rec["score"] += _init_pattern_score(kind, expr_norm, language_name=chunk_language)
             if len(rec["evidence"]) < 3:
                 rec["evidence"].append({
                     "file": file_path,
@@ -1202,7 +1045,7 @@ def build_type_init_index(chunks, max_per_type=16):
         if not code:
             continue
         file_path = str(c.get("file", ""))
-        chunk_language = infer_index_language_from_path(file_path, default=ACTIVE_INDEX_LANGUAGE)
+        chunk_language = infer_index_language_from_path(file_path, default=default_language)
         chunk_profile = get_language_profile(chunk_language)
         chunk_control_keywords = set(chunk_profile.control_keywords)
         caller_name = str(c.get("name", "")).strip()

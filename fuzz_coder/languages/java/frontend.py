@@ -3,8 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Set
 
-from .base import LanguageFrontend, LanguageProfile
-from .java_calls import detect_call_details as _detect_call_details_impl
+from ..base import LanguageFrontend, LanguageProfile
+from .calls import detect_call_details as _detect_call_details_impl
 
 
 JAVA_PROFILE = LanguageProfile(

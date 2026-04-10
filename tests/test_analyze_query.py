@@ -278,7 +278,7 @@ def test_analyze_query_default_v2_filters_generic_symbol_like_data(monkeypatch):
     assert "data" not in analysis["function_names"]
 
 
-def test_analyze_query_shadow_mode_attaches_diff_without_switching_result(monkeypatch):
+def test_analyze_query_shadow_mode_flags_are_ignored_after_legacy_removal(monkeypatch):
     planner = QueryPlanner(
         special_indices={},
         symbols={
@@ -296,10 +296,10 @@ def test_analyze_query_shadow_mode_attaches_diff_without_switching_result(monkey
     monkeypatch.setenv("FC_QUERY_ANALYZER_SHADOW", "1")
     analysis = planner.analyze_query(q)
 
-    assert "data" in analysis["function_names"]
-    assert "_shadow_diff" in analysis
-    assert "function_names" in analysis["_shadow_diff"]
-    assert "data" not in analysis["_shadow_diff"]["function_names"]["v2"]
+    assert "process_request" in analysis["function_names"]
+    assert "main" in analysis["function_names"]
+    assert "data" not in analysis["function_names"]
+    assert "_shadow_diff" not in analysis
 
 
 def test_analyze_query_default_v2_keeps_explicit_symbol_even_if_common_word(monkeypatch):

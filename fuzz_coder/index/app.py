@@ -184,7 +184,7 @@ def main():
         json.dump(function_hints, f)
 
     # Save type initialization patterns (for better example generation fallback).
-    type_init_index = core.build_type_init_index(chunks)
+    type_init_index = core.build_type_init_index(chunks, language_name=args.language)
     with open(out/"type_init_index.json", "w") as f:
         json.dump(type_init_index, f)
 

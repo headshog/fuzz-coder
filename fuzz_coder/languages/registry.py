@@ -19,8 +19,8 @@ from .query_adapters import (
     QueryLanguageAdapter,
     get_query_language_adapter as _get_query_language_adapter_impl,
 )
-from .c_cpp import C_CPP_FRONTEND, C_CPP_PROFILE
-from .java import JAVA_FRONTEND, JAVA_PROFILE
+from .c_cpp.frontend import C_CPP_FRONTEND, C_CPP_PROFILE
+from .java.frontend import JAVA_FRONTEND, JAVA_PROFILE
 
 
 _PROFILES = {

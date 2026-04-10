@@ -13,9 +13,6 @@ from .llm import call_llm as _call_llm_impl
 from .prompting import build_prompt as _build_prompt_impl
 from .prompting import _build_thinking_prompt_with_limit as _build_thinking_prompt_impl
 from .query_analysis import analyze_query_v2 as _analyze_query_v2_impl
-from .query_analysis import compare_analysis as _compare_analysis_impl
-from .query_analysis import extract_max_param_count as _extract_max_param_count_impl
-from .query_analysis import extract_explicit_function_mentions as _extract_explicit_function_mentions_impl
 from .example_context import build_example_context as _build_example_context_impl
 from .example_grounding import build_example_context_grounded as _build_example_context_grounded_impl
 from .fallback_builders import build_example_answer_from_context as _build_example_answer_from_context_impl
@@ -28,32 +25,101 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
+DEFAULT_QUERY_LANGUAGE = get_query_language_adapter("").name
 
-_QUERY_ADAPTER = get_query_language_adapter("c_cpp")
+TYPE_KEYWORDS = {}
+TYPE_ALIASES = {}
+TYPE_INDEX_ALIASES = {}
+TYPE_PARAM_HINTS = {}
+STDIN_QUERY_KEYWORDS = []
+FILE_QUERY_KEYWORDS = []
+API_QUERY_KEYWORDS = []
+OUTPUT_QUERY_KEYWORDS = []
+MEMORY_QUERY_KEYWORDS = []
+ERROR_QUERY_KEYWORDS = []
+PARAMS_QUERY_KEYWORDS = []
+WRITE_LIKE_KEYWORDS = []
+PARSE_LIKE_KEYWORDS = []
+FUZZ_QUERY_KEYWORDS = []
+FUZZ_TARGET_KEYWORDS = []
+PATH_LIKE_TYPE_HINTS = []
+SIMPLE_POINTER_TYPE_HINTS = []
+FILE_HANDLE_TYPE_HINTS = []
+PATH_PARAM_NAME_HINTS = []
+VECTOR_LIKE_TYPE_HINTS = []
+PATH_FILTER_PATTERNS = []
+COMMON_QUERY_WORDS = set()
+QUERY_SYMBOL_BLACKLIST = set()
+FUZZ_PARAM_HINT_TOKENS = []
+_CURRENT_QUERY_LANGUAGE = DEFAULT_QUERY_LANGUAGE
 
-TYPE_KEYWORDS = dict(_QUERY_ADAPTER.type_keywords)
-TYPE_ALIASES = dict(_QUERY_ADAPTER.type_aliases)
-TYPE_INDEX_ALIASES = dict(_QUERY_ADAPTER.type_index_aliases)
-TYPE_PARAM_HINTS = dict(_QUERY_ADAPTER.type_param_hints)
-STDIN_QUERY_KEYWORDS = list(_QUERY_ADAPTER.stdin_query_keywords)
-FILE_QUERY_KEYWORDS = list(_QUERY_ADAPTER.file_query_keywords)
-API_QUERY_KEYWORDS = list(_QUERY_ADAPTER.api_query_keywords)
-OUTPUT_QUERY_KEYWORDS = list(_QUERY_ADAPTER.output_query_keywords)
-MEMORY_QUERY_KEYWORDS = list(_QUERY_ADAPTER.memory_query_keywords)
-ERROR_QUERY_KEYWORDS = list(_QUERY_ADAPTER.error_query_keywords)
-PARAMS_QUERY_KEYWORDS = list(_QUERY_ADAPTER.params_query_keywords)
-WRITE_LIKE_KEYWORDS = list(_QUERY_ADAPTER.write_like_keywords)
-PARSE_LIKE_KEYWORDS = list(_QUERY_ADAPTER.parse_like_keywords)
-FUZZ_QUERY_KEYWORDS = list(_QUERY_ADAPTER.fuzz_query_keywords)
-FUZZ_TARGET_KEYWORDS = list(_QUERY_ADAPTER.fuzz_target_keywords)
-PATH_LIKE_TYPE_HINTS = list(_QUERY_ADAPTER.path_like_type_hints)
-SIMPLE_POINTER_TYPE_HINTS = list(_QUERY_ADAPTER.simple_pointer_type_hints)
-FILE_HANDLE_TYPE_HINTS = list(_QUERY_ADAPTER.file_handle_type_hints)
-PATH_PARAM_NAME_HINTS = list(_QUERY_ADAPTER.path_param_name_hints)
-VECTOR_LIKE_TYPE_HINTS = list(_QUERY_ADAPTER.vector_like_type_hints)
-PATH_FILTER_PATTERNS = list(_QUERY_ADAPTER.path_filter_patterns)
-COMMON_QUERY_WORDS = set(_QUERY_ADAPTER.common_query_words)
-QUERY_SYMBOL_BLACKLIST = set(_QUERY_ADAPTER.query_symbol_blacklist)
+
+def _apply_query_language(language_name=None):
+    global TYPE_KEYWORDS
+    global TYPE_ALIASES
+    global TYPE_INDEX_ALIASES
+    global TYPE_PARAM_HINTS
+    global STDIN_QUERY_KEYWORDS
+    global FILE_QUERY_KEYWORDS
+    global API_QUERY_KEYWORDS
+    global OUTPUT_QUERY_KEYWORDS
+    global MEMORY_QUERY_KEYWORDS
+    global ERROR_QUERY_KEYWORDS
+    global PARAMS_QUERY_KEYWORDS
+    global WRITE_LIKE_KEYWORDS
+    global PARSE_LIKE_KEYWORDS
+    global FUZZ_QUERY_KEYWORDS
+    global FUZZ_TARGET_KEYWORDS
+    global PATH_LIKE_TYPE_HINTS
+    global SIMPLE_POINTER_TYPE_HINTS
+    global FILE_HANDLE_TYPE_HINTS
+    global PATH_PARAM_NAME_HINTS
+    global VECTOR_LIKE_TYPE_HINTS
+    global PATH_FILTER_PATTERNS
+    global COMMON_QUERY_WORDS
+    global QUERY_SYMBOL_BLACKLIST
+    global FUZZ_PARAM_HINT_TOKENS
+
+    adapter = get_query_language_adapter(language_name or DEFAULT_QUERY_LANGUAGE)
+    TYPE_KEYWORDS = dict(adapter.type_keywords)
+    TYPE_ALIASES = dict(adapter.type_aliases)
+    TYPE_INDEX_ALIASES = dict(adapter.type_index_aliases)
+    TYPE_PARAM_HINTS = dict(adapter.type_param_hints)
+    STDIN_QUERY_KEYWORDS = list(adapter.stdin_query_keywords)
+    FILE_QUERY_KEYWORDS = list(adapter.file_query_keywords)
+    API_QUERY_KEYWORDS = list(adapter.api_query_keywords)
+    OUTPUT_QUERY_KEYWORDS = list(adapter.output_query_keywords)
+    MEMORY_QUERY_KEYWORDS = list(adapter.memory_query_keywords)
+    ERROR_QUERY_KEYWORDS = list(adapter.error_query_keywords)
+    PARAMS_QUERY_KEYWORDS = list(adapter.params_query_keywords)
+    WRITE_LIKE_KEYWORDS = list(adapter.write_like_keywords)
+    PARSE_LIKE_KEYWORDS = list(adapter.parse_like_keywords)
+    FUZZ_QUERY_KEYWORDS = list(adapter.fuzz_query_keywords)
+    FUZZ_TARGET_KEYWORDS = list(adapter.fuzz_target_keywords)
+    PATH_LIKE_TYPE_HINTS = list(adapter.path_like_type_hints)
+    SIMPLE_POINTER_TYPE_HINTS = list(adapter.simple_pointer_type_hints)
+    FILE_HANDLE_TYPE_HINTS = list(adapter.file_handle_type_hints)
+    PATH_PARAM_NAME_HINTS = list(adapter.path_param_name_hints)
+    VECTOR_LIKE_TYPE_HINTS = list(adapter.vector_like_type_hints)
+    PATH_FILTER_PATTERNS = list(adapter.path_filter_patterns)
+    COMMON_QUERY_WORDS = set(adapter.common_query_words)
+    QUERY_SYMBOL_BLACKLIST = set(adapter.query_symbol_blacklist)
+    FUZZ_PARAM_HINT_TOKENS = sorted({
+        str(tok).lower()
+        for values in TYPE_PARAM_HINTS.values()
+        for tok in (values or [])
+        if isinstance(tok, str) and str(tok).strip()
+    })
+    return adapter.name
+
+
+def set_query_language(language_name=None):
+    global _CURRENT_QUERY_LANGUAGE
+    _CURRENT_QUERY_LANGUAGE = _apply_query_language(language_name)
+    return _CURRENT_QUERY_LANGUAGE
+
+
+_apply_query_language(DEFAULT_QUERY_LANGUAGE)
 
 
 def query_contains_keyword(query_lower, keyword):
@@ -181,120 +247,6 @@ def extract_function_names_from_text(text, symbols):
     return found
 
 
-def extract_function_like_candidates(query, known_symbols_by_lower=None):
-    """Extract function-like identifiers from user query.
-
-    Keeps explicit symbol-like tokens and also plain identifiers that are
-    present in the known symbol table (e.g. "split", "main").
-    """
-    candidates = []
-    known_symbols_by_lower = known_symbols_by_lower or {}
-
-    # Prefer explicit code-style references.
-    for t in re.findall(r"`([^`]+)`", query):
-        candidates.append((t, "explicit"))
-    for t in re.findall(r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*(?=\()", query):
-        candidates.append((t, "call_like"))
-
-    # Function-focused phrase patterns (captures plain names like "split" or "main").
-    phrase_patterns = [
-        r"\b(?:of|for|from|in|using|use|invoke|invoking|calling|call)\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+(?:function|method)\b",
-        r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+(?:function|method)\b",
-    ]
-    for pat in phrase_patterns:
-        for t in re.findall(pat, query, flags=re.IGNORECASE):
-            candidates.append((t, "phrase"))
-
-    # Fallback: generic identifier scan.
-    for t in re.findall(r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b", query):
-        candidates.append((t, "token"))
-
-    out = []
-    seen = set()
-    for raw, source in candidates:
-        token = (raw or "").strip().strip("`'\".,:;!?()[]{}")
-        if not token:
-            continue
-
-        token_lower = token.lower()
-        known_symbol_match = token_lower in known_symbols_by_lower
-
-        # Keep identifiers that look like actual symbols, avoid plain prose.
-        looks_like_symbol = (
-            "_" in token or
-            "::" in token or
-            (any(ch.isupper() for ch in token[1:]) and any(ch.islower() for ch in token))
-        )
-
-        if source == "token":
-            if token_lower in QUERY_SYMBOL_BLACKLIST:
-                continue
-            if token_lower in COMMON_QUERY_WORDS and token_lower != "main":
-                continue
-            if len(token) < 3 and not known_symbol_match:
-                continue
-            if not (looks_like_symbol or known_symbol_match):
-                continue
-        else:
-            # For explicit/call-like/phrase sources keep strong mentions,
-            # but still drop obvious language words.
-            if token_lower in QUERY_SYMBOL_BLACKLIST and token_lower != "main":
-                continue
-
-        if token_lower not in seen:
-            seen.add(token_lower)
-            out.append(token)
-
-    return out
-
-
-def choose_primary_example_function(query, resolved_function_names):
-    """Pick primary target function for example-generation queries.
-
-    Heuristics:
-    - Prefer symbol after calling/invoke/use/example-of phrases.
-    - Treat "from <fn> function" as context function, not primary target.
-    - If ambiguous and `main` is present with others, prefer non-main.
-    """
-    if not resolved_function_names:
-        return None
-    if len(resolved_function_names) == 1:
-        return resolved_function_names[0]
-
-    q = query or ""
-    patterns = [
-        r"\b(?:calling|call|invoke|invoking|using|use)\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b",
-        r"\b(?:example|пример)\s+(?:of\s+)?([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b",
-        r"\b(?:пример)\s+(?:вызова|использования)\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b",
-    ]
-    lowered_map = {fn.lower(): fn for fn in resolved_function_names}
-    for pat in patterns:
-        for m in re.finditer(pat, q, flags=re.IGNORECASE):
-            cand = (m.group(1) or "").strip().lower()
-            if cand in lowered_map:
-                return lowered_map[cand]
-
-    helper_context = set()
-    for m in re.finditer(
-        r"\bfrom\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+function\b",
-        q,
-        flags=re.IGNORECASE,
-    ):
-        helper_context.add((m.group(1) or "").strip().lower())
-
-    if helper_context:
-        for fn in resolved_function_names:
-            if fn.lower() not in helper_context:
-                return fn
-
-    if any(fn.lower() == "main" for fn in resolved_function_names):
-        for fn in resolved_function_names:
-            if fn.lower() != "main":
-                return fn
-
-    return resolved_function_names[0]
-
-
 def normalize_type_name(type_name):
     """Normalize type names to canonical keys."""
     t = type_name.lower().strip()
@@ -328,10 +280,23 @@ def query_excludes_output(query_lower):
     if any(p in query_lower for p in explicit_phrases):
         return True
 
-    # Pattern-based negative constraints close to output keywords
-    neg_en = r"\b(not|without|exclude|except|excluding)\b[^.\n]{0,60}\b(write|output|print|printf|fprintf|cout|log|dump|serialize)\b"
-    neg_ru = r"\b(не|без|кроме|исключая)\b[^.\n]{0,60}\b(запис\w*|вывод\w*|печат\w*|лог\w*)\b"
-    return re.search(neg_en, query_lower) is not None or re.search(neg_ru, query_lower) is not None
+    neg_markers = ["not", "without", "exclude", "except", "excluding", "не", "без", "кроме", "исключая"]
+    terms = set()
+    terms.update([w for w in WRITE_LIKE_KEYWORDS if isinstance(w, str)])
+    terms.update([w for w in OUTPUT_QUERY_KEYWORDS if isinstance(w, str)])
+    terms.update(["write", "output", "print", "log", "serialize", "запис", "вывод", "печат", "лог"])
+    terms = {t.strip().lower() for t in terms if t and len(t.strip()) >= 3}
+    term_parts = [re.escape(t).replace(r"\ ", r"\s+") for t in sorted(terms, key=len, reverse=True)[:60]]
+    if not term_parts:
+        return False
+    term_pat = "(?:" + "|".join(term_parts) + ")"
+    neg_pat = (
+        r"\b(?:"
+        + "|".join(neg_markers)
+        + r")\b[^.\n]{0,80}"
+        + term_pat
+    )
+    return re.search(neg_pat, query_lower, flags=re.IGNORECASE) is not None
 
 
 def parameter_matches_type(param, type_name):
@@ -471,10 +436,7 @@ def fuzz_target_score(chunk):
         p_text = f"{p.get('raw', '')} {p.get('type', '')} {p.get('name', '')}".lower()
         if "*" in p_text or "&" in p_text:
             score += 0.05
-        if any(token in p_text for token in [
-            "char", "string", "buffer", "data", "byte", "uint8",
-            "vector<", "array<", "span", "size_t", "int", "len", "length"
-        ]):
+        if any(token in p_text for token in FUZZ_PARAM_HINT_TOKENS):
             score += 0.04
 
     fields = " ".join([
@@ -668,7 +630,10 @@ def keyword_match_score(query, chunk):
 
 def parameter_match_score(query, chunk):
     """Check if query mentions parameters and if chunk has them"""
-    param_keywords = list(PARAMS_QUERY_KEYWORDS) + ["байт", "массив", "array", "byte"]
+    type_query_hints = []
+    for t in ["byte_array", "template", "string"]:
+        type_query_hints.extend(TYPE_KEYWORDS.get(t, []))
+    param_keywords = list(PARAMS_QUERY_KEYWORDS) + list(type_query_hints)
     has_param_query = any(kw in query.lower() for kw in param_keywords)
 
     if not has_param_query:
@@ -897,316 +862,26 @@ def build_parameter_analysis_from_context(frags, analysis=None, example_context=
 class QueryPlanner:
     """Advanced query planner with thinking mode support"""
 
-    def __init__(self, special_indices, symbols, call_graph, called_by, meta=None):
+    def __init__(self, special_indices, symbols, call_graph, called_by, meta=None, language_name=None):
         self.special_indices = special_indices
         self.symbols = symbols
         self.call_graph = call_graph
         self.called_by = called_by
         self.meta = meta or []
+        self.language_name = language_name or DEFAULT_QUERY_LANGUAGE
+        set_query_language(self.language_name)
         self.symbols_by_lower = defaultdict(list)
         for fn in self.symbols.keys():
             self.symbols_by_lower[fn.lower()].append(fn)
 
     def analyze_query(self, query, context_history=None):
-        """Analyze query with v2-by-default analyzer and optional shadow diff."""
-        legacy_mode = os.getenv("FC_QUERY_ANALYZER_LEGACY", "0") == "1"
-        use_v2 = not legacy_mode
-        shadow = os.getenv("FC_QUERY_ANALYZER_SHADOW", "0") == "1"
-
-        legacy = None
-        if not use_v2 or shadow:
-            legacy = self._analyze_query_legacy(query, context_history=context_history)
-        if use_v2:
-            v2 = _analyze_query_v2_impl(
-                query,
-                context_history=context_history,
-                symbols_by_lower=self.symbols_by_lower,
-            )
-            if shadow and legacy is not None:
-                diff = _compare_analysis_impl(legacy, v2)
-                if diff:
-                    v2["_shadow_diff"] = diff
-            return v2
-
-        if shadow and legacy is not None:
-            v2 = _analyze_query_v2_impl(
-                query,
-                context_history=context_history,
-                symbols_by_lower=self.symbols_by_lower,
-            )
-            diff = _compare_analysis_impl(legacy, v2)
-            if diff:
-                legacy["_shadow_diff"] = diff
-        return legacy
-
-    def _analyze_query_legacy(self, query, context_history=None):
-        """Analyze query to determine search strategy with thinking mode"""
-        query_lower = query.lower()
-        is_example_request = any(
-            w in query_lower
-            for w in ["example", "пример", "как вызвать", "как использовать", "usage", "использовани"]
-        )
-
-        analysis = {
-            "query_type": "general",
-            "keywords": re.findall(r"[a-z_а-яё]\w+", query_lower),
-            "is_listing": False,
-            "needs_stdin": False,
-            "needs_file": False,
-            "needs_api": False,
-            "needs_output": False,
-            "needs_memory_mgmt": False,
-            "needs_error_handling": False,
-            "needs_params": False,
-            "needs_types": False,
-            "needs_param_semantics": False,
-            "needs_parse_like": False,
-            "needs_fuzz_targets": False,
-            "needs_type_info": False,
-            "requested_types": [],
-            "constraint_mode": "all",
-            "exclude_output": False,
-            "max_param_count": None,
-            "needs_broad_fuzz_surface": False,
-            "min_fuzz_score": 0.35,
-            "min_fallback_fuzz_score": 0.15,
-            "listing_target_count": None,
-            "path_filters": [],
-            "exclude_previously_listed": False,
-            "function_names": [],
-            "primary_function_name": None,
-            "expand_callers": False,
-            "expand_callees": False,
-            "needs_example": False,
-            "needs_implementation": False,
-            "follow_up": False,
-            "referenced_functions": [],
-            "query_function_candidates": [],
-        }
-
-        # Detect input type requirements
-        if any(w in query_lower for w in STDIN_QUERY_KEYWORDS):
-            analysis["needs_stdin"] = True
-
-        if any(w in query_lower for w in FILE_QUERY_KEYWORDS):
-            analysis["needs_file"] = True
-
-        if any(w in query_lower for w in API_QUERY_KEYWORDS):
-            analysis["needs_api"] = True
-
-        # Detect output/error/memory focused queries (kept conservative to avoid
-        # matching imperative phrases like "write a list ...").
-        if any(w in query_lower for w in OUTPUT_QUERY_KEYWORDS) or re.search(r"\bwrite(s|d|ing)?\s+(to|into)\b", query_lower):
-            analysis["needs_output"] = True
-
-        if any(w in query_lower for w in MEMORY_QUERY_KEYWORDS):
-            analysis["needs_memory_mgmt"] = True
-
-        if any(w in query_lower for w in ERROR_QUERY_KEYWORDS):
-            analysis["needs_error_handling"] = True
-
-        # Detect parameter-related queries
-        if any(w in query_lower for w in PARAMS_QUERY_KEYWORDS):
-            analysis["needs_params"] = True
-
-        param_semantics_markers = [
-            "parameter semantics",
-            "what parameters", "which parameters", "parameter meanings", "meaning of parameter",
-            "what does parameter", "parameter format", "data format of parameter",
-            "куда передается", "что означает параметр", "какие параметры принимает",
-            "какие аргументы принимает", "формат параметров", "формат данных параметра",
-            "откуда берутся параметры", "source of parameters",
-        ]
-        if any(m in query_lower for m in param_semantics_markers):
-            analysis["needs_param_semantics"] = True
-            analysis["needs_params"] = True
-
-        # Detect type-specific queries
-        analysis["requested_types"] = extract_requested_types(query_lower)
-        if analysis["requested_types"]:
-            analysis["needs_type_info"] = True
-            analysis["needs_types"] = True
-
-        # Detect parse-like intent
-        if query_has_any_keyword(query_lower, PARSE_LIKE_KEYWORDS):
-            analysis["needs_parse_like"] = True
-
-        # Detect fuzzing-target intent
-        if query_has_any_keyword(query_lower, FUZZ_QUERY_KEYWORDS):
-            analysis["needs_fuzz_targets"] = True
-            # Fuzzing asks are effectively listing/ranking asks even without explicit "list".
-            analysis["is_listing"] = True
-
-        # Detect explicit function-like mentions from query text.
-        analysis["query_function_candidates"] = extract_function_like_candidates(
+        """Analyze query using the single maintained v2 analyzer."""
+        return _analyze_query_v2_impl(
             query,
-            known_symbols_by_lower=self.symbols_by_lower,
+            context_history=context_history,
+            symbols_by_lower=self.symbols_by_lower,
+            language_name=self.language_name,
         )
-        for cand in analysis["query_function_candidates"]:
-            for resolved in self.symbols_by_lower.get(cand.lower(), []):
-                if resolved not in analysis["function_names"]:
-                    analysis["function_names"].append(resolved)
-                    analysis["referenced_functions"].append(resolved)
-
-        # Alias-friendly behavior: in prompts like
-        # "define a standalone main() and call X from it", "main" is snippet context,
-        # not a target function to retrieve from codebase.
-        if ("standalone main" in query_lower or "define a standalone main" in query_lower) and len(analysis["function_names"]) > 1:
-            analysis["function_names"] = [fn for fn in analysis["function_names"] if fn.lower() != "main"]
-            analysis["referenced_functions"] = [fn for fn in analysis["referenced_functions"] if fn.lower() != "main"]
-
-        # Detect call graph expansion needs
-        if any(w in query_lower for w in ["call", "invoke", "use", "caller", "callee", "called by", "вызыва", "использу"]):
-            if "caller" in query_lower or "called by" in query_lower or "кто вызыва" in query_lower:
-                analysis["expand_callers"] = True
-            else:
-                analysis["expand_callees"] = True
-
-        # Detect listing/enumeration queries
-        if any(w in query_lower for w in ["list", "enumerate", "show all", "find all", "which functions", "какие функции", "перечисли", "покажи все"]):
-            analysis["is_listing"] = True
-            analysis["query_type"] = "listing"
-
-        explicit_max_params = _extract_max_param_count_impl(query_lower)
-        if explicit_max_params is not None:
-            analysis["max_param_count"] = explicit_max_params
-
-        # Detect exclusion constraints
-        if query_excludes_output(query_lower):
-            analysis["exclude_output"] = True
-            # Negative output constraint overrides positive output intent.
-            analysis["needs_output"] = False
-
-        # Detect path/module filters
-        analysis["path_filters"] = extract_path_filters_from_query(query)
-
-        # Detect novelty requests: "other/different/new functions"
-        novelty_requested = any(w in query_lower for w in [
-            "other", "another", "different", "new", "remaining", "else",
-            "друг", "еще", "ещё", "остальн", "дополнительно"
-        ])
-        if novelty_requested and (
-            analysis["is_listing"] or "function" in query_lower or "функц" in query_lower
-        ):
-            analysis["exclude_previously_listed"] = True
-
-        # Decide whether positive constraints are all-required or any-of
-        positive_signals = 0
-        positive_signals += int(analysis["needs_stdin"])
-        positive_signals += int(analysis["needs_file"])
-        positive_signals += int(analysis["needs_api"])
-        positive_signals += int(analysis["needs_output"])
-        positive_signals += int(analysis["needs_memory_mgmt"])
-        positive_signals += int(analysis["needs_error_handling"])
-        positive_signals += int(bool(analysis["requested_types"]))
-        positive_signals += int(analysis["needs_parse_like"])
-        positive_signals += int(analysis["needs_fuzz_targets"])
-
-        has_or_connector = re.search(r"\b(or|или)\b", query_lower) is not None
-        has_and_connector = re.search(r"\b(and|и)\b", query_lower) is not None
-
-        if positive_signals > 1:
-            if has_or_connector:
-                analysis["constraint_mode"] = "any"
-            elif has_and_connector:
-                analysis["constraint_mode"] = "all"
-            elif analysis["is_listing"] and analysis["needs_parse_like"]:
-                # Typical query style: "parse ... or stdin/string/bytes input"
-                analysis["constraint_mode"] = "any"
-
-        if analysis["needs_fuzz_targets"] and analysis["is_listing"] and not is_example_request:
-            analysis["needs_broad_fuzz_surface"] = True
-            if analysis["max_param_count"] is None:
-                analysis["max_param_count"] = 4
-            analysis["constraint_mode"] = "any"
-            if not analysis.get("listing_target_count"):
-                analysis["listing_target_count"] = 25
-            explicit_mentions = _extract_explicit_function_mentions_impl(
-                query,
-                known_symbols_by_lower=self.symbols_by_lower,
-            )
-            if explicit_mentions:
-                explicit_set = set(explicit_mentions)
-                analysis["function_names"] = [fn for fn in analysis["function_names"] if fn in explicit_set]
-                if not analysis["function_names"]:
-                    analysis["function_names"] = list(explicit_mentions)
-                analysis["referenced_functions"] = [fn for fn in analysis["referenced_functions"] if fn in explicit_set]
-                analysis["query_function_candidates"] = [fn for fn in analysis["query_function_candidates"] if fn in explicit_set]
-            else:
-                analysis["function_names"] = []
-                analysis["referenced_functions"] = []
-                analysis["query_function_candidates"] = []
-
-        # Detect example generation requests
-        if is_example_request:
-            analysis["needs_example"] = True
-            analysis["query_type"] = "example_generation"
-            # Example generation should not be treated as listing/ranking query.
-            analysis["is_listing"] = False
-            analysis["exclude_previously_listed"] = False
-            # If user named concrete functions, focus retrieval on those instead of broad fuzz-target discovery.
-            if analysis["function_names"]:
-                analysis["needs_fuzz_targets"] = False
-                analysis["primary_function_name"] = choose_primary_example_function(
-                    query,
-                    analysis["function_names"],
-                )
-
-        # Detect implementation questions
-        if any(w in query_lower for w in ["implement", "реализ", "как работает", "how does", "algorithm", "алгоритм"]):
-            analysis["needs_implementation"] = True
-            analysis["query_type"] = "implementation_explanation"
-
-        # Check for follow-up questions
-        if context_history:
-            # Use phrase-level references instead of raw tokens like "that":
-            # "that" is common in English relative clauses ("functions that parse...").
-            follow_up_patterns = [
-                r"\b(these|those)\b",
-                r"\b(this|that)\s+(one|ones|function|functions|list|result|results|candidate|candidates|answer)\b",
-                r"\b(from|in)\s+(the\s+)?(list|previous|above|earlier)\b",
-                r"\b(previous|above|earlier)\s+(list|answer|results?)\b",
-                r"\bиз\s+(этого|того|предыдущего)?\s*списк",
-                r"\b(эт(и|от|у)|тот)\s+(функц|спис)",
-                r"\b(предыдущ|выше|ранее)\s+(ответ|спис|результ)",
-                r"\b(далее|дальше|продолж)\b",
-                r"\bfunction\s+[abc]\b",
-            ]
-
-            if any(re.search(p, query_lower) for p in follow_up_patterns):
-                analysis["follow_up"] = True
-
-            if analysis["exclude_previously_listed"]:
-                analysis["follow_up"] = True
-
-        # Determine query type
-        if analysis["needs_example"]:
-            analysis["query_type"] = "example_generation"
-        elif analysis["needs_implementation"]:
-            analysis["query_type"] = "implementation_explanation"
-        elif analysis["needs_param_semantics"] and len(analysis["function_names"]) > 0:
-            analysis["query_type"] = "parameter_analysis"
-            analysis["is_listing"] = False
-            analysis["needs_file"] = False
-            analysis["needs_output"] = False
-            analysis["needs_api"] = False
-            analysis["needs_stdin"] = False
-            if not analysis.get("primary_function_name"):
-                analysis["primary_function_name"] = analysis["function_names"][0]
-        elif analysis["is_listing"]:
-            analysis["query_type"] = "listing"
-        elif analysis["needs_stdin"] or analysis["needs_file"] or analysis["needs_api"]:
-            analysis["query_type"] = "input_specific"
-        elif analysis["needs_type_info"]:
-            analysis["query_type"] = "type_specific"
-        elif len(analysis["function_names"]) > 0:
-            analysis["query_type"] = "function_specific"
-
-        if analysis.get("query_type") != "listing":
-            analysis["listing_target_count"] = None
-            analysis["needs_broad_fuzz_surface"] = False
-
-        return analysis
 
     def collect_previously_listed_ids(self, context_history):
         """Collect function ids mentioned in prior assistant responses."""
@@ -1393,7 +1068,7 @@ def build_prompt(
     max_prompt_chars=20000,
     example_context=None,
     function_hints=None,
-    language_name="c_cpp",
+    language_name=None,
 ):
     """Main prompt builder with total-character budget."""
     return _build_prompt_impl(
@@ -1404,7 +1079,7 @@ def build_prompt(
         max_prompt_chars=max_prompt_chars,
         example_context=example_context,
         function_hints=function_hints,
-        language_name=language_name,
+        language_name=language_name or DEFAULT_QUERY_LANGUAGE,
     )
 
 

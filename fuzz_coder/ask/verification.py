@@ -21,8 +21,15 @@ CODE_BLOCK_RE = re.compile(r"```(?:[A-Za-z0-9_+\-]*)\n(.*?)```", flags=re.DOTALL
 
 
 def _get_verification_adapter(context_frags):
-    language_name = infer_ask_language_from_fragments(context_frags or [], default="c_cpp")
+    default_language = get_ask_language_adapter("").name
+    language_name = infer_ask_language_from_fragments(context_frags or [], default=default_language)
     return get_ask_language_adapter(language_name)
+
+
+def _resolve_verification_adapter(adapter=None, context_frags=None):
+    if adapter is not None:
+        return adapter
+    return _get_verification_adapter(context_frags or [])
 
 
 def _extract_name_from_signature(signature_line: str) -> str | None:
@@ -35,11 +42,11 @@ def _extract_name_from_signature(signature_line: str) -> str | None:
         return None
 
     head = sig[:lp]
-    tokens = re.findall(r"([A-Za-z_~]\w*(?:::[A-Za-z_~]\w*)*)", head)
+    tokens = re.findall(r"([A-Za-z_~]\w*(?:(?:::|\.)[A-Za-z_~]\w*)*)", head)
     if not tokens:
         return None
 
-    name = tokens[-1].split("::")[-1]
+    name = re.split(r"::|\.", tokens[-1])[-1]
     if name.startswith("~"):
         name = name[1:]
     if not name:
@@ -70,57 +77,57 @@ def _extract_arity(signature: str, adapter=None) -> int | None:
     params = sig[lp + 1:rp].strip()
     if not params or params == "void":
         return 0
-    ad = adapter or get_ask_language_adapter("c_cpp")
+    ad = _resolve_verification_adapter(adapter=adapter)
     return len(ad.split_top_level_arguments(params))
 
 
 def _extract_call_arities(text: str, target_function: str, adapter=None) -> List[int]:
     if not text or not target_function:
         return []
-    ad = adapter or get_ask_language_adapter("c_cpp")
+    ad = _resolve_verification_adapter(adapter=adapter)
     return ad.extract_call_arities(text, target_function, limit=64)
 
 
 def _extract_call_arg_lists(text: str, target_function: str, adapter=None) -> List[List[str]]:
     if not text or not target_function:
         return []
-    ad = adapter or get_ask_language_adapter("c_cpp")
+    ad = _resolve_verification_adapter(adapter=adapter)
     calls = ad.extract_call_argument_lists(text, target_function, limit=64)
     return [list(c.get("args", [])) for c in calls]
 
 
 def _extract_file_source_vars(code_text: str, adapter=None) -> List[str]:
-    ad = adapter or get_ask_language_adapter("c_cpp")
+    ad = _resolve_verification_adapter(adapter=adapter)
     return ad.extract_file_source_vars(code_text or "")
 
 
 def _normalize_chain_token(token: str) -> str:
-    ad = get_ask_language_adapter("c_cpp")
+    ad = _resolve_verification_adapter()
     return ad.normalize_chain_token(token)
 
 
 def _lhs_base_name(lhs_expr: str) -> str:
-    ad = get_ask_language_adapter("c_cpp")
+    ad = _resolve_verification_adapter()
     return ad.lhs_base_name(lhs_expr)
 
 
 def _extract_simple_assignment_edges(code: str, adapter=None) -> List[tuple[str, str]]:
-    ad = adapter or get_ask_language_adapter("c_cpp")
+    ad = _resolve_verification_adapter(adapter=adapter)
     return ad.extract_simple_assignment_edges(code or "")
 
 
 def _extract_file_data_flow_symbols(code_text: str, source_vars: List[str], adapter=None) -> List[str]:
-    ad = adapter or get_ask_language_adapter("c_cpp")
+    ad = _resolve_verification_adapter(adapter=adapter)
     return ad.extract_file_data_flow_symbols(code_text or "", source_vars or [])
 
 
 def _arg_uses_any_var(arg_expr: str, names: List[str], adapter=None) -> bool:
-    ad = adapter or get_ask_language_adapter("c_cpp")
+    ad = _resolve_verification_adapter(adapter=adapter)
     return ad.arg_uses_any_var(arg_expr or "", names or [])
 
 
 def _extract_nominal_type_name(type_text: str, adapter=None) -> str:
-    ad = adapter or get_ask_language_adapter("c_cpp")
+    ad = _resolve_verification_adapter(adapter=adapter)
     return ad.extract_nominal_type_name(type_text or "")
 
 
@@ -133,7 +140,7 @@ def _build_strong_recipe_expectations(type_init_index, target_function, target_p
         return []
     expected = []
     target = str(target_function or "").strip()
-    ad = adapter or get_ask_language_adapter("c_cpp")
+    ad = _resolve_verification_adapter(adapter=adapter)
     for i, p in enumerate(target_params or []):
         ptype = str((p or {}).get("type", ""))
         nominal = _extract_nominal_type_name(ptype, adapter=ad)
@@ -180,10 +187,13 @@ def _build_strong_recipe_expectations(type_init_index, target_function, target_p
     return expected
 
 
-def _code_uses_default_init_for_nominal(code_text: str, nominal: str) -> bool:
+def _code_uses_default_init_for_nominal(code_text: str, nominal: str, adapter=None) -> bool:
     code = code_text or ""
     n = re.escape(str(nominal or "").strip())
     if not n:
+        return False
+    ad = _resolve_verification_adapter(adapter=adapter)
+    if not ad.supports_default_init_recipe_penalty():
         return False
     patterns = [
         rf"\b{n}\b\s+[A-Za-z_]\w*\s*\{{\s*\}}\s*;",
@@ -200,9 +210,9 @@ def _code_contains_allocator_expr(code_text: str, allocator_expr: str) -> bool:
     call_name = _extract_name_from_signature(f"{expr};") or ""
     if call_name:
         return re.search(rf"\b{re.escape(call_name)}\s*\(", code_text or "") is not None
-    m = re.match(r"\s*((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*\(", expr)
+    m = re.match(r"\s*([A-Za-z_]\w*(?:(?:::|\.)[A-Za-z_]\w*)*)\s*\(", expr)
     if m:
-        call_name = str(m.group(1) or "").split("::")[-1]
+        call_name = re.split(r"::|\.", str(m.group(1) or ""))[-1]
         return re.search(rf"\b{re.escape(call_name)}\s*\(", code_text or "") is not None
     return False
 
@@ -597,11 +607,9 @@ def verify_example_answer_with_context(
         consistency_issues.add("target_call_arity_mismatch")
 
     if target_function and observed_call_refs and (expected_observed_call or expected_caller):
+        observed_target_pat = adapter.call_pattern(target_function)
         observed_mentions_target = any(
-            re.search(
-                rf"\b(?:[A-Za-z_]\w*::)*{re.escape(target_function)}\s*\(",
-                _strip_inline_code(ref),
-            ) is not None
+            observed_target_pat.search(_strip_inline_code(ref)) is not None
             for ref in observed_call_refs
         )
         if not observed_mentions_target:
@@ -650,7 +658,7 @@ def verify_example_answer_with_context(
             alloc_expr = str(exp.get("allocator_expr", "")).strip()
             if alloc_expr and _code_contains_allocator_expr(text_for_calls, alloc_expr):
                 continue
-            if _code_uses_default_init_for_nominal(text_for_calls, nominal):
+            if _code_uses_default_init_for_nominal(text_for_calls, nominal, adapter=adapter):
                 default_init_penalized_nominals.append(nominal)
         if default_init_penalized_nominals:
             consistency_issues.add("default_init_used_despite_recipe")

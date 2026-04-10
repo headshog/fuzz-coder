@@ -7,7 +7,7 @@ import re
 
 from fuzz_coder.ask.example_context import build_example_context as _build_example_context_impl
 
-from .fallback_c_cpp import (
+from ..c_cpp.fallback import (
     _format_file_loc,
     _next_unique_name,
     _normalize_inline_snippet,
@@ -205,4 +205,3 @@ def build_example_answer_from_context_java(frags, analysis=None, example_context
         lines.append("- Note: direct caller context for target function was not found in selected fragments.")
 
     return "\n".join(lines)
-

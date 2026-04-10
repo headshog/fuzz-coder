@@ -5,39 +5,46 @@ from typing import Dict, List, Tuple
 
 from fuzz_coder.languages.registry import get_query_language_adapter
 
-_QUERY_ADAPTER = get_query_language_adapter("c_cpp")
-
-TYPE_KEYWORDS = dict(_QUERY_ADAPTER.type_keywords)
-TYPE_ALIASES = dict(_QUERY_ADAPTER.type_aliases)
-FUZZ_QUERY_KEYWORDS = list(_QUERY_ADAPTER.fuzz_query_keywords)
-PARSE_LIKE_KEYWORDS = list(_QUERY_ADAPTER.parse_like_keywords)
-STDIN_QUERY_KEYWORDS = list(_QUERY_ADAPTER.stdin_query_keywords)
-FILE_QUERY_KEYWORDS = list(_QUERY_ADAPTER.file_query_keywords)
-API_QUERY_KEYWORDS = list(_QUERY_ADAPTER.api_query_keywords)
-OUTPUT_QUERY_KEYWORDS = list(_QUERY_ADAPTER.output_query_keywords)
-MEMORY_QUERY_KEYWORDS = list(_QUERY_ADAPTER.memory_query_keywords)
-ERROR_QUERY_KEYWORDS = list(_QUERY_ADAPTER.error_query_keywords)
-PARAMS_QUERY_KEYWORDS = list(_QUERY_ADAPTER.params_query_keywords)
-PATH_FILTER_PATTERNS = list(_QUERY_ADAPTER.path_filter_patterns)
-COMMON_QUERY_WORDS = set(_QUERY_ADAPTER.common_query_words)
-QUERY_SYMBOL_BLACKLIST = set(_QUERY_ADAPTER.query_symbol_blacklist) | {
+_EXTRA_QUERY_SYMBOL_BLACKLIST = {
     "data", "line", "value", "values", "path", "file", "module", "directory",
     "input", "output", "request", "response", "process",
 }
 
 
+def _query_adapter(language_name: str | None):
+    return get_query_language_adapter(language_name or "c_cpp")
+
+
+def _qualified_symbol_pattern(language_name: str | None) -> str:
+    return _query_adapter(language_name).qualified_symbol_pattern
+
+
+def _token_looks_like_symbol(token: str, language_name: str | None) -> bool:
+    if "_" in token:
+        return True
+    for sep in _query_adapter(language_name).qualifier_separators:
+        if sep and sep in token:
+            return True
+    return any(ch.isupper() for ch in token[1:]) and any(ch.islower() for ch in token)
+
+
 def extract_explicit_function_mentions(
     query: str,
     known_symbols_by_lower: Dict[str, List[str]] | None = None,
+    query_symbol_blacklist=None,
+    language_name: str | None = None,
 ) -> List[str]:
     """Extract only high-confidence function mentions (code-like/explicit)."""
     known_symbols_by_lower = known_symbols_by_lower or {}
+    if query_symbol_blacklist is None:
+        query_symbol_blacklist = set(_EXTRA_QUERY_SYMBOL_BLACKLIST)
     found: List[str] = []
     seen = set()
 
+    symbol_pat = _qualified_symbol_pattern(language_name)
     patterns = [
         r"`([^`]+)`",  # explicit backticked symbol
-        r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*(?=\()",  # call-like mention
+        rf"\b({symbol_pat})\s*(?=\()",  # call-like mention
     ]
     for pat in patterns:
         for m in re.finditer(pat, query):
@@ -45,7 +52,7 @@ def extract_explicit_function_mentions(
             if not token:
                 continue
             token_lower = token.lower()
-            if token_lower in QUERY_SYMBOL_BLACKLIST:
+            if token_lower in query_symbol_blacklist:
                 continue
             resolved = known_symbols_by_lower.get(token_lower, [token])
             for fn in resolved:
@@ -66,14 +73,16 @@ def query_has_any_keyword(query_lower: str, keywords: List[str]) -> bool:
     return any(query_contains_keyword(query_lower, kw) for kw in keywords)
 
 
-def normalize_type_name(type_name: str) -> str:
+def normalize_type_name(type_name: str, type_aliases=None) -> str:
     t = type_name.lower().strip()
-    return TYPE_ALIASES.get(t, t)
+    aliases = dict(type_aliases or {})
+    return aliases.get(t, t)
 
 
-def extract_requested_types(query_lower: str) -> List[str]:
+def extract_requested_types(query_lower: str, type_keywords=None, type_aliases=None) -> List[str]:
+    type_keywords = dict(type_keywords or {})
     matched = []
-    for type_name, keywords in TYPE_KEYWORDS.items():
+    for type_name, keywords in type_keywords.items():
         if any(query_contains_keyword(query_lower, kw) for kw in keywords):
             matched.append(type_name)
 
@@ -82,10 +91,12 @@ def extract_requested_types(query_lower: str) -> List[str]:
     if "&" in query_lower and "reference" not in matched:
         matched.append("reference")
 
-    return sorted(set(normalize_type_name(t) for t in matched))
+    return sorted(set(normalize_type_name(t, type_aliases=type_aliases) for t in matched))
 
 
-def query_excludes_output(query_lower: str) -> bool:
+def query_excludes_output(query_lower: str, write_like_keywords=None, output_query_keywords=None) -> bool:
+    write_like_keywords = list(write_like_keywords or [])
+    output_query_keywords = list(output_query_keywords or [])
     explicit_phrases = [
         "not write", "not write-like", "but not write", "without write",
         "exclude write", "except write", "not output", "exclude output",
@@ -95,9 +106,23 @@ def query_excludes_output(query_lower: str) -> bool:
     if any(p in query_lower for p in explicit_phrases):
         return True
 
-    neg_en = r"\b(not|without|exclude|except|excluding)\b[^.\n]{0,60}\b(write|output|print|printf|fprintf|cout|log|dump|serialize)\b"
-    neg_ru = r"\b(не|без|кроме|исключая)\b[^.\n]{0,60}\b(запис\w*|вывод\w*|печат\w*|лог\w*)\b"
-    return re.search(neg_en, query_lower) is not None or re.search(neg_ru, query_lower) is not None
+    neg_markers = ["not", "without", "exclude", "except", "excluding", "не", "без", "кроме", "исключая"]
+    terms = set()
+    terms.update([w for w in write_like_keywords if isinstance(w, str)])
+    terms.update([w for w in output_query_keywords if isinstance(w, str)])
+    terms.update(["write", "output", "print", "log", "serialize", "запис", "вывод", "печат", "лог"])
+    terms = {t.strip().lower() for t in terms if t and len(t.strip()) >= 3}
+    term_parts = [re.escape(t).replace(r"\ ", r"\s+") for t in sorted(terms, key=len, reverse=True)[:60]]
+    if not term_parts:
+        return False
+    term_pat = "(?:" + "|".join(term_parts) + ")"
+    neg_pat = (
+        r"\b(?:"
+        + "|".join(neg_markers)
+        + r")\b[^.\n]{0,80}"
+        + term_pat
+    )
+    return re.search(neg_pat, query_lower, flags=re.IGNORECASE) is not None
 
 
 def normalize_path_filter(path: str) -> str:
@@ -124,11 +149,12 @@ def clean_path_candidate(raw: str) -> str:
     return p.strip(" \t\r\n.,:;!?")
 
 
-def extract_path_filters_from_query(query: str) -> List[str]:
+def extract_path_filters_from_query(query: str, path_filter_patterns=None) -> List[str]:
+    path_filter_patterns = list(path_filter_patterns or [])
     filters: List[str] = []
     invalid_filters = {"main", "main()", "function", "functions", "module", "directory"}
 
-    for pattern in PATH_FILTER_PATTERNS:
+    for pattern in path_filter_patterns:
         for m in re.finditer(pattern, query, flags=re.IGNORECASE):
             raw = m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(1)
             norm = normalize_path_filter(clean_path_candidate(raw))
@@ -174,17 +200,22 @@ def extract_max_param_count(query_lower: str) -> int | None:
     return None
 
 
-def choose_primary_example_function(query: str, resolved_function_names: List[str]) -> str | None:
+def choose_primary_example_function(
+    query: str,
+    resolved_function_names: List[str],
+    language_name: str | None = None,
+) -> str | None:
     if not resolved_function_names:
         return None
     if len(resolved_function_names) == 1:
         return resolved_function_names[0]
 
     q = query or ""
+    symbol_pat = _qualified_symbol_pattern(language_name)
     patterns = [
-        r"\b(?:calling|call|invoke|invoking|using|use)\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b",
-        r"\b(?:example|пример)\s+(?:of\s+)?([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b",
-        r"\b(?:пример)\s+(?:вызова|использования)\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b",
+        rf"\b(?:calling|call|invoke|invoking|using|use)\s+({symbol_pat})\b",
+        rf"\b(?:example|пример)\s+(?:of\s+)?({symbol_pat})\b",
+        rf"\b(?:пример)\s+(?:вызова|использования)\s+({symbol_pat})\b",
     ]
     lowered_map = {fn.lower(): fn for fn in resolved_function_names}
     for pat in patterns:
@@ -195,7 +226,7 @@ def choose_primary_example_function(query: str, resolved_function_names: List[st
 
     helper_context = set()
     for m in re.finditer(
-        r"\bfrom\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+function\b",
+        rf"\bfrom\s+({symbol_pat})\s+function\b",
         q,
         flags=re.IGNORECASE,
     ):
@@ -217,26 +248,34 @@ def choose_primary_example_function(query: str, resolved_function_names: List[st
 def extract_function_like_candidates_v2(
     query: str,
     known_symbols_by_lower: Dict[str, List[str]] | None = None,
+    common_query_words=None,
+    query_symbol_blacklist=None,
+    language_name: str | None = None,
 ) -> List[str]:
     known_symbols_by_lower = known_symbols_by_lower or {}
+    if common_query_words is None:
+        common_query_words = set()
+    if query_symbol_blacklist is None:
+        query_symbol_blacklist = set(_EXTRA_QUERY_SYMBOL_BLACKLIST)
 
+    symbol_pat = _qualified_symbol_pattern(language_name)
     collected: List[Tuple[str, str, int]] = []
     order = 0
     for t in re.findall(r"`([^`]+)`", query):
         collected.append((t, "explicit", order))
         order += 1
-    for t in re.findall(r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*(?=\()", query):
+    for t in re.findall(rf"\b({symbol_pat})\s*(?=\()", query):
         collected.append((t, "call_like", order))
         order += 1
     phrase_patterns = [
-        r"\b(?:of|for|from|in|using|use|invoke|invoking|calling|call)\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+(?:function|method)\b",
-        r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+(?:function|method)\b",
+        rf"\b(?:of|for|from|in|using|use|invoke|invoking|calling|call)\s+({symbol_pat})\s+(?:function|method)\b",
+        rf"\b({symbol_pat})\s+(?:function|method)\b",
     ]
     for pat in phrase_patterns:
         for t in re.findall(pat, query, flags=re.IGNORECASE):
             collected.append((t, "phrase", order))
             order += 1
-    for t in re.findall(r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\b", query):
+    for t in re.findall(rf"\b({symbol_pat})\b", query):
         collected.append((t, "token", order))
         order += 1
 
@@ -254,16 +293,12 @@ def extract_function_like_candidates_v2(
             continue
         token_lower = token.lower()
         known_symbol_match = token_lower in known_symbols_by_lower
-        looks_like_symbol = (
-            "_" in token
-            or "::" in token
-            or (any(ch.isupper() for ch in token[1:]) and any(ch.islower() for ch in token))
-        )
+        looks_like_symbol = _token_looks_like_symbol(token, language_name)
 
         if source == "token":
-            if token_lower in QUERY_SYMBOL_BLACKLIST:
+            if token_lower in query_symbol_blacklist:
                 continue
-            if token_lower in COMMON_QUERY_WORDS and token_lower != "main":
+            if token_lower in common_query_words and token_lower != "main":
                 continue
             if len(token) < 3 and not known_symbol_match:
                 continue
@@ -271,7 +306,7 @@ def extract_function_like_candidates_v2(
                 continue
         elif source == "phrase":
             # Phrase captures are useful, but we keep only likely symbols.
-            if token_lower in QUERY_SYMBOL_BLACKLIST and token_lower != "main":
+            if token_lower in query_symbol_blacklist and token_lower != "main":
                 continue
             if not (looks_like_symbol or known_symbol_match):
                 continue
@@ -332,32 +367,48 @@ def analyze_query_v2(
     query: str,
     context_history=None,
     symbols_by_lower: Dict[str, List[str]] | None = None,
+    language_name: str | None = None,
 ) -> dict:
     query_lower = (query or "").lower()
     analysis = _base_analysis(query_lower)
     symbols_by_lower = symbols_by_lower or {}
+    adapter = _query_adapter(language_name)
+    type_keywords = dict(adapter.type_keywords)
+    type_aliases = dict(adapter.type_aliases)
+    fuzz_query_keywords = list(adapter.fuzz_query_keywords)
+    parse_like_keywords = list(adapter.parse_like_keywords)
+    stdin_query_keywords = list(adapter.stdin_query_keywords)
+    file_query_keywords = list(adapter.file_query_keywords)
+    api_query_keywords = list(adapter.api_query_keywords)
+    output_query_keywords = list(adapter.output_query_keywords)
+    memory_query_keywords = list(adapter.memory_query_keywords)
+    error_query_keywords = list(adapter.error_query_keywords)
+    params_query_keywords = list(adapter.params_query_keywords)
+    path_filter_patterns = list(adapter.path_filter_patterns)
+    common_query_words = set(adapter.common_query_words)
+    query_symbol_blacklist = set(adapter.query_symbol_blacklist) | _EXTRA_QUERY_SYMBOL_BLACKLIST
     is_example_request = any(
         w in query_lower
         for w in ["example", "пример", "как вызвать", "как использовать", "usage", "использовани"]
     )
 
-    if any(w in query_lower for w in STDIN_QUERY_KEYWORDS):
+    if any(w in query_lower for w in stdin_query_keywords):
         analysis["needs_stdin"] = True
-    if any(w in query_lower for w in FILE_QUERY_KEYWORDS):
+    if any(w in query_lower for w in file_query_keywords):
         analysis["needs_file"] = True
-    if any(w in query_lower for w in API_QUERY_KEYWORDS):
+    if any(w in query_lower for w in api_query_keywords):
         analysis["needs_api"] = True
 
-    if any(w in query_lower for w in OUTPUT_QUERY_KEYWORDS) or re.search(r"\bwrite(s|d|ing)?\s+(to|into)\b", query_lower):
+    if any(w in query_lower for w in output_query_keywords) or re.search(r"\bwrite(s|d|ing)?\s+(to|into)\b", query_lower):
         analysis["needs_output"] = True
 
-    if any(w in query_lower for w in MEMORY_QUERY_KEYWORDS):
+    if any(w in query_lower for w in memory_query_keywords):
         analysis["needs_memory_mgmt"] = True
 
-    if any(w in query_lower for w in ERROR_QUERY_KEYWORDS):
+    if any(w in query_lower for w in error_query_keywords):
         analysis["needs_error_handling"] = True
 
-    if any(w in query_lower for w in PARAMS_QUERY_KEYWORDS):
+    if any(w in query_lower for w in params_query_keywords):
         analysis["needs_params"] = True
 
     param_semantics_markers = [
@@ -374,21 +425,28 @@ def analyze_query_v2(
         if analysis["function_names"] and not analysis.get("primary_function_name"):
             analysis["primary_function_name"] = analysis["function_names"][0]
 
-    analysis["requested_types"] = extract_requested_types(query_lower)
+    analysis["requested_types"] = extract_requested_types(
+        query_lower,
+        type_keywords=type_keywords,
+        type_aliases=type_aliases,
+    )
     if analysis["requested_types"]:
         analysis["needs_type_info"] = True
         analysis["needs_types"] = True
 
-    if query_has_any_keyword(query_lower, PARSE_LIKE_KEYWORDS):
+    if query_has_any_keyword(query_lower, parse_like_keywords):
         analysis["needs_parse_like"] = True
 
-    if query_has_any_keyword(query_lower, FUZZ_QUERY_KEYWORDS):
+    if query_has_any_keyword(query_lower, fuzz_query_keywords):
         analysis["needs_fuzz_targets"] = True
         analysis["is_listing"] = True
 
     analysis["query_function_candidates"] = extract_function_like_candidates_v2(
         query,
         known_symbols_by_lower=symbols_by_lower,
+        common_query_words=common_query_words,
+        query_symbol_blacklist=query_symbol_blacklist,
+        language_name=language_name,
     )
     for cand in analysis["query_function_candidates"]:
         for resolved in symbols_by_lower.get(cand.lower(), []):
@@ -418,11 +476,18 @@ def analyze_query_v2(
     if explicit_max_params is not None:
         analysis["max_param_count"] = explicit_max_params
 
-    if query_excludes_output(query_lower):
+    if query_excludes_output(
+        query_lower,
+        write_like_keywords=adapter.write_like_keywords,
+        output_query_keywords=output_query_keywords,
+    ):
         analysis["exclude_output"] = True
         analysis["needs_output"] = False
 
-    analysis["path_filters"] = extract_path_filters_from_query(query)
+    analysis["path_filters"] = extract_path_filters_from_query(
+        query,
+        path_filter_patterns=path_filter_patterns,
+    )
 
     novelty_requested = any(w in query_lower for w in [
         "other", "another", "different", "new", "remaining", "else",
@@ -470,6 +535,8 @@ def analyze_query_v2(
         explicit_mentions = extract_explicit_function_mentions(
             query,
             known_symbols_by_lower=symbols_by_lower,
+            query_symbol_blacklist=query_symbol_blacklist,
+            language_name=language_name,
         )
         if explicit_mentions:
             explicit_set = set(explicit_mentions)
@@ -493,6 +560,7 @@ def analyze_query_v2(
             analysis["primary_function_name"] = choose_primary_example_function(
                 query,
                 analysis["function_names"],
+                language_name=language_name,
             )
 
     if any(w in query_lower for w in ["implement", "реализ", "как работает", "how does", "algorithm", "алгоритм"]):
