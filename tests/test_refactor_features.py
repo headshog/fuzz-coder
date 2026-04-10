@@ -322,7 +322,7 @@ def test_build_call_graph_called_by_is_correct_for_same_name_same_arity_in_diffe
     assert call_graph[0]["called_by"] == [2]
     assert call_graph[1]["called_by"] == [3]
 
-    # Name-based reverse index remains legacy aggregate, id-based data stays precise.
+    # Name-based reverse index remains shared aggregate, id-based data stays precise.
     assert called_by["foo"] == [2, 3]
     assert called_by["0"] == [2]
     assert called_by["1"] == [3]

@@ -116,11 +116,7 @@ python ask_fuzz_coder.py \
 - `--verbose`: показывать детали анализа
 
 Дополнительно (через переменные окружения):
-- `FC_QUERY_ANALYZER_LEGACY=1` — включить legacy-анализатор запросов (по умолчанию используется v2)
-- `FC_QUERY_ANALYZER_SHADOW=1` — shadow-режим: сравнивать legacy и v2 без смены результата
 - `FC_PIPELINE_SHADOW=1` — shadow-режим orchestration: сравнивать основной и shadow-пайплайны без смены ответа пользователю
-- `FC_EXAMPLE_GROUNDING_LEGACY=1` — включить legacy-grounding для example_generation (по умолчанию используется v2-grounding)
-- `FC_EXAMPLE_GROUNDING_SHADOW=1` — сравнивать legacy и v2 grounding в verbose-режиме без смены ответа
 
 ### Шаг 2.1 (опционально): Браузерный чат (Gradio)
 

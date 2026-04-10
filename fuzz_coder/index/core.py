@@ -688,7 +688,7 @@ def _recipe_rhs_score(expr, language_name=None):
 
 
 def build_type_init_index(chunks, max_per_type=16, language_name=None):
-    """Build v3 structural dataflow index for better example grounding."""
+    """Build v4 structural dataflow index for better example grounding."""
     default_language = language_name or ACTIVE_INDEX_LANGUAGE
     by_type = defaultdict(dict)  # type -> (kind, expr) -> aggregated record
     by_name = defaultdict(list)
@@ -796,7 +796,7 @@ def build_type_init_index(chunks, max_per_type=16, language_name=None):
         if not code:
             continue
 
-        # v3/A: language-adapter init patterns per nominal type.
+        # v4/A: language-adapter init patterns per nominal type.
         for init_item in _extract_init_patterns(code, language_name=chunk_language):
             kind = str((init_item or {}).get("kind") or "").strip()
             type_text = str((init_item or {}).get("type_text") or "").strip()
@@ -839,7 +839,7 @@ def build_type_init_index(chunks, max_per_type=16, language_name=None):
         field_reads = _extract_field_reads(code, language_name=chunk_language)
         call_sites = _extract_call_sites(code, chunk_control_keywords, language_name=chunk_language)
 
-        # v3/B: global struct field writes by nominal type
+        # v4/B: global struct field writes by nominal type
         for fw in field_writes:
             hint = var_hints.get(str(fw.get("base", "")).strip())
             if not hint:
@@ -872,7 +872,7 @@ def build_type_init_index(chunks, max_per_type=16, language_name=None):
                     "function": fn_name,
                 })
 
-        # v3/C: per-function effects on parameter fields (+ helper calls)
+        # v4/C: per-function effects on parameter fields (+ helper calls)
         params = list(c.get("parameters") or [])
         for pi, param in enumerate(params):
             pname = str(param.get("name", "")).strip()

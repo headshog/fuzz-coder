@@ -245,7 +245,7 @@ def choose_primary_example_function(
     return resolved_function_names[0]
 
 
-def extract_function_like_candidates_v2(
+def extract_function_like_candidates(
     query: str,
     known_symbols_by_lower: Dict[str, List[str]] | None = None,
     common_query_words=None,
@@ -363,7 +363,7 @@ def _base_analysis(query_lower: str) -> dict:
     }
 
 
-def analyze_query_v2(
+def analyze_query(
     query: str,
     context_history=None,
     symbols_by_lower: Dict[str, List[str]] | None = None,
@@ -441,7 +441,7 @@ def analyze_query_v2(
         analysis["needs_fuzz_targets"] = True
         analysis["is_listing"] = True
 
-    analysis["query_function_candidates"] = extract_function_like_candidates_v2(
+    analysis["query_function_candidates"] = extract_function_like_candidates(
         query,
         known_symbols_by_lower=symbols_by_lower,
         common_query_words=common_query_words,
@@ -614,15 +614,3 @@ def analyze_query_v2(
 
     return analysis
 
-
-def compare_analysis(legacy: dict, v2: dict) -> dict:
-    """Return lightweight diff between two analysis dicts."""
-    keys = sorted(set(legacy.keys()) | set(v2.keys()))
-    diff = {}
-    for k in keys:
-        if legacy.get(k) != v2.get(k):
-            diff[k] = {
-                "legacy": legacy.get(k),
-                "v2": v2.get(k),
-            }
-    return diff

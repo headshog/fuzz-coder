@@ -12,7 +12,7 @@ from collections import defaultdict
 from .llm import call_llm as _call_llm_impl
 from .prompting import build_prompt as _build_prompt_impl
 from .prompting import _build_thinking_prompt_with_limit as _build_thinking_prompt_impl
-from .query_analysis import analyze_query_v2 as _analyze_query_v2_impl
+from .query_analysis import analyze_query as _analyze_query_impl
 from .example_context import build_example_context as _build_example_context_impl
 from .example_grounding import build_example_context_grounded as _build_example_context_grounded_impl
 from .fallback_builders import build_example_answer_from_context as _build_example_answer_from_context_impl
@@ -875,8 +875,8 @@ class QueryPlanner:
             self.symbols_by_lower[fn.lower()].append(fn)
 
     def analyze_query(self, query, context_history=None):
-        """Analyze query using the single maintained v2 analyzer."""
-        return _analyze_query_v2_impl(
+        """Analyze query using the single maintained query analyzer."""
+        return _analyze_query_impl(
             query,
             context_history=context_history,
             symbols_by_lower=self.symbols_by_lower,

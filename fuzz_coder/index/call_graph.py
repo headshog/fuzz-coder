@@ -168,7 +168,7 @@ def build_call_graph(chunks, control_keywords, language_name: str = "c_cpp"):
             "called_by": sorted(reverse_by_id.get(cid, set())),
         }
 
-    # Keep "called_by.json" useful for both new id-based and legacy name-based lookups.
+    # Keep "called_by.json" useful for both id-based and name-based lookups.
     called_by_out = {}
     for c in chunks:
         cid = c["id"]

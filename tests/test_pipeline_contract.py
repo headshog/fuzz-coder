@@ -435,7 +435,7 @@ def test_pipeline_parameter_analysis_enforces_function_signature_header_and_fall
     assert "Parameters:" in result.answer
 
 
-def test_pipeline_example_grounding_v2_includes_real_caller_and_observed_call(monkeypatch):
+def test_pipeline_example_grounding_includes_real_caller_and_observed_call(monkeypatch):
     meta = [
         {
             "id": 0,
@@ -509,7 +509,6 @@ def test_pipeline_example_grounding_v2_includes_real_caller_and_observed_call(mo
     symbols = {"main": [0], "ma_device_init__dsound": [1]}
     planner = ask_core.QueryPlanner(special_indices, symbols, call_graph, called_by, meta=meta)
     monkeypatch.setattr(ask_core, "call_llm", _stub_call_llm)
-    monkeypatch.delenv("FC_EXAMPLE_GROUNDING_LEGACY", raising=False)
 
     pipeline = QueryPipeline(
         core_module=ask_core,
@@ -531,13 +530,10 @@ def test_pipeline_example_grounding_v2_includes_real_caller_and_observed_call(mo
             shadow_mode=False,
         ),
     )
-    try:
-        result = pipeline.run(
-            "Write an example of ma_device_init__dsound function that is called from main function and its parameters are constructed from file bytes given in argv[1]",
-            [],
-        )
-    finally:
-        monkeypatch.delenv("FC_EXAMPLE_GROUNDING_LEGACY", raising=False)
+    result = pipeline.run(
+        "Write an example of ma_device_init__dsound function that is called from main function and its parameters are constructed from file bytes given in argv[1]",
+        [],
+    )
 
     assert result.used_fallback is True
     assert "/repo/vendor/miniaudio/miniaudio.h:26135-26407" in result.answer
