@@ -254,7 +254,7 @@ def test_analyze_query_example_primary_prefers_call_target_over_main_context():
     assert analysis["primary_function_name"] == "llama_sampler_init_grammar_lazy_patterns"
 
 
-def test_analyze_query_default_v2_filters_generic_symbol_like_data(monkeypatch):
+def test_analyze_query_filters_generic_symbol_like_data():
     planner = QueryPlanner(
         special_indices={},
         symbols={
@@ -268,8 +268,6 @@ def test_analyze_query_default_v2_filters_generic_symbol_like_data(monkeypatch):
     )
     q = "Write an example of process_request function that is called from main function and its parameters are constructed from data given from file in argv[1]"
 
-    monkeypatch.delenv("FC_QUERY_ANALYZER_LEGACY", raising=False)
-    monkeypatch.delenv("FC_QUERY_ANALYZER_SHADOW", raising=False)
     analysis = planner.analyze_query(q)
 
     assert analysis["query_type"] == "example_generation"
@@ -278,7 +276,7 @@ def test_analyze_query_default_v2_filters_generic_symbol_like_data(monkeypatch):
     assert "data" not in analysis["function_names"]
 
 
-def test_analyze_query_shadow_mode_attaches_diff_without_switching_result(monkeypatch):
+def test_analyze_query_does_not_emit_shadow_diff_field():
     planner = QueryPlanner(
         special_indices={},
         symbols={
@@ -292,17 +290,15 @@ def test_analyze_query_shadow_mode_attaches_diff_without_switching_result(monkey
     )
     q = "Write an example of process_request function that is called from main function and its parameters are constructed from data given from file in argv[1]"
 
-    monkeypatch.setenv("FC_QUERY_ANALYZER_LEGACY", "1")
-    monkeypatch.setenv("FC_QUERY_ANALYZER_SHADOW", "1")
     analysis = planner.analyze_query(q)
 
-    assert "data" in analysis["function_names"]
-    assert "_shadow_diff" in analysis
-    assert "function_names" in analysis["_shadow_diff"]
-    assert "data" not in analysis["_shadow_diff"]["function_names"]["v2"]
+    assert "process_request" in analysis["function_names"]
+    assert "main" in analysis["function_names"]
+    assert "data" not in analysis["function_names"]
+    assert "_shadow_diff" not in analysis
 
 
-def test_analyze_query_default_v2_keeps_explicit_symbol_even_if_common_word(monkeypatch):
+def test_analyze_query_keeps_explicit_symbol_even_if_common_word():
     planner = QueryPlanner(
         special_indices={},
         symbols={
@@ -314,8 +310,6 @@ def test_analyze_query_default_v2_keeps_explicit_symbol_even_if_common_word(monk
     )
     q = "Give an example of `write` function"
 
-    monkeypatch.delenv("FC_QUERY_ANALYZER_LEGACY", raising=False)
-    monkeypatch.delenv("FC_QUERY_ANALYZER_SHADOW", raising=False)
     analysis = planner.analyze_query(q)
 
     assert analysis["query_type"] == "example_generation"

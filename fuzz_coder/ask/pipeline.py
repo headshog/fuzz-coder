@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-import os
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -70,8 +69,6 @@ def _print_query_analysis(analysis):
     print(f"  Mentioned functions: {analysis['function_names']}")
     print(f"  Primary function: {analysis.get('primary_function_name')}")
     print(f"  Keywords: {analysis['keywords'][:5]}...")
-    if analysis.get("_shadow_diff"):
-        print(f"  Shadow diff keys: {sorted(list(analysis['_shadow_diff'].keys()))[:8]}")
 
 
 def _compute_retrieval(
@@ -261,6 +258,7 @@ def _build_prompt_and_call_llm(
     max_prompt_chars,
     model,
     verbose,
+    language_name=None,
     example_context=None,
     function_hints=None,
 ):
@@ -273,6 +271,7 @@ def _build_prompt_and_call_llm(
         max_prompt_chars=max_prompt_chars,
         example_context=example_context,
         function_hints=function_hints,
+        language_name=language_name or "c_cpp",
     )
 
     if verbose:
@@ -314,6 +313,7 @@ def _verify_answer(
     model,
     prompt,
     question,
+    language_name="c_cpp",
     example_context=None,
     function_hints=None,
     type_init_index=None,
@@ -403,6 +403,7 @@ def _verify_answer(
                 question=question,
                 first_answer=ans,
                 verification=verification,
+                language_name=language_name,
             )
             candidate_evals: List[CandidateEval] = []
             for idx, cprompt in enumerate(candidate_prompts, 1):
@@ -566,6 +567,7 @@ class QueryPipeline:
         called_by=None,
         function_hints=None,
         type_init_index=None,
+        language_name: Optional[str] = None,
         shadow_runner: Optional[Callable[[str, List[Any]], PipelineResult]] = None,
     ):
         self.core = core_module
@@ -580,6 +582,7 @@ class QueryPipeline:
         self.called_by = called_by or {}
         self.function_hints = function_hints or {}
         self.type_init_index = type_init_index or {}
+        self.language_name = language_name
         self.config = config
         self._shadow_runner = shadow_runner
 
@@ -692,9 +695,6 @@ class QueryPipeline:
         example_context = None
         frags = [self.meta[i] for i in ranked_ids]
         if analysis.get("query_type") in {"example_generation", "parameter_analysis"}:
-            legacy_grounding = os.getenv("FC_EXAMPLE_GROUNDING_LEGACY", "0") == "1"
-            use_grounding_v2 = not legacy_grounding
-            grounding_shadow = os.getenv("FC_EXAMPLE_GROUNDING_SHADOW", "0") == "1"
             grounding_budget = max(40, effective_rerank_top_k * 5)
             grounding_candidate_ids = []
             for cid in (ranked_pool_ids + retrieval["all_candidates"]):
@@ -703,24 +703,16 @@ class QueryPipeline:
                 if len(grounding_candidate_ids) >= grounding_budget:
                     break
 
-            v1_context = None
-            if not use_grounding_v2 or grounding_shadow:
-                v1_context = self.core.build_example_context(frags, analysis=analysis)
-
-            v2_context = None
-            if use_grounding_v2 or grounding_shadow:
-                v2_context = self.core.build_example_context_grounded(
-                    frags=frags,
-                    analysis=analysis,
-                    meta=self.meta,
-                    symbols=self.symbols,
-                    call_graph=self.call_graph,
-                    called_by=self.called_by,
-                    candidate_ids=grounding_candidate_ids,
-                    top_k=grounding_budget,
-                )
-
-            example_context = v2_context if use_grounding_v2 else (v1_context or v2_context or {})
+            example_context = self.core.build_example_context_grounded(
+                frags=frags,
+                analysis=analysis,
+                meta=self.meta,
+                symbols=self.symbols,
+                call_graph=self.call_graph,
+                called_by=self.called_by,
+                candidate_ids=grounding_candidate_ids,
+                top_k=grounding_budget,
+            )
 
             target_id = example_context.get("target_id")
             caller_id = example_context.get("caller_id")
@@ -737,25 +729,6 @@ class QueryPipeline:
                         deduped.append(cid)
                 ranked_ids = deduped[:effective_rerank_top_k]
                 frags = [self.meta[i] for i in ranked_ids]
-
-            if grounding_shadow and self.config.verbose:
-                def _ctx_name(ctx, key):
-                    node = (ctx or {}).get(key) or {}
-                    return node.get("name")
-
-                def _ctx_call(ctx):
-                    return ((ctx or {}).get("observed_call") or {}).get("expr")
-
-                diffs = []
-                if _ctx_name(v1_context, "target") != _ctx_name(v2_context, "target"):
-                    diffs.append("target")
-                if _ctx_name(v1_context, "caller") != _ctx_name(v2_context, "caller"):
-                    diffs.append("caller")
-                if _ctx_call(v1_context) != _ctx_call(v2_context):
-                    diffs.append("observed_call")
-                if diffs:
-                    print("\n[Example Grounding Shadow]")
-                    print(f"  Diff keys: {sorted(diffs)}")
 
             if self.config.verbose and example_context.get("target"):
                 caller_name = (example_context.get("caller") or {}).get("name")
@@ -789,6 +762,7 @@ class QueryPipeline:
             max_prompt_chars=self.config.max_prompt_chars,
             model=self.config.model,
             verbose=self.config.verbose,
+            language_name=self.language_name,
             example_context=example_context,
             function_hints=function_hints,
         )
@@ -804,6 +778,7 @@ class QueryPipeline:
             model=self.config.model,
             prompt=prompt,
             question=q,
+            language_name=self.language_name,
             example_context=example_context,
             function_hints=function_hints,
             type_init_index=self.type_init_index,
@@ -834,7 +809,7 @@ class QueryPipeline:
 
         # Shadow mode: run both paths and compare key outputs, return main path result.
         # If shadow_runner is provided, it can execute an alternate orchestration path
-        # (e.g., legacy pipeline) for contract validation without affecting user output.
+        # for contract validation without affecting user output.
         primary = self._run_once(q, conversation_history)
         shadow = self._shadow_runner(q, conversation_history) if self._shadow_runner else self._run_once(q, conversation_history)
         diffs = {}

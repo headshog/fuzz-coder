@@ -55,3 +55,12 @@ class LanguageFrontend(ABC):
         if not extra:
             return default_bad_prefixes
         return default_bad_prefixes + extra
+
+    @abstractmethod
+    def detect_call_details(self, body: str, control_keywords: Set[str]) -> List[Dict[str, Any]]:
+        """Return call entries with at least: name, qualified, is_member, arity."""
+        raise NotImplementedError
+
+    def detect_calls(self, body: str, control_keywords: Set[str]) -> List[str]:
+        """Backward-compatible list of call names."""
+        return [d.get("name") for d in self.detect_call_details(body, control_keywords) if d.get("name")]

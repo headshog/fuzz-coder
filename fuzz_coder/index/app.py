@@ -81,8 +81,9 @@ def build_function_hints(symbols, doc_files, max_hints_per_function=8):
 
 
 def apply_language_profile(language_name: str) -> None:
-    """Apply language profile to legacy global constants without behavior changes."""
+    """Apply language profile to shared global constants without behavior changes."""
     profile = get_language_profile(language_name)
+    core.ACTIVE_INDEX_LANGUAGE = language_name
     core.SUPPORTED_EXT = set(profile.supported_ext)
     core.CONTROL_KEYWORDS = set(profile.control_keywords)
     core.STDIN_PATTERNS = list(profile.stdin_patterns)
@@ -126,7 +127,7 @@ def main():
 
         for fn in funcs:
             fn["file"] = str(f)
-            fn["calls"] = core.detect_calls(fn["body"])
+            fn["calls"] = core.detect_calls(fn["body"], language_name=args.language)
 
             # Detect input type
             input_info = core.detect_input_type(fn["code"])
@@ -146,7 +147,7 @@ def main():
 
     # Build call graph
     print("Building call graph...")
-    call_graph, called_by = core.build_call_graph(chunks)
+    call_graph, called_by = core.build_call_graph(chunks, language_name=args.language)
 
     # Build embeddings
     print("Building semantic embeddings...")
@@ -183,7 +184,7 @@ def main():
         json.dump(function_hints, f)
 
     # Save type initialization patterns (for better example generation fallback).
-    type_init_index = core.build_type_init_index(chunks)
+    type_init_index = core.build_type_init_index(chunks, language_name=args.language)
     with open(out/"type_init_index.json", "w") as f:
         json.dump(type_init_index, f)
 
@@ -194,6 +195,10 @@ def main():
     # Save reverse call index (called_by)
     with open(out/"called_by.json", "w") as f:
         json.dump(dict(called_by), f)
+
+    # Save index metadata for ask/runtime language-aware behavior.
+    with open(out/"index_meta.json", "w") as f:
+        json.dump({"language": args.language}, f)
 
     # Create special indices for different query types
     stdin_indices = [i for i, c in enumerate(chunks) if c.get("has_stdin")]

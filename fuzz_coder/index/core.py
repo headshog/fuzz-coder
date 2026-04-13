@@ -13,7 +13,12 @@ import os
 from bisect import bisect_right
 from .call_graph import detect_calls as _detect_calls_impl
 from .call_graph import build_call_graph as _build_call_graph_impl
-from fuzz_coder.languages.registry import get_language_frontend
+from fuzz_coder.languages.registry import (
+    get_language_frontend,
+    get_language_profile,
+    get_index_language_adapter,
+    infer_index_language_from_path,
+)
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -24,77 +29,18 @@ try:
 except ImportError:
     HAS_TREE_SITTER = False
 
-SUPPORTED_EXT = {
-    ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh"
-}
+ACTIVE_INDEX_LANGUAGE = "c_cpp"
+_DEFAULT_PROFILE = get_language_profile(ACTIVE_INDEX_LANGUAGE)
 
-CONTROL_KEYWORDS = {
-    "if", "for", "while", "switch", "return", "sizeof", "catch",
-    "new", "delete", "throw", "else", "do", "class", "struct",
-    "namespace", "template", "typedef", "using", "enum", "union"
-}
-
-# Patterns for detecting input sources
-STDIN_PATTERNS = [
-    r"\b(cin)\s*>>",
-    r"\b(scanf|getchar|getc|gets|gets_s)\s*\(",
-    r"\b(fgets|fscanf)\s*\([^)]*(stdin)\b",
-    r"\bstd::getline\s*\(\s*(std::)?cin\b",
-    r"\bgetline\s*\(\s*(std::)?cin\b",
-    r"\bread\s*\(\s*(0|STDIN_FILENO)\b",
-    r"\b(std::)?cin\b",
-    r"\b(System\.Console\.Read)\b",
-    r"\b(Console\.Read|ReadLine|ReadKey)\b",
-    r"\b(input|raw_input)\s*\(",
-    r"\b(sys\.stdin|process\.stdin)\b",
-]
-
-FILE_INPUT_PATTERNS = [
-    r"\bf(open|fopen|ifstream|fstream)\s*\(",
-    r"\b(fread|fgets|fscanf|fgetc|getc)\s*\(",
-    r"\b(std::)?(ifstream|fstream|ofstream)\b",
-    r"\b(File\.Open|File\.Read|StreamReader)\b",
-    r"\b(fs\.readFileSync?|fs\.createReadStream)\b",
-    r"\b(Path\.OpenText|File\.ReadAllText)\b",
-]
-
-API_CALL_PATTERNS = [
-    r"\b(http_client|HttpClient|curl_easy|wget)\b",
-    r"\b(requests\.(get|post|put|delete|patch))\b",
-    r"\b(fetch|axios|XMLHttpRequest)\b",
-    r"\b(urllib\.(request|urlopen))\b",
-    r"\b(httplib::Client|boost::beast)\b",
-]
-
-# Additional patterns for better code understanding
-OUTPUT_PATTERNS = [
-    r"\b(cout|printf|fprintf|sprintf)\b",
-    r"\b(std::)?(cout|cerr|clog|print|writeln)\b",
-    r"\b(Console\.Write|System\.out)\b",
-]
-
-MEMORY_MANAGEMENT_PATTERNS = [
-    r"\b(malloc|calloc|realloc|free)\b",
-    r"\b(new|delete)\b",
-    r"\b(shared_ptr|unique_ptr|weak_ptr)\b",
-]
-
-ERROR_HANDLING_PATTERNS = [
-    r"\b(throw|try|catch|finally)\b",
-    r"\b(errno|perror|strerror)\b",
-    r"\b(assert|static_assert)\b",
-]
-
-# Type system patterns for better type-based queries
-TYPE_PATTERNS = {
-    "byte_array": [r"\b(uint8_t|unsigned\s+char|char\s*\*|std::vector<uint8_t>|QByteArray|ByteBuffer)\b"],
-    "string": [r"\b(std::string|char\s*\*|const\s+char\s*\*|QString|std::wstring)\b"],
-    "integer": [r"\b(int|long|short|int32_t|int64_t|size_t|ssize_t)\b"],
-    "float": [r"\b(float|double|long\s+double)\b"],
-    "pointer": [r"\w+\s*\*\s*\w+"],
-    "reference": [r"\w+\s*&\s*\w+"],
-    "template": [r"\b(std::vector|std::map|std::set|std::unordered_map|std::array)\b"],
-}
+SUPPORTED_EXT = set(_DEFAULT_PROFILE.supported_ext)
+CONTROL_KEYWORDS = set(_DEFAULT_PROFILE.control_keywords)
+STDIN_PATTERNS = list(_DEFAULT_PROFILE.stdin_patterns)
+FILE_INPUT_PATTERNS = list(_DEFAULT_PROFILE.file_input_patterns)
+API_CALL_PATTERNS = list(_DEFAULT_PROFILE.api_call_patterns)
+OUTPUT_PATTERNS = list(_DEFAULT_PROFILE.output_patterns)
+MEMORY_MANAGEMENT_PATTERNS = list(_DEFAULT_PROFILE.memory_management_patterns)
+ERROR_HANDLING_PATTERNS = list(_DEFAULT_PROFILE.error_handling_patterns)
+TYPE_PATTERNS = dict(_DEFAULT_PROFILE.type_patterns)
 
 
 def unpack_if_zip(src, dst):
@@ -245,11 +191,12 @@ class TreeSitterParser:
             source_bytes = code.encode("utf-8", errors="ignore")
             tree = self.parser.parse(source_bytes)
             root = tree.root_node
+            profile = get_language_profile(self.language_name)
             functions = self.frontend.parse_tree_sitter_functions(
                 parser_utils=self,
                 source_bytes=source_bytes,
                 root=root,
-                control_keywords=CONTROL_KEYWORDS,
+                control_keywords=set(profile.control_keywords),
             )
 
         except Exception as e:
@@ -268,62 +215,7 @@ class TreeSitterParser:
 
     def _parse_parameters(self, params_text):
         """Parse parameter list into structured format"""
-        params = []
-        # Remove parentheses
-        params_text = params_text.strip("()")
-        if not params_text.strip():
-            return params
-
-        # Split by comma (handling nested templates)
-        depth = 0
-        current = ""
-        for char in params_text:
-            if char in "<(":
-                depth += 1
-            elif char in ">)":
-                depth -= 1
-            elif char == "," and depth == 0:
-                if current.strip():
-                    params.append(self._parse_single_param(current.strip()))
-                current = ""
-                continue
-            current += char
-
-        if current.strip():
-            params.append(self._parse_single_param(current.strip()))
-
-        return params
-
-    def _parse_single_param(self, param_text):
-        """Parse a single parameter"""
-        parts = param_text.split()
-        if len(parts) >= 2:
-            # Try to identify type and name
-            name = parts[-1].split("&")[-1].split("*")[-1].strip()
-            param_type = " ".join(parts[:-1])
-
-            # Check if it's a reference or pointer
-            is_reference = "&" in param_text
-            is_pointer = "*" in param_text
-            is_const = "const" in param_text.lower()
-
-            return {
-                "name": name,
-                "type": param_type,
-                "is_reference": is_reference,
-                "is_pointer": is_pointer,
-                "is_const": is_const,
-                "raw": param_text
-            }
-        else:
-            return {
-                "name": param_text,
-                "type": "unknown",
-                "is_reference": False,
-                "is_pointer": False,
-                "is_const": False,
-                "raw": param_text
-            }
+        return parse_parameters_simple(params_text, language_name=self.language_name)
 
     def _iter_nodes_by_type(self, root_node, node_type):
         """Yield nodes of a specific type via DFS traversal."""
@@ -335,52 +227,6 @@ class TreeSitterParser:
             # Reverse children to keep left-to-right traversal order.
             stack.extend(reversed(node.children))
 
-    def _extract_function_name_node(self, func_node):
-        """Extract function name node from function_definition declarator chain."""
-        declarator = func_node.child_by_field_name("declarator")
-        if declarator is None:
-            return None
-
-        current = declarator
-        for _ in range(32):
-            if current.type in {"identifier", "field_identifier"}:
-                return current
-
-            if current.type == "qualified_identifier":
-                name_node = current.child_by_field_name("name")
-                if name_node is not None:
-                    if name_node.type in {"identifier", "field_identifier"}:
-                        return name_node
-                    current = name_node
-                    continue
-
-            next_decl = current.child_by_field_name("declarator")
-            if next_decl is None:
-                break
-            current = next_decl
-
-        return None
-
-    def _extract_function_params_node(self, func_node):
-        """Extract parameter list node from function_definition declarator chain."""
-        declarator = func_node.child_by_field_name("declarator")
-        if declarator is None:
-            return None
-
-        current = declarator
-        for _ in range(32):
-            if current.type == "function_declarator":
-                params = current.child_by_field_name("parameters")
-                if params is not None:
-                    return params
-
-            next_decl = current.child_by_field_name("declarator")
-            if next_decl is None:
-                break
-            current = next_decl
-
-        return None
-
     def _build_signature(self, name, params):
         """Build function signature string"""
         param_strs = [p["raw"] for p in params]
@@ -391,6 +237,9 @@ def extract_functions_regex(_filepath, text, language_name="c_cpp"):
     """Fallback regex-based function extraction"""
     res = []
     frontend = get_language_frontend(language_name)
+    adapter = get_index_language_adapter(language_name)
+    profile = get_language_profile(language_name)
+    control_keywords = set(profile.control_keywords)
     lines_with_end = text.splitlines(keepends=True)
     lines = [ln.rstrip("\r\n") for ln in lines_with_end]
     # Keep fallback conservative but resilient for heavy template/macros signatures.
@@ -424,7 +273,7 @@ def extract_functions_regex(_filepath, text, language_name="c_cpp"):
             scanned_chars += len(line) + 1
             joined = "\n".join(sig_lines)
 
-            brace_pos, terminated_decl = scan_signature_for_body(joined)
+            brace_pos, terminated_decl = adapter.scan_signature_for_body(joined)
 
             if brace_pos != -1:
                 found_body = True
@@ -484,15 +333,15 @@ def extract_functions_regex(_filepath, text, language_name="c_cpp"):
         if head == name and re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
             i += 1
             continue
-        if name in CONTROL_KEYWORDS:
+        if name in control_keywords:
             i += 1
             continue
 
         # Extract parameters
-        rp = find_matching_paren(compact, lp)
+        rp = adapter.find_matching_paren(compact, lp)
         if rp != -1:
             params_text = compact[lp+1:rp]
-            params = parse_parameters_simple(params_text)
+            params = adapter.parse_parameters_simple(params_text)
         else:
             params = []
 
@@ -531,461 +380,28 @@ def extract_functions_regex(_filepath, text, language_name="c_cpp"):
     return res
 
 
-def scan_signature_for_body(signature_text):
-    """Find top-level body brace in a function signature window.
-
-    Returns (brace_pos, terminated_decl):
-      - brace_pos >= 0: opening "{" of function body found
-      - terminated_decl True: declaration ended with ";" before any body
-    """
-    in_str = False
-    in_char = False
-    in_line_comment = False
-    in_block_comment = False
-    escape = False
-
-    seen_lparen = False
-    paren_depth = 0
-
-    i = 0
-    n = len(signature_text)
-    while i < n:
-        ch = signature_text[i]
-        nxt = signature_text[i + 1] if i + 1 < n else ""
-
-        if in_line_comment:
-            if ch == "\n":
-                in_line_comment = False
-            i += 1
-            continue
-
-        if in_block_comment:
-            if ch == "*" and nxt == "/":
-                in_block_comment = False
-                i += 2
-                continue
-            i += 1
-            continue
-
-        if in_str:
-            if not escape and ch == '"':
-                in_str = False
-            escape = (ch == "\\" and not escape)
-            i += 1
-            continue
-
-        if in_char:
-            if not escape and ch == "'":
-                in_char = False
-            escape = (ch == "\\" and not escape)
-            i += 1
-            continue
-
-        if ch == "/" and nxt == "/":
-            in_line_comment = True
-            i += 2
-            continue
-
-        if ch == "/" and nxt == "*":
-            in_block_comment = True
-            i += 2
-            continue
-
-        if ch == '"':
-            in_str = True
-            escape = False
-            i += 1
-            continue
-
-        if ch == "'":
-            in_char = True
-            escape = False
-            i += 1
-            continue
-
-        if ch == "(":
-            seen_lparen = True
-            paren_depth += 1
-            i += 1
-            continue
-
-        if ch == ")" and paren_depth > 0:
-            paren_depth -= 1
-            i += 1
-            continue
-
-        if seen_lparen and paren_depth == 0:
-            if ch == "{":
-                return i, False
-            if ch == ";":
-                return -1, True
-
-        i += 1
-
-    return -1, False
+def scan_signature_for_body(signature_text, language_name=None):
+    lang = language_name or "c_cpp"
+    adapter = get_index_language_adapter(lang)
+    return adapter.scan_signature_for_body(signature_text or "")
 
 
-def parse_parameters_simple(params_text):
-    """Simple parameter parsing for regex fallback"""
-    params = []
-    params_text = params_text.strip()
-    if not params_text or params_text == "void":
-        return params
-
-    for idx, param in enumerate(split_top_level_params(params_text)):
-        param = param.strip()
-        if not param:
-            continue
-
-        name, param_type = parse_single_parameter_simple(param)
-        if not name or name == "unknown":
-            name = f"arg{idx}"
-        params.append({
-            "name": name,
-            "type": param_type,
-            "is_reference": "&" in param,
-            "is_pointer": "*" in param,
-            "is_const": "const" in param.lower(),
-            "raw": param
-        })
-
-    return params
+def parse_parameters_simple(params_text, language_name=None):
+    lang = language_name or "c_cpp"
+    adapter = get_index_language_adapter(lang)
+    return adapter.parse_parameters_simple(params_text or "")
 
 
-def split_top_level_params(params_text):
-    """Split C/C++ parameter list by top-level commas."""
-    out = []
-    cur = []
-
-    depth_angle = 0
-    depth_paren = 0
-    depth_brace = 0
-    depth_bracket = 0
-
-    in_str = False
-    in_char = False
-    escape = False
-
-    i = 0
-    n = len(params_text)
-    while i < n:
-        ch = params_text[i]
-
-        if in_str:
-            cur.append(ch)
-            if not escape and ch == '"':
-                in_str = False
-            escape = (ch == "\\" and not escape)
-            i += 1
-            continue
-
-        if in_char:
-            cur.append(ch)
-            if not escape and ch == "'":
-                in_char = False
-            escape = (ch == "\\" and not escape)
-            i += 1
-            continue
-
-        if ch == '"':
-            in_str = True
-            escape = False
-            cur.append(ch)
-            i += 1
-            continue
-
-        if ch == "'":
-            in_char = True
-            escape = False
-            cur.append(ch)
-            i += 1
-            continue
-
-        if ch == "<":
-            depth_angle += 1
-            cur.append(ch)
-            i += 1
-            continue
-        if ch == ">":
-            depth_angle = max(0, depth_angle - 1)
-            cur.append(ch)
-            i += 1
-            continue
-        if ch == "(":
-            depth_paren += 1
-            cur.append(ch)
-            i += 1
-            continue
-        if ch == ")":
-            depth_paren = max(0, depth_paren - 1)
-            cur.append(ch)
-            i += 1
-            continue
-        if ch == "{":
-            depth_brace += 1
-            cur.append(ch)
-            i += 1
-            continue
-        if ch == "}":
-            depth_brace = max(0, depth_brace - 1)
-            cur.append(ch)
-            i += 1
-            continue
-        if ch == "[":
-            depth_bracket += 1
-            cur.append(ch)
-            i += 1
-            continue
-        if ch == "]":
-            depth_bracket = max(0, depth_bracket - 1)
-            cur.append(ch)
-            i += 1
-            continue
-
-        if ch == "," and depth_angle == 0 and depth_paren == 0 and depth_brace == 0 and depth_bracket == 0:
-            part = "".join(cur).strip()
-            if part:
-                out.append(part)
-            cur = []
-            i += 1
-            continue
-
-        cur.append(ch)
-        i += 1
-
-    tail = "".join(cur).strip()
-    if tail:
-        out.append(tail)
-    return out
+def split_top_level_params(params_text, language_name=None):
+    lang = language_name or "c_cpp"
+    adapter = get_index_language_adapter(lang)
+    return adapter.split_top_level_params(params_text or "")
 
 
-def parse_single_parameter_simple(param_text):
-    """Best-effort parsing of a single C/C++ parameter."""
-    raw = param_text.strip()
-    if not raw:
-        return "unknown", "unknown"
-
-    no_default = _strip_default_initializer_top_level(raw)
-    no_default = re.sub(r"\b__attribute__\s*\(\(.*?\)\)", " ", no_default)
-    no_default = re.sub(r"\[\[.*?\]\]", " ", no_default)
-    no_default = re.sub(r"\s+", " ", no_default).strip()
-    if no_default == "...":
-        return "varargs", "..."
-
-    # Named parameter packs: Args&&... args
-    pack = re.search(r"\.\.\.\s*([A-Za-z_]\w*)\s*$", no_default)
-    if pack:
-        name = pack.group(1)
-        ptype = no_default[:pack.start(1)].strip()
-        return name, ptype or "unknown"
-
-    # Function pointer param: void (*cb)(int)
-    fp = re.search(
-        r"\(\s*[*&]\s*(?:(?:const|volatile|restrict|__restrict__)\s+)*([A-Za-z_]\w*)\s*\)",
-        no_default,
-    )
-    if fp:
-        name = fp.group(1)
-        return name, no_default
-
-    # Array-style parameter: int data[4]
-    arr = re.search(r"([A-Za-z_]\w*)\s*(\[[^\]]*\])\s*$", no_default)
-    if arr:
-        name = arr.group(1)
-        ptype = no_default[:arr.start(1)].strip()
-        return name, ptype or "unknown"
-
-    # Generic trailing identifier at top-level.
-    trailing = _extract_trailing_identifier_top_level(no_default)
-    if trailing:
-        name, start_idx = trailing
-        ptype = no_default[:start_idx].strip()
-        if ptype:
-            return name, ptype
-        return name, "unknown"
-
-    return raw, "unknown"
-
-
-def _strip_default_initializer_top_level(param_text):
-    """Strip default initializer (`= ...`) only at top-level."""
-    s = str(param_text or "")
-    depth_angle = 0
-    depth_paren = 0
-    depth_brace = 0
-    depth_bracket = 0
-    in_str = False
-    in_char = False
-    escape = False
-
-    i = 0
-    n = len(s)
-    while i < n:
-        ch = s[i]
-        if in_str:
-            if not escape and ch == '"':
-                in_str = False
-            escape = (ch == "\\" and not escape)
-            i += 1
-            continue
-        if in_char:
-            if not escape and ch == "'":
-                in_char = False
-            escape = (ch == "\\" and not escape)
-            i += 1
-            continue
-
-        if ch == '"':
-            in_str = True
-            escape = False
-            i += 1
-            continue
-        if ch == "'":
-            in_char = True
-            escape = False
-            i += 1
-            continue
-
-        if ch == "<":
-            depth_angle += 1
-            i += 1
-            continue
-        if ch == ">":
-            depth_angle = max(0, depth_angle - 1)
-            i += 1
-            continue
-        if ch == "(":
-            depth_paren += 1
-            i += 1
-            continue
-        if ch == ")":
-            depth_paren = max(0, depth_paren - 1)
-            i += 1
-            continue
-        if ch == "{":
-            depth_brace += 1
-            i += 1
-            continue
-        if ch == "}":
-            depth_brace = max(0, depth_brace - 1)
-            i += 1
-            continue
-        if ch == "[":
-            depth_bracket += 1
-            i += 1
-            continue
-        if ch == "]":
-            depth_bracket = max(0, depth_bracket - 1)
-            i += 1
-            continue
-
-        if ch == "=" and depth_angle == 0 and depth_paren == 0 and depth_brace == 0 and depth_bracket == 0:
-            return s[:i].rstrip()
-
-        i += 1
-    return s.strip()
-
-
-def _extract_trailing_identifier_top_level(param_text):
-    """Return (identifier, start_idx) for a trailing top-level parameter name."""
-    s = str(param_text or "").rstrip()
-    if not s:
-        return None
-
-    depth_angle = 0
-    depth_paren = 0
-    depth_brace = 0
-    depth_bracket = 0
-    in_str = False
-    in_char = False
-    escape = False
-
-    i = len(s) - 1
-    while i >= 0:
-        ch = s[i]
-        if in_str:
-            if not escape and ch == '"':
-                in_str = False
-            escape = (ch == "\\" and not escape)
-            i -= 1
-            continue
-        if in_char:
-            if not escape and ch == "'":
-                in_char = False
-            escape = (ch == "\\" and not escape)
-            i -= 1
-            continue
-
-        if ch == '"':
-            in_str = True
-            escape = False
-            i -= 1
-            continue
-        if ch == "'":
-            in_char = True
-            escape = False
-            i -= 1
-            continue
-
-        if ch == ">":
-            depth_angle += 1
-            i -= 1
-            continue
-        if ch == "<":
-            depth_angle = max(0, depth_angle - 1)
-            i -= 1
-            continue
-        if ch == ")":
-            depth_paren += 1
-            i -= 1
-            continue
-        if ch == "(":
-            depth_paren = max(0, depth_paren - 1)
-            i -= 1
-            continue
-        if ch == "}":
-            depth_brace += 1
-            i -= 1
-            continue
-        if ch == "{":
-            depth_brace = max(0, depth_brace - 1)
-            i -= 1
-            continue
-        if ch == "]":
-            depth_bracket += 1
-            i -= 1
-            continue
-        if ch == "[":
-            depth_bracket = max(0, depth_bracket - 1)
-            i -= 1
-            continue
-
-        if depth_angle == 0 and depth_paren == 0 and depth_brace == 0 and depth_bracket == 0:
-            if ch.isalnum() or ch == "_":
-                end = i
-                start = i
-                while start >= 0 and (s[start].isalnum() or s[start] == "_"):
-                    start -= 1
-                name = s[start + 1:end + 1]
-                # Ensure name is really trailing token (skip known type-only endings).
-                if name and name not in {
-                    "const", "volatile", "unsigned", "signed", "short", "long",
-                    "int", "char", "float", "double", "bool", "void", "size_t",
-                    "ssize_t", "struct", "class", "enum", "typename", "auto",
-                }:
-                    return name, start + 1
-                return None
-            if ch.isspace():
-                i -= 1
-                continue
-            # Hit top-level non-identifier token before any trailing identifier.
-            if ch in "*&])":
-                i -= 1
-                continue
-            return None
-
-        i -= 1
-    return None
+def parse_single_parameter_simple(param_text, language_name=None):
+    lang = language_name or "c_cpp"
+    adapter = get_index_language_adapter(lang)
+    return adapter.parse_single_parameter_simple(param_text or "")
 
 
 def find_matching_brace(text, pos):
@@ -1065,99 +481,22 @@ def find_matching_brace(text, pos):
     return -1
 
 
-def find_matching_paren(text, pos):
-    """Find matching ')' for '(' at position pos, honoring nested parens and literals/comments."""
-    if pos < 0 or pos >= len(text) or text[pos] != "(":
-        return -1
-
-    depth = 0
-    i = pos
-    n = len(text)
-
-    in_str = False
-    in_char = False
-    in_line_comment = False
-    in_block_comment = False
-    escape = False
-
-    while i < n:
-        ch = text[i]
-        nxt = text[i + 1] if i + 1 < n else ""
-
-        if in_line_comment:
-            if ch == "\n":
-                in_line_comment = False
-            i += 1
-            continue
-
-        if in_block_comment:
-            if ch == "*" and nxt == "/":
-                in_block_comment = False
-                i += 2
-                continue
-            i += 1
-            continue
-
-        if in_str:
-            if not escape and ch == '"':
-                in_str = False
-            escape = (ch == "\\" and not escape)
-            i += 1
-            continue
-
-        if in_char:
-            if not escape and ch == "'":
-                in_char = False
-            escape = (ch == "\\" and not escape)
-            i += 1
-            continue
-
-        if ch == "/" and nxt == "/":
-            in_line_comment = True
-            i += 2
-            continue
-
-        if ch == "/" and nxt == "*":
-            in_block_comment = True
-            i += 2
-            continue
-
-        if ch == '"':
-            in_str = True
-            escape = False
-            i += 1
-            continue
-
-        if ch == "'":
-            in_char = True
-            escape = False
-            i += 1
-            continue
-
-        if ch == "(":
-            depth += 1
-            i += 1
-            continue
-        if ch == ")":
-            depth -= 1
-            if depth == 0:
-                return i
-            i += 1
-            continue
-
-        i += 1
-
-    return -1
+def find_matching_paren(text, pos, language_name=None):
+    lang = language_name or "c_cpp"
+    adapter = get_index_language_adapter(lang)
+    return adapter.find_matching_paren(text or "", pos)
 
 
-def detect_calls(body):
-    """Detect function calls in code body"""
-    return _detect_calls_impl(body, CONTROL_KEYWORDS)
+def detect_calls(body, language_name="c_cpp"):
+    """Detect function calls in code body."""
+    profile = get_language_profile(language_name)
+    return _detect_calls_impl(body, set(profile.control_keywords), language_name=language_name)
 
 
-def build_call_graph(chunks):
-    """Build a call graph from function chunks"""
-    return _build_call_graph_impl(chunks, CONTROL_KEYWORDS)
+def build_call_graph(chunks, language_name="c_cpp"):
+    """Build a call graph from function chunks."""
+    profile = get_language_profile(language_name)
+    return _build_call_graph_impl(chunks, set(profile.control_keywords), language_name=language_name)
 
 
 def build_embeddings(chunks, model_name, embedding_backend=None):
@@ -1221,60 +560,29 @@ def build_lexical_index(chunks):
     return idx
 
 
-def _split_call_args_top_level(args_text):
+def _split_call_args_top_level(args_text, language_name=None):
     args_text = str(args_text or "").strip()
     if not args_text:
         return []
-    return split_top_level_params(args_text)
+    return split_top_level_params(args_text, language_name=language_name)
 
 
-def _is_literal_like_token(token):
-    t = str(token or "").strip()
-    if not t:
-        return False
-    if re.fullmatch(r"(?:[-+]?\d+(?:\.\d+)?(?:[uUlLfF]*)|nullptr|NULL|true|false)", t):
-        return True
-    if re.fullmatch(r"'(?:\\.|[^'])+'", t):
-        return True
-    if re.fullmatch(r"\"(?:\\.|[^\"])*\"", t):
-        return True
-    # allow namespaced/UPPERCASE constants
-    if re.fullmatch(r"(?:[A-Za-z_]\w*::)*[A-Z_][A-Z0-9_]*", t):
-        return True
-    return False
+def _is_literal_like_token(token, language_name=None):
+    lang = language_name or ACTIVE_INDEX_LANGUAGE
+    adapter = get_index_language_adapter(lang)
+    return adapter.is_literal_like_token(token)
 
 
-def _is_self_contained_call_expr(expr):
-    e = str(expr or "").strip()
-    m = re.fullmatch(r"(?P<fn>(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*\((?P<args>.*)\)", e)
-    if not m:
-        return False
-    args = _split_call_args_top_level(m.group("args") or "")
-    if not args:
-        return True
-    for a in args:
-        if not _is_literal_like_token(a):
-            return False
-    return True
+def _is_self_contained_call_expr(expr, language_name=None):
+    lang = language_name or ACTIVE_INDEX_LANGUAGE
+    adapter = get_index_language_adapter(lang)
+    return adapter.is_self_contained_call_expr(expr)
 
 
-def _extract_nominal_type_name_for_init(type_text):
-    t = re.sub(r"\b(const|volatile|restrict|__restrict__)\b", " ", str(type_text or ""))
-    t = re.sub(r"\s+", " ", t).strip()
-    t = t.replace("*", " ").replace("&", " ")
-    tokens = re.findall(r"[A-Za-z_]\w*", t)
-    if not tokens:
-        return None
-    skip = {
-        "struct", "class", "enum",
-        "unsigned", "signed", "long", "short",
-        "int", "float", "double", "bool", "void",
-        "size_t", "ssize_t", "auto", "typename",
-    }
-    for tok in reversed(tokens):
-        if tok.lower() not in skip:
-            return tok
-    return None
+def _extract_nominal_type_name_for_init(type_text, language_name=None):
+    lang = language_name or ACTIVE_INDEX_LANGUAGE
+    adapter = get_index_language_adapter(lang)
+    return adapter.extract_nominal_type_name_for_init(type_text)
 
 
 def _normalize_expr(expr, max_len=240):
@@ -1284,15 +592,13 @@ def _normalize_expr(expr, max_len=240):
     return e[: max_len - 3].rstrip() + "..."
 
 
-def _extract_call_name(expr):
-    e = str(expr or "").strip()
-    m = re.match(r"((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*\(", e)
-    if not m:
-        return None
-    return m.group(1).split("::")[-1]
+def _extract_call_name(expr, language_name=None):
+    lang = language_name or ACTIVE_INDEX_LANGUAGE
+    adapter = get_index_language_adapter(lang)
+    return adapter.extract_call_name(expr)
 
 
-def _init_pattern_score(kind, expr):
+def _init_pattern_score(kind, expr, language_name=None):
     score = 0
     e = str(expr or "").lower()
     if kind == "pointer_call":
@@ -1307,174 +613,39 @@ def _init_pattern_score(kind, expr):
     for kw in ["alloc", "create", "init", "default", "open", "new"]:
         if kw in e:
             score += 2
-    if _is_self_contained_call_expr(expr):
+    if _is_self_contained_call_expr(expr, language_name=language_name):
         score += 3
     return score
 
 
-def _extract_variable_type_hints(code):
-    """Extract local variable -> nominal type hints from a function body."""
-    hints = {}
-    ptr_decl = re.compile(
-        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*\*\s*"
-        r"(?P<var>[A-Za-z_]\w*)\b"
-    )
-    val_decl = re.compile(
-        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+"
-        r"(?P<var>[A-Za-z_]\w*)\b"
-    )
-
-    for raw in str(code or "").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("//") or line.startswith("#"):
-            continue
-        if "(" in line and ")" in line and line.endswith("{"):
-            continue
-
-        match = ptr_decl.match(line)
-        is_ptr = True
-        if not match:
-            match = val_decl.match(line)
-            is_ptr = False
-        if not match:
-            continue
-
-        var = str(match.group("var") or "").strip()
-        nominal = _extract_nominal_type_name_for_init(match.group("type"))
-        if not var or not nominal:
-            continue
-        hints[var] = {"nominal_type": nominal, "is_pointer": is_ptr}
-    return hints
+def _extract_variable_type_hints(code, language_name=None):
+    lang = language_name or ACTIVE_INDEX_LANGUAGE
+    adapter = get_index_language_adapter(lang)
+    return adapter.extract_variable_type_hints(code or "")
 
 
-def _extract_field_assignments(code):
-    """Extract assignments like cfg.x = ... and cfg->x = ..."""
-    out = []
-    pat = re.compile(
-        r"^\s*(?P<base>[A-Za-z_]\w*)\s*"
-        r"(?P<tail>(?:(?:\.|->)\s*[A-Za-z_]\w+)+)\s*=\s*"
-        r"(?P<rhs>[^;]+)\s*;\s*$"
-    )
-
-    for li, raw in enumerate(str(code or "").splitlines(), start=1):
-        line = raw.strip()
-        if not line or line.startswith("//") or line.startswith("#"):
-            continue
-        if "==" in line or "+=" in line or "-=" in line or "*=" in line or "/=" in line:
-            continue
-        m = pat.match(line)
-        if not m:
-            continue
-
-        base = str(m.group("base") or "").strip()
-        tail = str(m.group("tail") or "")
-        rhs = str(m.group("rhs") or "").strip()
-        if not base or not tail or not rhs:
-            continue
-
-        pieces = re.findall(r"(\.|->)\s*([A-Za-z_]\w+)", tail)
-        if not pieces:
-            continue
-        access = "arrow" if pieces[0][0] == "->" else "dot"
-        path = ".".join(name for _, name in pieces)
-        out.append({
-            "line": li,
-            "base": base,
-            "access": access,
-            "path": path,
-            "rhs": _normalize_expr(rhs),
-        })
-    return out
+def _extract_init_patterns(code, language_name=None):
+    lang = language_name or ACTIVE_INDEX_LANGUAGE
+    adapter = get_index_language_adapter(lang)
+    return adapter.extract_init_patterns(code or "")
 
 
-def _extract_field_reads(code):
-    """Extract field reads like cfg.x / cfg->x (excluding direct LHS writes)."""
-    out = []
-    access_pat = re.compile(
-        r"(?P<base>[A-Za-z_]\w*)\s*(?P<tail>(?:(?:\.|->)\s*[A-Za-z_]\w+)+)"
-    )
-    assign_pat = re.compile(
-        r"^\s*(?P<base>[A-Za-z_]\w*)\s*(?P<tail>(?:(?:\.|->)\s*[A-Za-z_]\w+)+)\s*=\s*[^;]+;\s*$"
-    )
-
-    for li, raw in enumerate(str(code or "").splitlines(), start=1):
-        line = raw.strip()
-        if not line or line.startswith("//") or line.startswith("#"):
-            continue
-
-        write_key = None
-        m_assign = assign_pat.match(line)
-        if m_assign:
-            base = str(m_assign.group("base") or "").strip()
-            tail = str(m_assign.group("tail") or "")
-            pieces = re.findall(r"(\.|->)\s*([A-Za-z_]\w+)", tail)
-            if pieces:
-                access = "arrow" if pieces[0][0] == "->" else "dot"
-                path = ".".join(name for _, name in pieces)
-                write_key = (base, access, path)
-
-        for m in access_pat.finditer(line):
-            base = str(m.group("base") or "").strip()
-            tail = str(m.group("tail") or "")
-            if not base or not tail:
-                continue
-            pieces = re.findall(r"(\.|->)\s*([A-Za-z_]\w+)", tail)
-            if not pieces:
-                continue
-            access = "arrow" if pieces[0][0] == "->" else "dot"
-            path = ".".join(name for _, name in pieces)
-            key = (base, access, path)
-            if write_key is not None and key == write_key:
-                continue
-            out.append({
-                "line": li,
-                "base": base,
-                "access": access,
-                "path": path,
-            })
-    return out
+def _extract_field_assignments(code, language_name=None):
+    lang = language_name or ACTIVE_INDEX_LANGUAGE
+    adapter = get_index_language_adapter(lang)
+    return adapter.extract_field_assignments(code or "")
 
 
-def _extract_call_sites(code, control_keywords):
-    """Extract call sites with name/arity/args/line from function body."""
-    out = []
-    masked = code
-    # Reuse call-regex from call graph module semantics.
-    call_re = re.compile(
-        r"(?<![A-Za-z0-9_~])(?P<expr>"
-        r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*"
-        r"|"
-        r"[A-Za-z_]\w*\s*(?:->|\.)\s*[A-Za-z_]\w*"
-        r")\s*\("
-    )
+def _extract_field_reads(code, language_name=None):
+    lang = language_name or ACTIVE_INDEX_LANGUAGE
+    adapter = get_index_language_adapter(lang)
+    return adapter.extract_field_reads(code or "")
 
-    for m in call_re.finditer(masked):
-        expr = re.sub(r"\s+", "", (m.group("expr") or ""))
-        if not expr:
-            continue
-        if "->" in expr:
-            name = expr.split("->")[-1]
-        elif "." in expr:
-            name = expr.split(".")[-1]
-        else:
-            name = expr.split("::")[-1]
-        if not name or name in control_keywords:
-            continue
 
-        open_idx = m.end() - 1
-        close_idx = find_matching_paren(code, open_idx)
-        if close_idx == -1:
-            continue
-        args_text = code[open_idx + 1:close_idx]
-        args = _split_call_args_top_level(args_text)
-        line_no = code.count("\n", 0, m.start()) + 1
-        out.append({
-            "name": name,
-            "arity": len(args),
-            "args": args,
-            "line": line_no,
-        })
-    return out
+def _extract_call_sites(code, control_keywords, language_name=None):
+    lang = language_name or ACTIVE_INDEX_LANGUAGE
+    adapter = get_index_language_adapter(lang)
+    return adapter.extract_call_sites(code or "", control_keywords or [])
 
 
 def _extract_simple_identifiers(expr):
@@ -1484,98 +655,41 @@ def _extract_simple_identifiers(expr):
     return re.findall(r"[A-Za-z_]\w*", e)
 
 
-def _extract_dependency_chain(code, base_var, before_line, max_steps=8):
-    """Build simple backward dependency chain: tmp -> cfg -> call."""
-    lines = str(code or "").splitlines()
-    upto = max(0, int(before_line) - 1)
-    if not lines or not base_var:
-        return []
-
-    decl_init_pat = re.compile(
-        r"^\s*(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*(?:\s*[*&]\s*)?\s*"
-        r"(?P<lhs>[A-Za-z_]\w*)\s*=\s*(?P<rhs>[^;]+)\s*;\s*$"
-    )
-    assign_pat = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z_]\w*)\s*=\s*(?P<rhs>[^;]+)\s*;\s*$"
-    )
-
-    tracked = {str(base_var)}
-    chain = []
-    seen_stmt = set()
-
-    for li in range(min(upto, len(lines)), 0, -1):
-        if len(chain) >= max_steps:
-            break
-        line = lines[li - 1].strip()
-        if not line or line.startswith("//") or line.startswith("#"):
-            continue
-        if "==" in line or "+=" in line or "-=" in line or "*=" in line or "/=" in line:
-            continue
-
-        m = assign_pat.match(line) or decl_init_pat.match(line)
-        if not m:
-            continue
-        lhs = str(m.group("lhs") or "").strip()
-        rhs = str(m.group("rhs") or "").strip()
-        if lhs not in tracked:
-            continue
-
-        stmt = f"{lhs} = {rhs};"
-        if stmt in seen_stmt:
-            continue
-        seen_stmt.add(stmt)
-        chain.append({
-            "line": li,
-            "statement": stmt,
-        })
-
-        for tok in _extract_simple_identifiers(rhs):
-            if tok != lhs:
-                tracked.add(tok)
-
-    chain.sort(key=lambda x: int(x.get("line", 0)))
-    return chain
+def _extract_dependency_chain(code, base_var, before_line, max_steps=8, language_name=None):
+    lang = language_name or ACTIVE_INDEX_LANGUAGE
+    adapter = get_index_language_adapter(lang)
+    return adapter.extract_dependency_chain(code or "", base_var, before_line, max_steps=max_steps)
 
 
-def _extract_arg_base_var(arg_expr):
-    expr = str(arg_expr or "").strip()
-    if not expr:
-        return None
-    if re.fullmatch(r"&\s*([A-Za-z_]\w*)", expr):
-        return re.sub(r"^&\s*", "", expr).strip()
-    if re.fullmatch(r"\*+\s*([A-Za-z_]\w*)", expr):
-        return re.sub(r"^\*+\s*", "", expr).strip()
-    if re.fullmatch(r"[A-Za-z_]\w*", expr):
-        return expr
-    return None
+def _extract_arg_base_var(arg_expr, language_name=None):
+    lang = language_name or ACTIVE_INDEX_LANGUAGE
+    adapter = get_index_language_adapter(lang)
+    return adapter.extract_arg_base_var(arg_expr)
 
 
-def _field_rhs_score(expr):
+def _field_rhs_score(expr, language_name=None):
     e = _normalize_expr(expr)
-    if _is_literal_like_token(e):
+    if _is_literal_like_token(e, language_name=language_name):
         return 6
-    if _is_self_contained_call_expr(e):
+    if _is_self_contained_call_expr(e, language_name=language_name):
         return 5
-    if re.fullmatch(r"(?:[A-Za-z_]\w*::)*[A-Z_][A-Z0-9_]*", e):
-        return 4
     return 1
 
 
-def _recipe_rhs_score(expr):
+def _recipe_rhs_score(expr, language_name=None):
     e = _normalize_expr(expr)
-    if _is_self_contained_call_expr(e):
+    if _is_self_contained_call_expr(e, language_name=language_name):
         return 8
-    if _is_literal_like_token(e):
+    if _is_literal_like_token(e, language_name=language_name):
         return 6
-    if re.fullmatch(r"(?:[A-Za-z_]\w*::)*[A-Z_][A-Z0-9_]*", e):
-        return 5
     if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", e):
         return 4
     return 1
 
 
-def build_type_init_index(chunks, max_per_type=16):
-    """Build v3 structural dataflow index for better example grounding."""
+def build_type_init_index(chunks, max_per_type=16, language_name=None):
+    """Build v4 structural dataflow index for better example grounding."""
+    default_language = language_name or ACTIVE_INDEX_LANGUAGE
     by_type = defaultdict(dict)  # type -> (kind, expr) -> aggregated record
     by_name = defaultdict(list)
     for c in chunks or []:
@@ -1583,33 +697,33 @@ def build_type_init_index(chunks, max_per_type=16):
         if name:
             by_name[name].append(c)
 
-    pat_ptr_eq = re.compile(
-        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*\*\s*"
-        r"(?P<var>[A-Za-z_]\w*)\s*=\s*(?P<expr>[^;]+)\s*;\s*$"
-    )
-    pat_val_eq = re.compile(
-        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+"
-        r"(?P<var>[A-Za-z_]\w*)\s*=\s*(?P<expr>[^;]+)\s*;\s*$"
-    )
-    pat_val_ctor = re.compile(
-        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+"
-        r"(?P<var>[A-Za-z_]\w*)\s*\((?P<expr>[^;]*)\)\s*;\s*$"
-    )
-    pat_val_brace = re.compile(
-        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+"
-        r"(?P<var>[A-Za-z_]\w*)\s*(?P<expr>\{[^;]*\})\s*;\s*$"
-    )
-    pat_val_default = re.compile(
-        r"^\s*(?P<type>(?:const\s+)?(?:struct\s+|class\s+|enum\s+)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+"
-        r"(?P<var>[A-Za-z_]\w*)\s*;\s*$"
-    )
-
     struct_field_writes_acc = defaultdict(dict)  # nominal -> (path,access) -> rec
     function_effects_acc = {}  # (fn,sig,arg_i,arg_name,type) -> rec
     helper_effect_lookup = defaultdict(list)  # (helper_fn,arg_index) -> [{"type","writes"}]
     callsite_arg_flow = defaultdict(list)
     req = {}
     recipe_acc = {}
+
+    def _augment_var_hints_with_params(var_hints, chunk, *, chunk_language):
+        hints = dict(var_hints or {})
+        for p in list(chunk.get("parameters") or []):
+            pname = str(p.get("name", "")).strip()
+            if not pname:
+                continue
+            ptype = str(p.get("type", "") or p.get("raw", "")).strip()
+            nominal = _extract_nominal_type_name_for_init(ptype, language_name=chunk_language)
+            if not nominal:
+                continue
+            raw = str(p.get("raw", "")).strip()
+            is_ptr = bool(p.get("is_pointer")) or ("*" in ptype) or ("*" in raw)
+            hints.setdefault(
+                pname,
+                {
+                    "nominal_type": nominal,
+                    "is_pointer": is_ptr,
+                },
+            )
+        return hints
 
     def _ensure_req_bucket(target_name, arg_index, arg_name, nominal):
         key = (str(target_name), int(arg_index), str(arg_name), str(nominal))
@@ -1693,6 +807,9 @@ def build_type_init_index(chunks, max_per_type=16):
     # Pass 1: aggregate init patterns + function effects + struct writes.
     for c in chunks or []:
         file_path = str(c.get("file", ""))
+        chunk_language = infer_index_language_from_path(file_path, default=default_language)
+        chunk_profile = get_language_profile(chunk_language)
+        chunk_control_keywords = set(chunk_profile.control_keywords)
         fn_name = str(c.get("name", "")).strip()
         signature = str(c.get("signature", "")).strip() or (f"{fn_name}()")
         start_line = int(c.get("start_line", 1) or 1)
@@ -1700,36 +817,18 @@ def build_type_init_index(chunks, max_per_type=16):
         if not code:
             continue
 
-        # v3/A: init patterns per nominal type (existing logic)
-        for li, raw in enumerate(code.splitlines(), start=1):
-            line = (raw or "").strip()
-            if not line or line.startswith("//") or line.startswith("#"):
-                continue
-
-            kind = None
-            type_text = None
-            expr = None
-            match = None
-            for k, pat in [
-                ("pointer_call", pat_ptr_eq),
-                ("value_call", pat_val_eq),
-                ("value_call", pat_val_ctor),
-                ("value_brace", pat_val_brace),
-                ("value_default", pat_val_default),
-            ]:
-                m = pat.match(line)
-                if m:
-                    match = m
-                    kind = k
-                    type_text = m.group("type")
-                    expr = (m.groupdict().get("expr") or "").strip()
-                    break
-            if not match or not kind or not type_text:
+        # v4/A: language-adapter init patterns per nominal type.
+        for init_item in _extract_init_patterns(code, language_name=chunk_language):
+            kind = str((init_item or {}).get("kind") or "").strip()
+            type_text = str((init_item or {}).get("type_text") or "").strip()
+            expr = str((init_item or {}).get("expr") or "").strip()
+            li = int((init_item or {}).get("line") or 0)
+            if not kind or not type_text or li <= 0:
                 continue
             if kind in {"pointer_call", "value_call"}:
-                if not re.fullmatch(r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*\s*\([^;]*\)", expr or ""):
+                if not _extract_call_name(expr or "", language_name=chunk_language):
                     continue
-            nominal = _extract_nominal_type_name_for_init(type_text)
+            nominal = _extract_nominal_type_name_for_init(type_text, language_name=chunk_language)
             if not nominal:
                 continue
 
@@ -1740,15 +839,15 @@ def build_type_init_index(chunks, max_per_type=16):
                 rec = {
                     "kind": kind,
                     "expr": expr_norm,
-                    "function": _extract_call_name(expr_norm) if kind in {"pointer_call", "value_call"} else None,
-                    "self_contained": _is_self_contained_call_expr(expr_norm) if kind in {"pointer_call", "value_call"} else (kind != "value_default"),
+                    "function": _extract_call_name(expr_norm, language_name=chunk_language) if kind in {"pointer_call", "value_call"} else None,
+                    "self_contained": _is_self_contained_call_expr(expr_norm, language_name=chunk_language) if kind in {"pointer_call", "value_call"} else (kind != "value_default"),
                     "count": 0,
                     "score": 0,
                     "evidence": [],
                 }
                 by_type[nominal][key] = rec
             rec["count"] += 1
-            rec["score"] += _init_pattern_score(kind, expr_norm)
+            rec["score"] += _init_pattern_score(kind, expr_norm, language_name=chunk_language)
             if len(rec["evidence"]) < 3:
                 rec["evidence"].append({
                     "file": file_path,
@@ -1756,12 +855,17 @@ def build_type_init_index(chunks, max_per_type=16):
                     "function": fn_name,
                 })
 
-        var_hints = _extract_variable_type_hints(code)
-        field_writes = _extract_field_assignments(code)
-        field_reads = _extract_field_reads(code)
-        call_sites = _extract_call_sites(code, CONTROL_KEYWORDS)
+        var_hints = _extract_variable_type_hints(code, language_name=chunk_language)
+        var_hints = _augment_var_hints_with_params(
+            var_hints,
+            c,
+            chunk_language=chunk_language,
+        )
+        field_writes = _extract_field_assignments(code, language_name=chunk_language)
+        field_reads = _extract_field_reads(code, language_name=chunk_language)
+        call_sites = _extract_call_sites(code, chunk_control_keywords, language_name=chunk_language)
 
-        # v3/B: global struct field writes by nominal type
+        # v4/B: global struct field writes by nominal type
         for fw in field_writes:
             hint = var_hints.get(str(fw.get("base", "")).strip())
             if not hint:
@@ -1794,11 +898,11 @@ def build_type_init_index(chunks, max_per_type=16):
                     "function": fn_name,
                 })
 
-        # v3/C: per-function effects on parameter fields (+ helper calls)
+        # v4/C: per-function effects on parameter fields (+ helper calls)
         params = list(c.get("parameters") or [])
         for pi, param in enumerate(params):
             pname = str(param.get("name", "")).strip()
-            ptype_nominal = _extract_nominal_type_name_for_init(param.get("type", ""))
+            ptype_nominal = _extract_nominal_type_name_for_init(param.get("type", ""), language_name=chunk_language)
             if not pname or not ptype_nominal:
                 continue
             key = (fn_name, signature, int(pi), pname, ptype_nominal)
@@ -1864,7 +968,7 @@ def build_type_init_index(chunks, max_per_type=16):
 
             for cs in call_sites:
                 for ai, a in enumerate(list(cs.get("args") or [])):
-                    if _extract_arg_base_var(a) != pname:
+                    if _extract_arg_base_var(a, language_name=chunk_language) != pname:
                         continue
                     helper_name = str(cs.get("name") or "").strip()
                     if helper_name:
@@ -1967,11 +1071,19 @@ def build_type_init_index(chunks, max_per_type=16):
         if not code:
             continue
         file_path = str(c.get("file", ""))
+        chunk_language = infer_index_language_from_path(file_path, default=default_language)
+        chunk_profile = get_language_profile(chunk_language)
+        chunk_control_keywords = set(chunk_profile.control_keywords)
         caller_name = str(c.get("name", "")).strip()
         start_line = int(c.get("start_line", 1) or 1)
-        var_hints = _extract_variable_type_hints(code)
-        field_assignments = _extract_field_assignments(code)
-        call_sites = _extract_call_sites(code, CONTROL_KEYWORDS)
+        var_hints = _extract_variable_type_hints(code, language_name=chunk_language)
+        var_hints = _augment_var_hints_with_params(
+            var_hints,
+            c,
+            chunk_language=chunk_language,
+        )
+        field_assignments = _extract_field_assignments(code, language_name=chunk_language)
+        call_sites = _extract_call_sites(code, chunk_control_keywords, language_name=chunk_language)
         if not call_sites:
             continue
 
@@ -1982,7 +1094,7 @@ def build_type_init_index(chunks, max_per_type=16):
 
             arg_flow_rows = []
             for ai, arg in enumerate(cs_args):
-                base_var = _extract_arg_base_var(arg)
+                base_var = _extract_arg_base_var(arg, language_name=chunk_language)
                 arg_row = {
                     "arg_index": int(ai),
                     "arg_expr": str(arg),
@@ -1993,7 +1105,13 @@ def build_type_init_index(chunks, max_per_type=16):
                     if hint and str(hint.get("nominal_type", "")).strip():
                         arg_row["nominal_type"] = str(hint.get("nominal_type", "")).strip()
 
-                    chain = _extract_dependency_chain(code, base_var, before_line=cs_line, max_steps=8)
+                    chain = _extract_dependency_chain(
+                        code,
+                        base_var,
+                        before_line=cs_line,
+                        max_steps=8,
+                        language_name=chunk_language,
+                    )
                     if chain:
                         arg_row["dependency_chain"] = chain
 
@@ -2025,7 +1143,7 @@ def build_type_init_index(chunks, max_per_type=16):
                         p_name = str(prev.get("name") or "").strip()
                         p_args = list(prev.get("args") or [])
                         for pj, pa in enumerate(p_args):
-                            if _extract_arg_base_var(pa) != base_var:
+                            if _extract_arg_base_var(pa, language_name=chunk_language) != base_var:
                                 continue
                             for he in helper_effect_lookup.get((p_name, int(pj)), []):
                                 for wr in list(he.get("writes") or []):
@@ -2070,13 +1188,16 @@ def build_type_init_index(chunks, max_per_type=16):
                     if i >= len(cs_args):
                         continue
                     arg = cs_args[i]
-                    base_var = _extract_arg_base_var(arg)
+                    base_var = _extract_arg_base_var(arg, language_name=chunk_language)
                     if not base_var:
                         continue
                     hint = var_hints.get(base_var)
                     if not hint:
                         continue
-                    nominal = _extract_nominal_type_name_for_init(param.get("type", ""))
+                    nominal = _extract_nominal_type_name_for_init(
+                        param.get("type", ""),
+                        language_name=chunk_language,
+                    )
                     if not nominal:
                         continue
                     if str(hint.get("nominal_type", "")).lower() != nominal.lower():
@@ -2105,7 +1226,13 @@ def build_type_init_index(chunks, max_per_type=16):
                             "function": caller_name,
                         })
 
-                    chain = _extract_dependency_chain(code, base_var, before_line=cs_line, max_steps=8)
+                    chain = _extract_dependency_chain(
+                        code,
+                        base_var,
+                        before_line=cs_line,
+                        max_steps=8,
+                        language_name=chunk_language,
+                    )
                     for ch in chain:
                         stmt = str(ch.get("statement", "")).strip()
                         m_assign = re.match(r"^\s*(?P<lhs>[A-Za-z_]\w*)\s*=\s*(?P<rhs>[^;]+)\s*;\s*$", stmt)
@@ -2159,7 +1286,7 @@ def build_type_init_index(chunks, max_per_type=16):
                         p_name = str(prev.get("name") or "").strip()
                         p_args = list(prev.get("args") or [])
                         for pj, pa in enumerate(p_args):
-                            if _extract_arg_base_var(pa) != base_var:
+                            if _extract_arg_base_var(pa, language_name=chunk_language) != base_var:
                                 continue
                             for he in helper_effect_lookup.get((p_name, int(pj)), []):
                                 for wr in list(he.get("writes") or []):
@@ -2354,6 +1481,162 @@ def build_type_init_index(chunks, max_per_type=16):
             reverse=True,
         )
         init_recipes_out[nominal] = rows[: max(8, max_per_type * 3)]
+
+    # Fallback: synthesize recipe rows from required-field evidence for tuples
+    # that do not yet have direct caller-trace recipes.
+    existing_recipe_keys = set()
+    for nominal, rows in init_recipes_out.items():
+        for row in rows:
+            existing_recipe_keys.add(
+                (
+                    str(nominal),
+                    str(row.get("target_function", "")),
+                    int(row.get("arg_index", -1)),
+                    str(row.get("arg_name", "")),
+                )
+            )
+
+    for target_fn, req_entries in req_out.items():
+        for req_entry in list(req_entries or []):
+            nominal = str(req_entry.get("type", "")).strip()
+            arg_index = int(req_entry.get("arg_index", -1))
+            arg_name = str(req_entry.get("arg_name", "")).strip()
+            if not nominal or arg_index < 0:
+                continue
+
+            rkey = (nominal, str(target_fn), arg_index, arg_name)
+            if rkey in existing_recipe_keys:
+                continue
+
+            req_fields = list(req_entry.get("fields") or [])
+            if not req_fields:
+                continue
+
+            recipe_fields = []
+            nontrivial_field_count = 0
+            evidence = []
+            for f in req_fields[:16]:
+                sample_expr = str(f.get("sample_expr", "")).strip()
+                if sample_expr and _recipe_rhs_score(sample_expr, language_name=default_language) >= 4:
+                    nontrivial_field_count += 1
+                f_evidence = list(f.get("evidence") or [])
+                if f_evidence:
+                    evidence.extend(f_evidence[:1])
+                recipe_fields.append(
+                    {
+                        "path": str(f.get("path", "")),
+                        "access": str(f.get("access", "dot")),
+                        "count": int(f.get("count", 0)),
+                        "support": float(f.get("support", 0.0) or 0.0),
+                        "sample_expr": sample_expr,
+                        "sources": dict(f.get("sources") or {}),
+                        "evidence": list(f_evidence),
+                    }
+                )
+
+            if not recipe_fields:
+                continue
+
+            steps = []
+            for f in recipe_fields[:12]:
+                access_op = "->" if str(f.get("access")) == "arrow" else "."
+                rhs = str(f.get("sample_expr", "")).strip() or "{}"
+                steps.append(
+                    {
+                        "statement": f"$arg{access_op}{f.get('path', '')} = {rhs};",
+                        "kind": "field_write",
+                    }
+                )
+
+            call_sites = int(req_entry.get("call_sites", 0))
+            synthetic_score = (
+                int(call_sites) * 2
+                + min(6, nontrivial_field_count * 2)
+                + min(4, len(recipe_fields))
+            )
+            synthesized = {
+                "target_function": str(target_fn),
+                "arg_index": int(arg_index),
+                "arg_name": arg_name,
+                "is_pointer": any(str(f.get("access")) == "arrow" for f in recipe_fields),
+                "call_sites": int(call_sites),
+                "score": int(synthetic_score),
+                "allocator_expr": "",
+                "fields": recipe_fields,
+                "steps": steps,
+                "evidence": evidence[:6],
+            }
+            init_recipes_out.setdefault(nominal, []).append(synthesized)
+            existing_recipe_keys.add(rkey)
+
+    for nominal, rows in list(init_recipes_out.items()):
+        rows.sort(
+            key=lambda r: (
+                int(r.get("score", 0)),
+                int(r.get("call_sites", 0)),
+                bool(r.get("allocator_expr")),
+                len(list(r.get("fields") or [])),
+            ),
+            reverse=True,
+        )
+        init_recipes_out[nominal] = rows[: max(8, max_per_type * 3)]
+
+    # Last-resort fallback: if a type has field-write evidence but still no recipe,
+    # synthesize a generic type recipe so ask-side can avoid total recipe starvation.
+    for nominal, rows in struct_field_writes_out.items():
+        if not nominal:
+            continue
+        if init_recipes_out.get(nominal):
+            continue
+        if not rows:
+            continue
+
+        top = list(rows)[:16]
+        max_count = max(1, max(int(r.get("count", 0)) for r in top))
+        fields = []
+        for r in top:
+            sample_expr = str(r.get("sample_expr", "")).strip()
+            fields.append(
+                {
+                    "path": str(r.get("path", "")),
+                    "access": str(r.get("access", "dot")),
+                    "count": int(r.get("count", 0)),
+                    "support": round(float(int(r.get("count", 0))) / float(max_count), 4),
+                    "sample_expr": sample_expr,
+                    "sources": {"struct_field_writes": int(r.get("count", 0))},
+                    "evidence": list(r.get("evidence", [])),
+                }
+            )
+        fields = [f for f in fields if str(f.get("path", "")).strip()]
+        if not fields:
+            continue
+
+        steps = []
+        for f in fields[:12]:
+            access_op = "->" if str(f.get("access")) == "arrow" else "."
+            rhs = str(f.get("sample_expr", "")).strip() or "{}"
+            steps.append(
+                {
+                    "statement": f"$arg{access_op}{f.get('path', '')} = {rhs};",
+                    "kind": "field_write",
+                }
+            )
+
+        score = min(16, sum(int(f.get("count", 0)) for f in fields[:4]))
+        init_recipes_out[nominal] = [
+            {
+                "target_function": "",
+                "arg_index": -1,
+                "arg_name": "",
+                "is_pointer": any(str(f.get("access")) == "arrow" for f in fields),
+                "call_sites": 0,
+                "score": int(score),
+                "allocator_expr": "",
+                "fields": fields[:16],
+                "steps": steps,
+                "evidence": [e for f in fields for e in list(f.get("evidence", []))][:6],
+            }
+        ]
 
     return {
         "version": 4,

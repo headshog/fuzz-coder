@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Sequence, Tuple
 
+from fuzz_coder.languages.registry import get_prompt_language_adapter
+
 
 CRITICAL_ISSUES = {
     "target_call_arity_mismatch",
@@ -71,8 +73,10 @@ def build_candidate_prompts(
     question: str,
     first_answer: str,
     verification: Dict[str, Any],
+    language_name: str = "c_cpp",
 ) -> List[str]:
     issues = _build_issue_summary(verification)
+    cli_expr = get_prompt_language_adapter(language_name or "c_cpp").cli_file_expr
 
     prompt_a = (
         f"{original_prompt}\n\n"
@@ -82,7 +86,7 @@ def build_candidate_prompts(
         "- exact target signature and arity\n"
         "- valid file references with line ranges\n"
         "- observed call tied to target function\n"
-        "- if file-based request: argv[1]-derived data must reach target call args\n"
+        f"- if file-based request: {cli_expr}-derived data must reach target call args\n"
         "Question:\n"
         f"{question}\n\n"
         "Current issues:\n"
@@ -100,7 +104,7 @@ def build_candidate_prompts(
         "- target File + Signature\n"
         "- caller File + Signature (or explicit not found)\n"
         "- Observed call for target (or explicit not found)\n"
-        "- for argv[1]/file request: target call uses argv[1]-derived bytes/variables\n"
+        f"- for {cli_expr}/file request: target call uses {cli_expr}-derived bytes/variables\n"
         "Question:\n"
         f"{question}\n\n"
         "Current issues:\n"
@@ -173,4 +177,3 @@ def pick_best_candidate(candidates: Sequence[CandidateEval]) -> CandidateEval | 
         return None
     # Deterministic: highest score, then lexicographic label.
     return sorted(candidates, key=lambda c: (-c.score, c.label))[0]
-

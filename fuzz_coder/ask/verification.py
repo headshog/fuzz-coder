@@ -3,16 +3,10 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Set
 
-
-COMMON_NON_FUNCTION_TOKENS = {
-    "if", "for", "while", "switch", "return", "sizeof", "catch",
-    "new", "delete", "throw", "else", "do", "class", "struct",
-    "namespace", "template", "typedef", "using", "enum", "union",
-    "printf", "scanf", "malloc", "free", "memset", "memcpy",
-    "std", "vector", "string", "map", "set",
-    "phase", "criteria", "console", "input", "output", "function",
-    "void", "int", "float", "double", "char", "bool", "const", "size_t",
-}
+from .language_adapter import (
+    get_ask_language_adapter,
+    infer_ask_language_from_fragments,
+)
 
 
 ENTRY_HEADER_RE = re.compile(
@@ -26,6 +20,18 @@ EVIDENCE_OBSERVED_CALL_RE = re.compile(r"^\s*(?:[-*]\s*)?Observed call:\s*(.+)$"
 CODE_BLOCK_RE = re.compile(r"```(?:[A-Za-z0-9_+\-]*)\n(.*?)```", flags=re.DOTALL)
 
 
+def _get_verification_adapter(context_frags):
+    default_language = get_ask_language_adapter("").name
+    language_name = infer_ask_language_from_fragments(context_frags or [], default=default_language)
+    return get_ask_language_adapter(language_name)
+
+
+def _resolve_verification_adapter(adapter=None, context_frags=None):
+    if adapter is not None:
+        return adapter
+    return _get_verification_adapter(context_frags or [])
+
+
 def _extract_name_from_signature(signature_line: str) -> str | None:
     sig = signature_line.strip().strip("`").strip()
     if not sig:
@@ -36,11 +42,11 @@ def _extract_name_from_signature(signature_line: str) -> str | None:
         return None
 
     head = sig[:lp]
-    tokens = re.findall(r"([A-Za-z_~]\w*(?:::[A-Za-z_~]\w*)*)", head)
+    tokens = re.findall(r"([A-Za-z_~]\w*(?:(?:::|\.)[A-Za-z_~]\w*)*)", head)
     if not tokens:
         return None
 
-    name = tokens[-1].split("::")[-1]
+    name = re.split(r"::|\.", tokens[-1])[-1]
     if name.startswith("~"):
         name = name[1:]
     if not name:
@@ -62,7 +68,7 @@ def _normalize_signature(signature: str) -> str:
     return s
 
 
-def _extract_arity(signature: str) -> int | None:
+def _extract_arity(signature: str, adapter=None) -> int | None:
     sig = _normalize_signature(signature)
     lp = sig.find("(")
     rp = sig.rfind(")")
@@ -71,320 +77,61 @@ def _extract_arity(signature: str) -> int | None:
     params = sig[lp + 1:rp].strip()
     if not params or params == "void":
         return 0
-    depth = 0
-    arity = 1
-    for ch in params:
-        if ch in "<({[":
-            depth += 1
-        elif ch in ">)}]":
-            depth = max(0, depth - 1)
-        elif ch == "," and depth == 0:
-            arity += 1
-    return arity
+    ad = _resolve_verification_adapter(adapter=adapter)
+    return len(ad.split_top_level_arguments(params))
 
 
-def _count_top_level_args(params_text: str) -> int:
-    params = (params_text or "").strip()
-    if not params or params == "void":
-        return 0
-
-    depth = 0
-    in_str = False
-    in_char = False
-    escape = False
-    count = 1
-
-    for ch in params:
-        if in_str:
-            if not escape and ch == '"':
-                in_str = False
-            escape = (ch == "\\" and not escape)
-            continue
-        if in_char:
-            if not escape and ch == "'":
-                in_char = False
-            escape = (ch == "\\" and not escape)
-            continue
-
-        if ch == '"':
-            in_str = True
-            escape = False
-            continue
-        if ch == "'":
-            in_char = True
-            escape = False
-            continue
-
-        if ch in "<({[":
-            depth += 1
-            continue
-        if ch in ">)}]":
-            depth = max(0, depth - 1)
-            continue
-        if ch == "," and depth == 0:
-            count += 1
-
-    return count
-
-
-def _find_matching_paren(text: str, open_idx: int) -> int:
-    if open_idx < 0 or open_idx >= len(text) or text[open_idx] != "(":
-        return -1
-
-    depth = 0
-    in_str = False
-    in_char = False
-    escape = False
-    for i in range(open_idx, len(text)):
-        ch = text[i]
-        if in_str:
-            if not escape and ch == '"':
-                in_str = False
-            escape = (ch == "\\" and not escape)
-            continue
-        if in_char:
-            if not escape and ch == "'":
-                in_char = False
-            escape = (ch == "\\" and not escape)
-            continue
-
-        if ch == '"':
-            in_str = True
-            escape = False
-            continue
-        if ch == "'":
-            in_char = True
-            escape = False
-            continue
-
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                return i
-    return -1
-
-
-def _extract_call_arities(text: str, target_function: str) -> List[int]:
+def _extract_call_arities(text: str, target_function: str, adapter=None) -> List[int]:
     if not text or not target_function:
         return []
-
-    pattern = re.compile(
-        rf"(?<![A-Za-z0-9_~])(?:[A-Za-z_]\w*::)*{re.escape(target_function)}\s*\("
-    )
-    arities: List[int] = []
-    for m in pattern.finditer(text):
-        open_idx = text.find("(", m.start())
-        if open_idx == -1:
-            continue
-        close_idx = _find_matching_paren(text, open_idx)
-        if close_idx == -1:
-            continue
-        args_text = text[open_idx + 1:close_idx]
-        arities.append(_count_top_level_args(args_text))
-    return arities
+    ad = _resolve_verification_adapter(adapter=adapter)
+    return ad.extract_call_arities(text, target_function, limit=64)
 
 
-def _extract_call_arg_lists(text: str, target_function: str) -> List[List[str]]:
+def _extract_call_arg_lists(text: str, target_function: str, adapter=None) -> List[List[str]]:
     if not text or not target_function:
         return []
-
-    pattern = re.compile(
-        rf"(?<![A-Za-z0-9_~])(?:[A-Za-z_]\w*::)*{re.escape(target_function)}\s*\("
-    )
-    out: List[List[str]] = []
-    for m in pattern.finditer(text):
-        open_idx = text.find("(", m.start())
-        if open_idx == -1:
-            continue
-        close_idx = _find_matching_paren(text, open_idx)
-        if close_idx == -1:
-            continue
-        args = text[open_idx + 1:close_idx].strip()
-        out.append(_split_top_level_args(args))
-    return out
+    ad = _resolve_verification_adapter(adapter=adapter)
+    calls = ad.extract_call_argument_lists(text, target_function, limit=64)
+    return [list(c.get("args", [])) for c in calls]
 
 
-def _split_top_level_args(args_text: str) -> List[str]:
-    if not args_text:
-        return []
-    params = args_text.strip()
-    if not params or params == "void":
-        return []
-
-    out: List[str] = []
-    cur: List[str] = []
-    depth = 0
-    in_str = False
-    in_char = False
-    escape = False
-    for ch in params:
-        if in_str:
-            cur.append(ch)
-            if not escape and ch == '"':
-                in_str = False
-            escape = (ch == "\\" and not escape)
-            continue
-        if in_char:
-            cur.append(ch)
-            if not escape and ch == "'":
-                in_char = False
-            escape = (ch == "\\" and not escape)
-            continue
-
-        if ch == '"':
-            in_str = True
-            escape = False
-            cur.append(ch)
-            continue
-        if ch == "'":
-            in_char = True
-            escape = False
-            cur.append(ch)
-            continue
-
-        if ch in "<({[":
-            depth += 1
-            cur.append(ch)
-            continue
-        if ch in ">)}]":
-            depth = max(0, depth - 1)
-            cur.append(ch)
-            continue
-        if ch == "," and depth == 0:
-            part = "".join(cur).strip()
-            if part:
-                out.append(part)
-            cur = []
-            continue
-        cur.append(ch)
-
-    tail = "".join(cur).strip()
-    if tail:
-        out.append(tail)
-    return out
-
-
-def _extract_file_source_vars(code_text: str) -> List[str]:
-    code = code_text or ""
-    out: List[str] = []
-    patterns = [
-        r"\bstd::ifstream\s+([A-Za-z_]\w*)\s*\(\s*argv\s*\[\s*1\s*\]",
-        r"\bauto\s+([A-Za-z_]\w*)\s*=\s*[^;\n]*argv\s*\[\s*1\s*\]",
-        r"\b(?:std::string|std::vector<[^>]+>|std::vector<\s*uint8_t\s*>)\s+([A-Za-z_]\w*)\s*\([^;\n]*argv\s*\[\s*1\s*\]",
-        r"\bstd::getline\s*\([^,\n]+,\s*([A-Za-z_]\w+)\s*\)",
-        r"\b([A-Za-z_]\w+)\s*\.assign\s*\(\s*std::istreambuf_iterator<",
-        r"\bfread\s*\(\s*([A-Za-z_]\w+)\s*,",
-    ]
-    for pat in patterns:
-        for m in re.finditer(pat, code):
-            name = (m.group(1) or "").strip()
-            if name and name not in out:
-                out.append(name)
-    return out
+def _extract_file_source_vars(code_text: str, adapter=None) -> List[str]:
+    ad = _resolve_verification_adapter(adapter=adapter)
+    return ad.extract_file_source_vars(code_text or "")
 
 
 def _normalize_chain_token(token: str) -> str:
-    t = str(token or "").strip()
-    t = re.sub(r"\s+", "", t)
-    return t
+    ad = _resolve_verification_adapter()
+    return ad.normalize_chain_token(token)
 
 
 def _lhs_base_name(lhs_expr: str) -> str:
-    lhs = _normalize_chain_token(lhs_expr)
-    if "->" in lhs:
-        return lhs.split("->", 1)[0]
-    if "." in lhs:
-        return lhs.split(".", 1)[0]
-    return lhs
+    ad = _resolve_verification_adapter()
+    return ad.lhs_base_name(lhs_expr)
 
 
-def _extract_simple_assignment_edges(code: str) -> List[tuple[str, str]]:
-    if not code:
-        return []
-    pat = re.compile(
-        r"([A-Za-z_]\w*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)*)\s*"
-        r"(?<![=!<>+\-*/%&|^])=(?!=)\s*"
-        r"([^;]+);"
-    )
-    edges: List[tuple[str, str]] = []
-    for m in pat.finditer(code):
-        lhs_raw = (m.group(1) or "").strip()
-        rhs_raw = (m.group(2) or "").strip()
-        if not lhs_raw or not rhs_raw:
-            continue
-        if lhs_raw.startswith(("return ", "if ", "while ", "for ", "switch ")):
-            continue
-        lhs = _normalize_chain_token(lhs_raw)
-        edges.append((lhs, rhs_raw))
-    return edges
+def _extract_simple_assignment_edges(code: str, adapter=None) -> List[tuple[str, str]]:
+    ad = _resolve_verification_adapter(adapter=adapter)
+    return ad.extract_simple_assignment_edges(code or "")
 
 
-def _extract_file_data_flow_symbols(code_text: str, source_vars: List[str]) -> List[str]:
-    derived = {_normalize_chain_token(v) for v in (source_vars or []) if v}
-    code = code_text or ""
-    if not code:
-        return sorted({v for v in derived if v})
-
-    for v in list(derived):
-        base = _lhs_base_name(v)
-        if base:
-            derived.add(base)
-
-    edges = _extract_simple_assignment_edges(code)
-    for _ in range(6):
-        changed = False
-        names = [v for v in derived if v]
-        for lhs, rhs in edges:
-            if not names:
-                break
-            if _arg_uses_any_var(rhs, names):
-                if lhs not in derived:
-                    derived.add(lhs)
-                    changed = True
-                base = _lhs_base_name(lhs)
-                if base and base not in derived:
-                    derived.add(base)
-                    changed = True
-        if not changed:
-            break
-
-    return sorted({v for v in derived if v})
+def _extract_file_data_flow_symbols(code_text: str, source_vars: List[str], adapter=None) -> List[str]:
+    ad = _resolve_verification_adapter(adapter=adapter)
+    return ad.extract_file_data_flow_symbols(code_text or "", source_vars or [])
 
 
-def _arg_uses_any_var(arg_expr: str, names: List[str]) -> bool:
-    expr = arg_expr or ""
-    for name in names:
-        n = _normalize_chain_token(name)
-        if not n:
-            continue
-        if "." in n or "->" in n:
-            pat = rf"(?<![A-Za-z0-9_]){re.escape(n)}(?![A-Za-z0-9_])"
-        else:
-            pat = rf"\b{re.escape(n)}\b"
-        if re.search(pat, expr):
-            return True
-    return False
+def _arg_uses_any_var(arg_expr: str, names: List[str], adapter=None) -> bool:
+    ad = _resolve_verification_adapter(adapter=adapter)
+    return ad.arg_uses_any_var(arg_expr or "", names or [])
 
 
-def _extract_nominal_type_name(type_text: str) -> str:
-    t = re.sub(r"\b(const|volatile|restrict|__restrict__|struct|class|enum)\b", " ", str(type_text or ""))
-    t = t.replace("*", " ").replace("&", " ")
-    tokens = re.findall(r"[A-Za-z_]\w*", t)
-    if not tokens:
-        return ""
-    skip = {
-        "unsigned", "signed", "long", "short", "int", "float", "double", "bool", "void",
-        "size_t", "ssize_t", "auto", "typename",
-    }
-    for tok in reversed(tokens):
-        if tok.lower() not in skip:
-            return tok
-    return ""
+def _extract_nominal_type_name(type_text: str, adapter=None) -> str:
+    ad = _resolve_verification_adapter(adapter=adapter)
+    return ad.extract_nominal_type_name(type_text or "")
 
 
-def _build_strong_recipe_expectations(type_init_index, target_function, target_params):
+def _build_strong_recipe_expectations(type_init_index, target_function, target_params, adapter=None):
     raw = type_init_index or {}
     if not isinstance(raw, dict):
         return []
@@ -393,9 +140,10 @@ def _build_strong_recipe_expectations(type_init_index, target_function, target_p
         return []
     expected = []
     target = str(target_function or "").strip()
+    ad = _resolve_verification_adapter(adapter=adapter)
     for i, p in enumerate(target_params or []):
         ptype = str((p or {}).get("type", ""))
-        nominal = _extract_nominal_type_name(ptype)
+        nominal = _extract_nominal_type_name(ptype, adapter=ad)
         if not nominal:
             continue
         entries = list(by_type.get(nominal, [])) + list(by_type.get(nominal.lower(), []))
@@ -439,10 +187,13 @@ def _build_strong_recipe_expectations(type_init_index, target_function, target_p
     return expected
 
 
-def _code_uses_default_init_for_nominal(code_text: str, nominal: str) -> bool:
+def _code_uses_default_init_for_nominal(code_text: str, nominal: str, adapter=None) -> bool:
     code = code_text or ""
     n = re.escape(str(nominal or "").strip())
     if not n:
+        return False
+    ad = _resolve_verification_adapter(adapter=adapter)
+    if not ad.supports_default_init_recipe_penalty():
         return False
     patterns = [
         rf"\b{n}\b\s+[A-Za-z_]\w*\s*\{{\s*\}}\s*;",
@@ -459,9 +210,9 @@ def _code_contains_allocator_expr(code_text: str, allocator_expr: str) -> bool:
     call_name = _extract_name_from_signature(f"{expr};") or ""
     if call_name:
         return re.search(rf"\b{re.escape(call_name)}\s*\(", code_text or "") is not None
-    m = re.match(r"\s*((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*\(", expr)
+    m = re.match(r"\s*([A-Za-z_]\w*(?:(?:::|\.)[A-Za-z_]\w*)*)\s*\(", expr)
     if m:
-        call_name = str(m.group(1) or "").split("::")[-1]
+        call_name = re.split(r"::|\.", str(m.group(1) or ""))[-1]
         return re.search(rf"\b{re.escape(call_name)}\s*\(", code_text or "") is not None
     return False
 
@@ -516,7 +267,7 @@ def _file_matches_chunk(file_ref: str, chunk: Dict) -> bool:
     return chunk_start <= ref_start <= chunk_end and chunk_start <= ref_end <= chunk_end
 
 
-def _signature_matches_chunk(signature_ref: str, chunk: Dict) -> bool:
+def _signature_matches_chunk(signature_ref: str, chunk: Dict, adapter=None) -> bool:
     ref_sig = _normalize_signature(signature_ref)
     if not ref_sig:
         return False
@@ -533,8 +284,9 @@ def _signature_matches_chunk(signature_ref: str, chunk: Dict) -> bool:
     if not ref_name or not chunk_name or ref_name != chunk_name:
         return False
 
-    ref_arity = _extract_arity(ref_sig)
-    chunk_arity = _extract_arity(chunk_sig)
+    ad = adapter or _get_verification_adapter([chunk])
+    ref_arity = _extract_arity(ref_sig, adapter=ad)
+    chunk_arity = _extract_arity(chunk_sig, adapter=ad)
     if ref_arity is not None and chunk_arity is not None and ref_arity != chunk_arity:
         return False
 
@@ -603,6 +355,8 @@ def verify_answer_with_context(answer, context_frags, known_functions=None):
         name = f.get("name")
         if name:
             actual_by_name.setdefault(name, []).append(f)
+    adapter = _get_verification_adapter(context_frags)
+    non_function_tokens = adapter.non_function_tokens()
     known_funcs = set(known_functions) if known_functions is not None else set(actual_funcs)
 
     mentioned_actual = set()
@@ -619,18 +373,18 @@ def verify_answer_with_context(answer, context_frags, known_functions=None):
         call_like = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", answer, flags=re.MULTILINE))
         structured_candidates = {
             c for c in call_like
-            if len(c) > 2 and c.lower() not in COMMON_NON_FUNCTION_TOKENS
+            if len(c) > 2 and c.lower() not in non_function_tokens
         }
 
     mentioned_candidates = mentioned_actual | structured_candidates
 
     hallucinated = {
         h for h in structured_candidates
-        if h not in known_funcs and h.lower() not in COMMON_NON_FUNCTION_TOKENS and len(h) > 2
+        if h not in known_funcs and h.lower() not in non_function_tokens and len(h) > 2
     }
     out_of_context = {
         h for h in structured_candidates
-        if h in known_funcs and h not in actual_funcs and h.lower() not in COMMON_NON_FUNCTION_TOKENS and len(h) > 2
+        if h in known_funcs and h not in actual_funcs and h.lower() not in non_function_tokens and len(h) > 2
     }
 
     file_mismatches = set()
@@ -735,13 +489,14 @@ def verify_example_answer_with_context(
     - Must provide at least one `Signature:` reference.
     - File/signature references must match current context.
     - If structured example_context contains caller/call-site facts, caller evidence is required.
-    - If structured example_context requires file-based data flow, target call must use data derived from argv[1].
+    - If structured example_context requires file-based data flow, target call must use data derived from the CLI file argument.
     """
     base = verify_answer_with_context(
         answer,
         context_frags,
         known_functions=known_functions,
     )
+    adapter = _get_verification_adapter(context_frags)
 
     file_refs = [m.strip() for m in EVIDENCE_FILE_RE.findall(answer or "")]
     signature_refs = [m.strip() for m in EVIDENCE_SIGNATURE_RE.findall(answer or "")]
@@ -766,7 +521,7 @@ def verify_example_answer_with_context(
 
     signature_matches = 0
     for sig in signature_refs:
-        if any(_signature_matches_chunk(sig, c) for c in context_frags):
+        if any(_signature_matches_chunk(sig, c, adapter=adapter) for c in context_frags):
             signature_matches += 1
 
     target_mentioned = True
@@ -781,15 +536,15 @@ def verify_example_answer_with_context(
             (_extract_name_from_signature(sig) or "") == target_function
             for sig in signature_refs
         )
-        target_call_arities = _extract_call_arities(text_for_calls, target_function)
-        target_call_arg_lists = _extract_call_arg_lists(text_for_calls, target_function)
+        target_call_arities = _extract_call_arities(text_for_calls, target_function, adapter=adapter)
+        target_call_arg_lists = _extract_call_arg_lists(text_for_calls, target_function, adapter=adapter)
         target_call_present = len(target_call_arities) > 0
 
         expected_arities = set()
         for c in context_frags:
             if c.get("name") != target_function:
                 continue
-            ar = _extract_arity(str(c.get("signature", "")))
+            ar = _extract_arity(str(c.get("signature", "")), adapter=adapter)
             if ar is not None:
                 expected_arities.add(ar)
         if expected_arities and target_call_arities:
@@ -805,6 +560,7 @@ def verify_example_answer_with_context(
         type_init_index=type_init_index,
         target_function=target_function,
         target_params=target_params,
+        adapter=adapter,
     )
 
     missing_requirements = set()
@@ -851,11 +607,9 @@ def verify_example_answer_with_context(
         consistency_issues.add("target_call_arity_mismatch")
 
     if target_function and observed_call_refs and (expected_observed_call or expected_caller):
+        observed_target_pat = adapter.call_pattern(target_function)
         observed_mentions_target = any(
-            re.search(
-                rf"\b(?:[A-Za-z_]\w*::)*{re.escape(target_function)}\s*\(",
-                _strip_inline_code(ref),
-            ) is not None
+            observed_target_pat.search(_strip_inline_code(ref)) is not None
             for ref in observed_call_refs
         )
         if not observed_mentions_target:
@@ -867,32 +621,22 @@ def verify_example_answer_with_context(
             observed_ref_arities = []
             for ref in observed_call_refs:
                 txt = _strip_inline_code(ref)
-                m = re.search(
-                    rf"\b(?:[A-Za-z_]\w*::)*{re.escape(target_function)}\s*\(",
-                    txt,
+                observed_ref_arities.extend(
+                    _extract_call_arities(txt, target_function, adapter=adapter)
                 )
-                if not m:
-                    continue
-                open_idx = txt.find("(", m.start())
-                if open_idx == -1:
-                    continue
-                close_idx = _find_matching_paren(txt, open_idx)
-                if close_idx == -1:
-                    continue
-                observed_ref_arities.append(_count_top_level_args(txt[open_idx + 1:close_idx]))
             if observed_ref_arities and all(a != expected_arity for a in observed_ref_arities):
                 consistency_issues.add("observed_call_arity_mismatch")
 
-    has_argv1 = re.search(r"argv\s*\[\s*1\s*\]", text_for_calls) is not None
-    file_source_vars = _extract_file_source_vars(text_for_calls)
-    file_flow_vars = _extract_file_data_flow_symbols(text_for_calls, file_source_vars)
+    has_argv1 = adapter.is_cli_file_expr(text_for_calls)
+    file_source_vars = _extract_file_source_vars(text_for_calls, adapter=adapter)
+    file_flow_vars = _extract_file_data_flow_symbols(text_for_calls, file_source_vars, adapter=adapter)
     target_uses_file_data = False
     for arg_list in target_call_arg_lists:
         for arg in arg_list:
-            if re.search(r"argv\s*\[\s*1\s*\]", arg):
+            if adapter.is_cli_file_expr(arg):
                 target_uses_file_data = True
                 break
-            if _arg_uses_any_var(arg, file_flow_vars):
+            if _arg_uses_any_var(arg, file_flow_vars, adapter=adapter):
                 target_uses_file_data = True
                 break
         if target_uses_file_data:
@@ -914,7 +658,7 @@ def verify_example_answer_with_context(
             alloc_expr = str(exp.get("allocator_expr", "")).strip()
             if alloc_expr and _code_contains_allocator_expr(text_for_calls, alloc_expr):
                 continue
-            if _code_uses_default_init_for_nominal(text_for_calls, nominal):
+            if _code_uses_default_init_for_nominal(text_for_calls, nominal, adapter=adapter):
                 default_init_penalized_nominals.append(nominal)
         if default_init_penalized_nominals:
             consistency_issues.add("default_init_used_despite_recipe")

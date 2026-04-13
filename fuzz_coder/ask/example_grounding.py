@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import re
 from typing import Dict, List, Optional, Set
+
+from fuzz_coder.languages.registry import get_ask_language_adapter, infer_ask_language_from_fragments
 
 from .example_context import (
     _arg_uses_any_var,
@@ -59,8 +60,19 @@ def _extract_target_arity(target: Dict) -> Optional[int]:
     return len(params) if params is not None else None
 
 
-def _observed_call_for_target(caller: Dict, target_name: str, target_arity: Optional[int]) -> Optional[Dict]:
-    calls = _extract_call_argument_lists(str(caller.get("code", "")), target_name, limit=8)
+def _observed_call_for_target(
+    caller: Dict,
+    target_name: str,
+    target_arity: Optional[int],
+    *,
+    language_name: str,
+) -> Optional[Dict]:
+    calls = _extract_call_argument_lists(
+        str(caller.get("code", "")),
+        target_name,
+        limit=8,
+        language_name=language_name,
+    )
     if not calls:
         return None
     if target_arity is None:
@@ -87,6 +99,8 @@ class ExampleGroundingResolver:
         self.call_graph = call_graph or {}
         self.called_by = called_by or {}
         self.id_to_chunk = _normalize_id_to_chunk(self.meta)
+        self.language_name = infer_ask_language_from_fragments(self.meta, default="c_cpp")
+        self.adapter = get_ask_language_adapter(self.language_name)
 
     def _resolve_target(self, frags: List[Dict], analysis: Dict) -> Optional[Dict]:
         function_names = list(analysis.get("function_names") or [])
@@ -130,13 +144,7 @@ class ExampleGroundingResolver:
             caller_chunks = [self.id_to_chunk.get(x) for x in callers if x in self.id_to_chunk]
             caller_chunks = [c for c in caller_chunks if c is not None]
             has_main_caller = any(str(c.get("name", "")).lower() == "main" for c in caller_chunks)
-            has_file_reader_caller = any(
-                "argv[1]" in str(c.get("code", "")) and bool(re.search(
-                    r"\b(ifstream|fopen|open|read|getline|istreambuf_iterator|fread)\b",
-                    str(c.get("code", "")),
-                ))
-                for c in caller_chunks
-            )
+            has_file_reader_caller = any(self.adapter.caller_reads_cli_file_data(str(c.get("code", ""))) for c in caller_chunks)
             quality = _target_quality_score(chunk)
             return (
                 1 if has_main_caller else 0,
@@ -211,7 +219,12 @@ class ExampleGroundingResolver:
             if chunk is None:
                 continue
 
-            observed = _observed_call_for_target(chunk, target_name, target_arity)
+            observed = _observed_call_for_target(
+                chunk,
+                target_name,
+                target_arity,
+                language_name=self.language_name,
+            )
             if observed is None:
                 continue
 
@@ -223,19 +236,16 @@ class ExampleGroundingResolver:
             resolved = set(_to_int_ids(cg.get("resolved_calls", [])))
             edge_to_target = target_id in resolved
             caller_code = str(chunk.get("code", ""))
-            caller_reads_file = "argv[1]" in caller_code and bool(re.search(
-                r"\b(ifstream|fopen|open|read|getline|istreambuf_iterator|fread)\b",
-                caller_code,
-            ))
-            source_vars = _extract_file_source_vars(caller_code)
-            flow_vars = _extract_file_data_flow_symbols(caller_code, source_vars)
+            caller_reads_file = self.adapter.caller_reads_cli_file_data(caller_code)
+            source_vars = _extract_file_source_vars(caller_code, language_name=self.language_name)
+            flow_vars = _extract_file_data_flow_symbols(caller_code, source_vars, language_name=self.language_name)
             observed_args = list(observed.get("args", []))
             target_uses_file_data = False
             for a in observed_args:
-                if "argv[1]" in (a or ""):
+                if self.adapter.is_cli_file_expr(a or ""):
                     target_uses_file_data = True
                     break
-                if _arg_uses_any_var(a, flow_vars):
+                if _arg_uses_any_var(a, flow_vars, language_name=self.language_name):
                     target_uses_file_data = True
                     break
 
@@ -336,27 +346,24 @@ class ExampleGroundingResolver:
                 "index": i,
                 "name": p_name,
                 "type": p_type,
-                "shape": _classify_param_shape(p_type, p_name),
+                "shape": _classify_param_shape(p_type, p_name, language_name=self.language_name),
                 "observed_arg": observed_args[i] if i < len(observed_args) else None,
             })
 
         requires_file_data = bool(analysis.get("needs_file"))
         caller_code = str((caller or {}).get("code", ""))
-        source_vars = _extract_file_source_vars(caller_code)
-        flow_vars = _extract_file_data_flow_symbols(caller_code, source_vars)
-        caller_reads_argv1 = "argv[1]" in caller_code and bool(re.search(
-            r"\b(ifstream|fopen|open|read|getline|istreambuf_iterator|fread)\b",
-            caller_code,
-        ))
+        source_vars = _extract_file_source_vars(caller_code, language_name=self.language_name)
+        flow_vars = _extract_file_data_flow_symbols(caller_code, source_vars, language_name=self.language_name)
+        caller_reads_argv1 = self.adapter.caller_reads_cli_file_data(caller_code)
 
         target_uses_file_data = False
         argv1_direct_to_target = False
         for a in observed_args:
-            if "argv[1]" in (a or ""):
+            if self.adapter.is_cli_file_expr(a or ""):
                 argv1_direct_to_target = True
                 target_uses_file_data = True
                 break
-            if _arg_uses_any_var(a, flow_vars):
+            if _arg_uses_any_var(a, flow_vars, language_name=self.language_name):
                 target_uses_file_data = True
                 break
 
@@ -391,6 +398,7 @@ class ExampleGroundingResolver:
                 "argv1_direct_to_target": argv1_direct_to_target,
                 "evidence": evidence,
             },
+            "language": self.language_name,
         }
 
 

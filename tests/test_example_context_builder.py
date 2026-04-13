@@ -195,3 +195,52 @@ def test_example_context_builder_tracks_simple_assignment_flow_chain_to_target_a
     assert "line" in ctx["file_data_flow_hints"]["source_vars"]
     assert "cfg.path" in ctx["file_data_flow_hints"]["flow_vars"]
     assert ctx["file_data_flow_hints"]["target_uses_file_data"] is True
+
+
+def test_example_context_builder_java_tracks_args_file_flow_to_target():
+    frags = [
+        {
+            "id": 50,
+            "name": "mainEntry",
+            "file": "/repo/src/parser/Main.java",
+            "start_line": 1,
+            "end_line": 80,
+            "signature": "mainEntry(String[] args)",
+            "parameters": [],
+            "code": (
+                "int mainEntry(String[] args) throws Exception {\n"
+                "    byte[] bytes = Files.readAllBytes(Path.of(args[0]));\n"
+                "    int n = bytes.length;\n"
+                "    return Parser.parsePayload(bytes, n);\n"
+                "}\n"
+            ),
+        },
+        {
+            "id": 51,
+            "name": "parsePayload",
+            "file": "/repo/src/parser/Parser.java",
+            "start_line": 10,
+            "end_line": 40,
+            "signature": "parsePayload(byte[] data, int n)",
+            "parameters": [
+                {"name": "data", "type": "byte[]"},
+                {"name": "n", "type": "int"},
+            ],
+            "code": "int parsePayload(byte[] data, int n) { return n; }",
+        },
+    ]
+    analysis = {
+        "primary_function_name": "parsePayload",
+        "function_names": ["parsePayload", "mainEntry"],
+        "needs_file": True,
+    }
+
+    ctx = build_example_context(frags, analysis=analysis, language_name="java")
+    assert ctx["language"] == "java"
+    assert ctx["target"]["name"] == "parsePayload"
+    assert ctx["caller"]["name"] == "mainEntry"
+    assert "Parser.parsePayload(" in ctx["observed_call"]["expr"]
+    assert ctx["observed_call"]["arity"] == 2
+    assert ctx["file_data_flow_hints"]["caller_reads_argv1"] is True
+    assert "bytes" in ctx["file_data_flow_hints"]["source_vars"]
+    assert ctx["file_data_flow_hints"]["target_uses_file_data"] is True

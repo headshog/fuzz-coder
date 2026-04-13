@@ -24,6 +24,9 @@ from fuzz_coder.ask.pipeline import PipelineConfig, QueryPipeline
 from fuzz_coder.embeddings.registry import get_embedding_backend
 from fuzz_coder.languages.registry import get_supported_language_names
 
+TYPING_PLACEHOLDER_TEXT = "..."
+TYPING_PLACEHOLDER_HTML = "<div class='fc-chat-typing fc-typing-dots'><span></span><span></span><span></span></div>"
+
 
 def _parse_args():
     ap = argparse.ArgumentParser()
@@ -73,7 +76,10 @@ def _load_indices(index_dir: Path):
     function_hints = core.load_json(function_hints_path) if function_hints_path.exists() else {}
     type_init_index_path = index_dir / "type_init_index.json"
     type_init_index = core.load_json(type_init_index_path) if type_init_index_path.exists() else {}
-    return idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index
+    index_meta_path = index_dir / "index_meta.json"
+    index_meta = core.load_json(index_meta_path) if index_meta_path.exists() else {}
+    language_name = (index_meta or {}).get("language")
+    return idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index, language_name
 
 
 def _load_models(args):
@@ -98,6 +104,8 @@ def _history_to_conversation(history):
             u, a = item[0], item[1]
             if u is None or a is None:
                 continue
+            if _is_typing_placeholder(a):
+                continue
             out.append((_content_to_text(u), _content_to_text(a)))
         return out
 
@@ -112,6 +120,8 @@ def _history_to_conversation(history):
             if role == "user":
                 pending_user = _content_to_text(content)
             elif role == "assistant" and pending_user is not None:
+                if _is_typing_placeholder(content):
+                    continue
                 out.append((pending_user, _content_to_text(content)))
                 pending_user = None
         return out
@@ -166,6 +176,11 @@ def _content_to_text(content):
     if hasattr(content, "content"):
         return _content_to_text(getattr(content, "content"))
     return str(content)
+
+
+def _is_typing_placeholder(content) -> bool:
+    txt = _content_to_text(content).strip()
+    return txt in {TYPING_PLACEHOLDER_TEXT, TYPING_PLACEHOLDER_HTML}
 
 
 def _normalize_conversation(conversation):
@@ -285,12 +300,35 @@ def _load_user_histories(history_dir: Path, username: str, project_names: List[s
     return result
 
 
-def _save_user_histories(history_dir: Path, username: str, user_histories, project_names: List[str]):
+def _load_user_last_project(history_dir: Path, username: str, project_names: List[str]):
+    p = _history_file_for_user(history_dir, username)
+    if not p.exists():
+        return ""
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    project_name = str(data.get("last_project", "") or "").strip()
+    return project_name if project_name in project_names else ""
+
+
+def _save_user_histories(
+    history_dir: Path,
+    username: str,
+    user_histories,
+    project_names: List[str],
+    *,
+    last_project: str | None = None,
+):
     history_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "username": username,
         "projects": {},
     }
+    if last_project:
+        payload["last_project"] = last_project
     for project_name in project_names:
         conv = _normalize_conversation(user_histories.get(project_name, []))
         if conv:
@@ -384,6 +422,25 @@ def _normalize_uploaded_zip_path(zip_file) -> str:
     return str(zip_file).strip()
 
 
+def _clean_index_log_line(line: str) -> str:
+    txt = str(line or "").replace("\r", "").rstrip("\n")
+    # Strip ANSI escape sequences.
+    txt = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", txt)
+    return txt.strip()
+
+
+def _build_index_status_text(project_name: str, log_lines: List[str]) -> str:
+    tail = list(log_lines[-120:])
+    if not tail:
+        return f"Indexing `{project_name}`..."
+    return (
+        f"Indexing `{project_name}`...\n\n"
+        "```text\n"
+        + "\n".join(tail)
+        + "\n```"
+    )
+
+
 def _run_index_build(
     zip_path: Path,
     out_dir: Path,
@@ -424,8 +481,15 @@ def _run_index_build(
 
 
 def _build_pipeline_for_index(index_dir: Path, args, embed_model, reranker):
-    idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index = _load_indices(index_dir)
-    planner = core.QueryPlanner(special_indices, symbols, call_graph, called_by, meta=meta)
+    idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index, language_name = _load_indices(index_dir)
+    planner = core.QueryPlanner(
+        special_indices,
+        symbols,
+        call_graph,
+        called_by,
+        meta=meta,
+        language_name=language_name or ask_app.DEFAULT_CHAT_LANGUAGE,
+    )
     return QueryPipeline(
         core_module=core,
         planner=planner,
@@ -439,6 +503,7 @@ def _build_pipeline_for_index(index_dir: Path, args, embed_model, reranker):
         called_by=called_by,
         function_hints=function_hints,
         type_init_index=type_init_index,
+        language_name=language_name,
         config=PipelineConfig(
             top_k=args.top_k,
             rerank_top_k=args.rerank_top_k,
@@ -453,12 +518,15 @@ def _build_pipeline_for_index(index_dir: Path, args, embed_model, reranker):
 def _create_chatbot():
     """Create Chatbot and infer its effective history mode from the instance itself."""
     try:
-        chatbot = gr.Chatbot(type="messages", elem_id="main_chatbot")
+        chatbot = gr.Chatbot(type="messages", elem_id="main_chatbot", sanitize_html=False)
     except TypeError:
         try:
-            chatbot = gr.Chatbot(elem_id="main_chatbot")
+            chatbot = gr.Chatbot(type="messages", elem_id="main_chatbot")
         except TypeError:
-            chatbot = gr.Chatbot()
+            try:
+                chatbot = gr.Chatbot(elem_id="main_chatbot", sanitize_html=False)
+            except TypeError:
+                chatbot = gr.Chatbot(elem_id="main_chatbot")
 
     mode = getattr(chatbot, "type", None)
     if isinstance(mode, str):
@@ -571,6 +639,10 @@ def main():
         if not isinstance(users, dict):
             users = {}
         state["users"] = users
+        last_project = state.get("last_project")
+        if not isinstance(last_project, dict):
+            last_project = {}
+        state["last_project"] = last_project
         return state
 
     def _ensure_user_histories(state, username: str):
@@ -579,6 +651,11 @@ def main():
         if username not in users:
             users[username] = _load_user_histories(history_dir, username, project_names)
         user_histories = users[username]
+        user_last = state["last_project"]
+        if username not in user_last:
+            loaded_last = _load_user_last_project(history_dir, username, project_names)
+            if loaded_last:
+                user_last[username] = loaded_last
         for pname in project_names:
             if pname not in user_histories:
                 user_histories[pname] = []
@@ -589,15 +666,94 @@ def main():
     def _on_project_change(project_name, histories, request: gr.Request = None):
         username = _user_from_request(request)
         user_histories, histories = _ensure_user_histories(histories, username)
+        histories["last_project"][username] = project_name
+        _save_user_histories(
+            history_dir,
+            username,
+            user_histories,
+            project_names,
+            last_project=project_name,
+        )
         mode = chatbot_mode_holder["mode"]
         project_hist = _conversation_to_history(user_histories.get(project_name, []), mode)
         return project_hist, histories
 
     def _on_page_load(project_name, histories, request: gr.Request = None):
         _sync_projects_from_disk()
-        current_project = project_name if project_name in project_names else project_names[0]
-        project_hist, histories = _on_project_change(current_project, histories, request=request)
+        username = _user_from_request(request)
+        user_histories, histories = _ensure_user_histories(histories, username)
+        remembered_project = str(histories.get("last_project", {}).get(username, "") or "").strip()
+        if remembered_project in project_names:
+            current_project = remembered_project
+        elif project_name in project_names:
+            current_project = project_name
+        else:
+            current_project = project_names[0]
+        histories["last_project"][username] = current_project
+        _save_user_histories(
+            history_dir,
+            username,
+            user_histories,
+            project_names,
+            last_project=current_project,
+        )
+        mode = chatbot_mode_holder["mode"]
+        project_hist = _conversation_to_history(user_histories.get(current_project, []), mode)
         return gr.update(choices=project_names, value=current_project), project_hist, histories
+
+    def _append_pending_turn(chat_history, q: str, mode: str):
+        normalized = _normalize_history_for_mode(chat_history, mode)
+        if mode == "messages":
+            normalized.append({"role": "user", "content": q})
+            normalized.append({"role": "assistant", "content": TYPING_PLACEHOLDER_HTML})
+            return normalized
+        normalized.append((q, TYPING_PLACEHOLDER_HTML))
+        return normalized
+
+    def _finalize_pending_turn(chat_history, q: str, ans: str, mode: str):
+        normalized = _normalize_history_for_mode(chat_history, mode)
+        if mode == "messages":
+            if (
+                len(normalized) >= 2
+                and isinstance(normalized[-1], dict)
+                and isinstance(normalized[-2], dict)
+                and normalized[-1].get("role") == "assistant"
+                and normalized[-2].get("role") == "user"
+                and _content_to_text(normalized[-2].get("content")) == q
+                and _is_typing_placeholder(normalized[-1].get("content"))
+            ):
+                normalized[-1] = {"role": "assistant", "content": ans}
+                return normalized
+            normalized.append({"role": "assistant", "content": ans})
+            return normalized
+
+        if normalized and isinstance(normalized[-1], (list, tuple)) and len(normalized[-1]) >= 2:
+            last_user = _content_to_text(normalized[-1][0])
+            last_assistant = normalized[-1][1]
+            if last_user == q and (last_assistant is None or _is_typing_placeholder(last_assistant)):
+                normalized[-1] = (last_user, ans)
+                return normalized
+        normalized.append((q, ans))
+        return normalized
+
+    def _drop_pending_typing(chat_history, mode: str):
+        normalized = _normalize_history_for_mode(chat_history, mode)
+        if mode == "messages":
+            while (
+                normalized
+                and isinstance(normalized[-1], dict)
+                and normalized[-1].get("role") == "assistant"
+                and _is_typing_placeholder(normalized[-1].get("content"))
+            ):
+                normalized.pop()
+            return normalized
+
+        if normalized and isinstance(normalized[-1], (list, tuple)) and len(normalized[-1]) >= 2:
+            last_user = _content_to_text(normalized[-1][0])
+            last_assistant = normalized[-1][1]
+            if _is_typing_placeholder(last_assistant):
+                normalized[-1] = (last_user, None)
+        return normalized
 
     def _chat_submit(message, chat_history, project_name, histories, request: gr.Request = None):
         username = _user_from_request(request)
@@ -609,19 +765,37 @@ def main():
         if not q:
             return "", chat_history, histories
 
-        if ask_app.is_help_query(q):
-            ans = ask_app.render_help_text()
-        else:
-            expanded_q, _alias_used = ask_app.expand_chat_alias(q)
-            pipeline = _get_pipeline(project_name)
-            result = pipeline.run(expanded_q, conversation_history)
-            ans = result.answer
+        pending_history = _append_pending_turn(chat_history, q, mode)
+        yield "", pending_history, histories
 
-        conversation_history.append((q, ans))
+        try:
+            if ask_app.is_help_query(q):
+                lang = getattr(_get_pipeline(project_name), "language_name", None) if project_name else None
+                ans = ask_app.render_help_text(language_name=lang or ask_app.DEFAULT_CHAT_LANGUAGE)
+            else:
+                pipeline = _get_pipeline(project_name)
+                expanded_q, _alias_used = ask_app.expand_chat_alias(
+                    q,
+                    language_name=(getattr(pipeline, "language_name", None) or ask_app.DEFAULT_CHAT_LANGUAGE),
+                )
+                result = pipeline.run(expanded_q, conversation_history)
+                ans = result.answer
+        except Exception as e:
+            ans = f"[ERROR] {type(e).__name__}: {e}"
+
+        final_history = _finalize_pending_turn(pending_history, q, ans, mode)
+        conversation_history = _history_to_conversation(final_history)
         user_histories[project_name] = conversation_history
-        _save_user_histories(history_dir, username, user_histories, project_names)
+        histories["last_project"][username] = project_name
+        _save_user_histories(
+            history_dir,
+            username,
+            user_histories,
+            project_names,
+            last_project=project_name,
+        )
 
-        return "", _conversation_to_history(conversation_history, mode), histories
+        yield "", final_history, histories
 
     def _chat_request_started(message):
         if not str(message or "").strip():
@@ -631,11 +805,22 @@ def main():
     def _chat_request_finished():
         return gr.update(visible=True), gr.update(visible=False)
 
+    def _cancel_chat_request(chat_history):
+        mode = chatbot_mode_holder["mode"]
+        cleaned = _drop_pending_typing(chat_history, mode)
+        return cleaned, gr.update(visible=True), gr.update(visible=False)
+
     def _clear_project_chat(project_name, histories, request: gr.Request = None):
         username = _user_from_request(request)
         user_histories, histories = _ensure_user_histories(histories, username)
         user_histories[project_name] = []
-        _save_user_histories(history_dir, username, user_histories, project_names)
+        _save_user_histories(
+            history_dir,
+            username,
+            user_histories,
+            project_names,
+            last_project=histories.get("last_project", {}).get(username) or project_name,
+        )
         return _conversation_to_history([], chatbot_mode_holder["mode"]), histories
 
     def _add_project_from_zip(
@@ -658,72 +843,147 @@ def main():
             keep_zip: bool = True,
             keep_ready: bool = True,
             next_project_name: str | None = None,
+            show_cancel: bool | None = None,
+            show_add: bool | None = None,
+            update_zip_value: bool = False,
         ):
             zip_still_selected = bool(keep_zip and zip_value)
+            add_update = gr.update(interactive=(zip_ready if keep_ready else False))
+            cancel_update = gr.update()
+            zip_update = gr.update()
+            if show_add is not None:
+                add_update = gr.update(
+                    interactive=(zip_ready if keep_ready else False),
+                    visible=show_add,
+                )
+            if show_cancel is not None:
+                cancel_update = gr.update(visible=show_cancel)
+            if update_zip_value:
+                zip_update = gr.update(value=(zip_value if keep_zip else None))
             return (
                 (next_project_name or current_project_name),
                 histories,
                 status_text,
-                gr.update(value=(zip_value if keep_zip else None)),
-                gr.update(interactive=(zip_ready if keep_ready else False), visible=True),
-                gr.update(visible=False),
+                zip_update,
+                add_update,
+                cancel_update,
                 gr.update(visible=zip_still_selected),
                 gr.update(visible=zip_still_selected),
             )
 
         if args.index_dir:
-            return _resp("Adding projects is disabled when started with --index_dir (single-project mode).")
+            yield _resp("Adding projects is disabled when started with --index_dir (single-project mode).")
+            return
 
         if not zip_value:
-            return _resp("Please select a .zip archive first.", keep_zip=False, keep_ready=False)
+            yield _resp("Please select a .zip archive first.", keep_zip=False, keep_ready=False)
+            return
 
         zip_path = Path(zip_value).expanduser().resolve()
         if not zip_path.exists():
-            return _resp(f"Uploaded file is not accessible on server: {zip_path}")
+            yield _resp(f"Uploaded file is not accessible on server: {zip_path}")
+            return
 
         if zip_path.suffix.lower() != ".zip":
-            return _resp(f"Only .zip archives are supported, got: {zip_path.name}")
+            yield _resp(f"Only .zip archives are supported, got: {zip_path.name}")
+            return
 
         base_name = _derive_project_name(zip_path, project_name_input or "")
         if not base_name:
-            return _resp("Unable to derive project name. Please set Project Name explicitly.")
+            yield _resp("Unable to derive project name. Please set Project Name explicitly.")
+            return
         if base_name in project_names or (index_base_dir / f"index_data_{base_name}").exists():
-            return _resp(
+            yield _resp(
                 f"Project `{base_name}` already exists. Choose another project name.",
                 keep_zip=True,
                 keep_ready=True,
             )
+            return
 
         new_project_name = base_name
         new_index_dir = index_base_dir / f"index_data_{new_project_name}"
 
-        ok, details = _run_index_build(
-            zip_path,
-            new_index_dir,
-            language_name,
-            args,
-            active_builds=active_builds,
-            build_key=username,
+        index_entry = Path(__file__).resolve().parent / "index_fuzz_coder.py"
+        cmd = [
+            sys.executable,
+            str(index_entry),
+            "--src",
+            str(zip_path),
+            "--out",
+            str(new_index_dir),
+            "--embed_model",
+            str(args.embed_model),
+            "--embedding_backend",
+            str(args.embedding_backend),
+            "--language",
+            str(language_name),
+        ]
+
+        log_lines: List[str] = []
+        yield _resp(
+            _build_index_status_text(new_project_name, log_lines),
+            keep_zip=True,
+            keep_ready=True,
+            show_cancel=True,
+            show_add=False,
         )
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        active_builds[username] = {"proc": proc, "out_dir": new_index_dir}
+        try:
+            if proc.stdout is not None:
+                for raw in iter(proc.stdout.readline, ""):
+                    clean = _clean_index_log_line(raw)
+                    if not clean:
+                        if proc.poll() is not None:
+                            break
+                        continue
+                    log_lines.append(clean)
+                    if len(log_lines) > 500:
+                        log_lines = log_lines[-300:]
+                    yield _resp(
+                        _build_index_status_text(new_project_name, log_lines),
+                        keep_zip=True,
+                        keep_ready=True,
+                        show_cancel=True,
+                        show_add=False,
+                    )
+            return_code = proc.wait()
+        finally:
+            active_builds.pop(username, None)
+
+        details = "\n".join(log_lines).strip()
+        ok = return_code == 0
         if not ok:
             short_details = (details or "").strip()
             short_details = short_details.splitlines()[-1] if short_details else "unknown indexer error"
             if args.verbose and details:
                 print("[Add Project] Index build failed:")
                 print(details[-4000:])
-            return _resp(
+            yield _resp(
                 f"Failed to build index for `{zip_path.name}`.\n\nReason: `{short_details}`",
                 keep_zip=True,
                 keep_ready=True,
+                show_cancel=False,
+                show_add=True,
             )
+            return
 
         if not _looks_like_index_dir(new_index_dir):
-            return _resp(
+            yield _resp(
                 f"Indexer finished but output is incomplete: {new_index_dir}\n"
                 "Expected semantic.faiss/meta.jsonl/indices files.",
                 keep_zip=True,
                 keep_ready=True,
+                show_cancel=False,
+                show_add=True,
             )
+            return
 
         projects[new_project_name] = new_index_dir.resolve()
         if new_project_name not in project_names:
@@ -733,17 +993,27 @@ def main():
         for user_key, user_map in histories.get("users", {}).items():
             if isinstance(user_map, dict) and new_project_name not in user_map:
                 user_map[new_project_name] = []
-                _save_user_histories(history_dir, user_key, user_map, project_names)
+                _save_user_histories(
+                    history_dir,
+                    user_key,
+                    user_map,
+                    project_names,
+                    last_project=histories.get("last_project", {}).get(user_key) or new_project_name,
+                )
 
         if args.verbose and details:
             print("[Add Project] Index build output:")
             print(details[-2000:])
-        return _resp(
+        yield _resp(
             f"Added project `{new_project_name}`.",
             keep_zip=False,
             keep_ready=False,
             next_project_name=new_project_name,
+            show_cancel=False,
+            show_add=True,
+            update_zip_value=True,
         )
+        return
 
     def _on_zip_change(zip_file):
         zip_value = _normalize_uploaded_zip_path(zip_file)
@@ -1019,6 +1289,31 @@ def main():
       border-color: #2563eb !important;
       color: white !important;
     }
+    .fc-chat-typing {
+      margin-top: 2px !important;
+      margin-bottom: 2px !important;
+      min-height: 16px;
+    }
+    .fc-typing-dots {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      height: 14px;
+    }
+    .fc-typing-dots span {
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: #9ca3af;
+      display: inline-block;
+      animation: fc-bounce 1s infinite ease-in-out;
+    }
+    .fc-typing-dots span:nth-child(2) {
+      animation-delay: 0.12s;
+    }
+    .fc-typing-dots span:nth-child(3) {
+      animation-delay: 0.24s;
+    }
     #main_chatbot {
       height: calc(100vh - 340px) !important;
       min-height: 360px !important;
@@ -1027,6 +1322,16 @@ def main():
       #main_chatbot {
         height: calc(100vh - 390px) !important;
         min-height: 300px !important;
+      }
+    }
+    @keyframes fc-bounce {
+      0%, 80%, 100% {
+        transform: translateY(0);
+        opacity: 0.35;
+      }
+      40% {
+        transform: translateY(-4px);
+        opacity: 1;
       }
     }
     """
@@ -1168,7 +1473,7 @@ def main():
                 clear_zip_select_btn,
                 clear_zip_row,
             ],
-            show_progress="full",
+            show_progress="minimal",
         )
         add_project_evt.then(
             fn=_finalize_add_project_ui,
@@ -1241,8 +1546,9 @@ def main():
         )
 
         cancel_chat_btn.click(
-            fn=_chat_request_finished,
-            outputs=[send_btn, cancel_chat_btn],
+            fn=_cancel_chat_request,
+            inputs=[chatbot],
+            outputs=[chatbot, send_btn, cancel_chat_btn],
             cancels=[send_chat_evt, submit_chat_evt],
             show_progress="hidden",
             queue=False,

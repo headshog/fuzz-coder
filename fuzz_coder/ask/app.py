@@ -9,6 +9,7 @@ import faiss
 from sentence_transformers import CrossEncoder
 
 from fuzz_coder.embeddings.registry import get_embedding_backend
+from fuzz_coder.languages.registry import get_prompt_language_adapter
 
 from . import core
 from .pipeline import PipelineConfig, QueryPipeline
@@ -28,41 +29,7 @@ HELP_QUERIES = {
 }
 
 MAX_HISTORY = 5
-ALIAS_FUZZ = "Write a list of functions that can be used for fuzzing"
-ALIAS_FUZZ_WIDE = (
-    "Write a large list (20-30) of functions that can be used for fuzzing. "
-    "Only include functions with at most 4 parameters. "
-    "A function is eligible if ANY of these is true: "
-    "it parses input (or has parse/decode/split/tokenize in name/logic), "
-    "OR it has path/filepath/file-name parameters, "
-    "OR it has file-handle/stream parameters (FILE*, ifstream/fstream/istream), "
-    "OR it has simple pointer-array parameters (char*, int*, uint8_t*, const variants), "
-    "OR it reads stdin, "
-    "OR it has std::vector/std::array/std::span-like parameters."
-)
-ALIAS_MORE_FUZZ_WIDE = (
-    "Write other functions in a large list (20-30) that can be used for fuzzing. "
-    "Exclude functions already listed previously. "
-    "Only include functions with at most 4 parameters. "
-    "A function is eligible if ANY of these is true: "
-    "it parses input (or has parse/decode/split/tokenize in name/logic), "
-    "OR it has path/filepath/file-name parameters, "
-    "OR it has file-handle/stream parameters (FILE*, ifstream/fstream/istream), "
-    "OR it has simple pointer-array parameters (char*, int*, uint8_t*, const variants), "
-    "OR it reads stdin, "
-    "OR it has std::vector/std::array/std::span-like parameters."
-)
-ALIAS_MORE_FUZZ = "Write other functions that are good for fuzzing"
-ALIAS_EXAMPLE_TEMPLATE = (
-    "Write an example of {function_name} function. In the generated snippet, define a standalone main() "
-    "and call {function_name} from it. Construct its parameters from data given from file in argv[1]"
-)
-ALIAS_EXPLAIN_TEMPLATE = (
-    "Analyze function parameter semantics for {function_name}: for each parameter, explain its role, "
-    "expected data format/range, whether it is input/output/inout, where values usually come from in the codebase, "
-    "and provide evidence from signature, call sites, and docs (file:line). "
-    "If unknown, say explicitly \"unknown from provided context\"."
-)
+DEFAULT_CHAT_LANGUAGE = "c_cpp"
 
 
 def is_help_query(q: str) -> bool:
@@ -78,21 +45,22 @@ def is_help_query(q: str) -> bool:
     ])
 
 
-def expand_chat_alias(q: str):
+def expand_chat_alias(q: str, language_name: str = DEFAULT_CHAT_LANGUAGE):
     """Expand short chat aliases into full natural-language queries."""
     raw = (q or "").strip()
     if not raw:
         return raw, False
 
+    adapter = get_prompt_language_adapter(language_name or DEFAULT_CHAT_LANGUAGE)
     normalized = " ".join(raw.split()).lower()
     if normalized == "fuzz":
-        return ALIAS_FUZZ, True
+        return adapter.alias_fuzz, True
     if normalized in {"fuzz wide", "wide fuzz"}:
-        return ALIAS_FUZZ_WIDE, True
+        return adapter.alias_fuzz_wide, True
     if normalized in {"more fuzz wide", "wide more fuzz", "more wide fuzz"}:
-        return ALIAS_MORE_FUZZ_WIDE, True
+        return adapter.alias_more_fuzz_wide, True
     if normalized == "more fuzz":
-        return ALIAS_MORE_FUZZ, True
+        return adapter.alias_more_fuzz, True
     if normalized.startswith("explain "):
         parts = raw.split(None, 1)
         if len(parts) == 2:
@@ -114,7 +82,7 @@ def expand_chat_alias(q: str):
                         tail,
                         flags=re.IGNORECASE,
                     )
-                    expanded = ALIAS_EXPLAIN_TEMPLATE.format(function_name=fn)
+                    expanded = adapter.alias_explain_template.format(function_name=fn)
                     if tail:
                         expanded = f"{expanded} {tail}"
                     return expanded, True
@@ -139,17 +107,19 @@ def expand_chat_alias(q: str):
                         tail,
                         flags=re.IGNORECASE,
                     )
-                    expanded = ALIAS_EXAMPLE_TEMPLATE.format(function_name=fn)
+                    expanded = adapter.alias_example_template.format(function_name=fn)
                     if tail:
                         expanded = f"{expanded} {tail}"
                     return expanded, True
             fn = rest.strip("`'\"")
             if fn:
-                return ALIAS_EXAMPLE_TEMPLATE.format(function_name=fn), True
+                return adapter.alias_example_template.format(function_name=fn), True
     return raw, False
 
 
-def render_help_text() -> str:
+def render_help_text(language_name: str = DEFAULT_CHAT_LANGUAGE) -> str:
+    adapter = get_prompt_language_adapter(language_name or DEFAULT_CHAT_LANGUAGE)
+    cli_expr = adapter.cli_file_expr
     return (
         "I can analyze indexed code and answer questions about functions, types, call flows, and fuzz targets.\n\n"
         "What I can do:\n"
@@ -164,12 +134,12 @@ def render_help_text() -> str:
         "- fuzz wide -> Large fuzz-target list (20-30) with <=4 params and broad OR input-surface constraints\n"
         "- more fuzz -> Write other functions that are good for fuzzing\n"
         "- more fuzz wide -> Like fuzz wide, but exclude previously listed functions\n"
-        "- example FUNCTION_NAME -> Write an example of FUNCTION_NAME with a standalone main() and argv[1]-based params\n\n"
+        f"- example FUNCTION_NAME -> Write an example of FUNCTION_NAME with a standalone main() and {cli_expr}-based params\n\n"
         "- explain FUNCTION_NAME -> Analyze parameter semantics/format/source for FUNCTION_NAME with evidence\n\n"
         "Example queries:\n"
         "- List functions good for fuzzing from module src/parsers\n"
         "- Какие функции читают из stdin?\n"
-        "- Покажи функции с параметром std::string\n"
+        f"{adapter.help_type_query_example}"
         "- Дай список других функций для фаззинга из директории src/parsers\n"
         "- Explain how decode_binary_blob works\n"
         "- Give an example calling parse_json_payload\n"
@@ -203,7 +173,10 @@ def _load_indices(index_dir: Path):
     function_hints = core.load_json(function_hints_path) if function_hints_path.exists() else {}
     type_init_index_path = index_dir / "type_init_index.json"
     type_init_index = core.load_json(type_init_index_path) if type_init_index_path.exists() else {}
-    return idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index
+    index_meta_path = index_dir / "index_meta.json"
+    index_meta = core.load_json(index_meta_path) if index_meta_path.exists() else {}
+    language_name = (index_meta or {}).get("language")
+    return idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index, language_name
 
 
 def _load_models(args):
@@ -233,9 +206,16 @@ def main():
         print("Run index_fuzz_coder.py first to build the project index.")
         return
 
-    idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index = _load_indices(index_dir)
+    idx, meta, lex, special_indices, symbols, call_graph, called_by, function_hints, type_init_index, language_name = _load_indices(index_dir)
     embed_model, reranker = _load_models(args)
-    planner = core.QueryPlanner(special_indices, symbols, call_graph, called_by, meta=meta)
+    planner = core.QueryPlanner(
+        special_indices,
+        symbols,
+        call_graph,
+        called_by,
+        meta=meta,
+        language_name=language_name or DEFAULT_CHAT_LANGUAGE,
+    )
 
     pipeline = QueryPipeline(
         core_module=core,
@@ -250,6 +230,7 @@ def main():
         called_by=called_by,
         function_hints=function_hints,
         type_init_index=type_init_index,
+        language_name=language_name,
         config=PipelineConfig(
             top_k=args.top_k,
             rerank_top_k=args.rerank_top_k,
@@ -277,9 +258,9 @@ def main():
         if not q:
             continue
         if is_help_query(q):
-            print("\n" + render_help_text())
+            print("\n" + render_help_text(language_name=language_name or DEFAULT_CHAT_LANGUAGE))
             continue
-        q, alias_used = expand_chat_alias(q)
+        q, alias_used = expand_chat_alias(q, language_name=language_name or DEFAULT_CHAT_LANGUAGE)
         if alias_used and args.verbose:
             print(f"\n[Alias]")
             print(f"  Expanded query: {q}")

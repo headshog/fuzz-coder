@@ -4,7 +4,7 @@
 #curl -fsSL https://ollama.com/install.sh | sh
 
 # Pull recommended model (fits in 24GB VRAM with context for code)
-#ollama pull qwen2.5-coder:32b
+#ollama pull qwen3-coder:30b
 
 # 2) Python env
 #python3 -m venv .venv
