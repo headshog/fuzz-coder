@@ -324,6 +324,67 @@ def extract_function_like_candidates(
     return [x[2] for x in chosen]
 
 
+def _looks_like_type_symbol(token: str) -> bool:
+    t = (token or "").strip()
+    if not t:
+        return False
+    base = re.split(r"::|\.", t)[-1]
+    if not base:
+        return False
+    # Favor nominal/user-defined names (e.g. ColorMapObject, AVFormatContext).
+    return bool(re.search(r"[A-Z]", base)) and len(base) >= 3
+
+
+def extract_type_like_candidates(
+    query: str,
+    query_lower: str,
+    unresolved_candidates: List[str],
+    language_name: str | None = None,
+) -> List[str]:
+    symbol_pat = _qualified_symbol_pattern(language_name)
+    out: List[str] = []
+    seen = set()
+
+    def _add(tok: str):
+        t = (tok or "").strip().strip("`'\".,:;!?()[]{}")
+        if not t:
+            return
+        tl = t.lower()
+        if tl in _EXTRA_QUERY_SYMBOL_BLACKLIST:
+            return
+        if not _looks_like_type_symbol(t):
+            return
+        if tl in seen:
+            return
+        seen.add(tl)
+        out.append(t)
+
+    # Explicit type intent in query text.
+    patterns = [
+        rf"\b(?:struct|class|type|datatype|data\s+structure|object)\s+({symbol_pat})\b",
+        rf"\b(?:структур[аы]?|класс[а-я]*|тип[а-я]*)\s+({symbol_pat})\b",
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, query, flags=re.IGNORECASE):
+            _add(m.group(1))
+
+    # Alias-expanded explain query: "Analyze ... for X"
+    for m in re.finditer(rf"\bfor\s+({symbol_pat})\b", query, flags=re.IGNORECASE):
+        _add(m.group(1))
+
+    # Fallback to unresolved symbol-like candidates.
+    for cand in unresolved_candidates or []:
+        _add(cand)
+
+    # If user asked plain "explain X" and we still have nothing, use last token.
+    if not out and query_lower.strip().startswith("explain "):
+        m = re.match(rf"^\s*explain\s+({symbol_pat})\s*$", query, flags=re.IGNORECASE)
+        if m:
+            _add(m.group(1))
+
+    return out
+
+
 def _base_analysis(query_lower: str) -> dict:
     return {
         "query_type": "general",
@@ -338,6 +399,7 @@ def _base_analysis(query_lower: str) -> dict:
         "needs_params": False,
         "needs_types": False,
         "needs_param_semantics": False,
+        "needs_type_semantics": False,
         "needs_parse_like": False,
         "needs_fuzz_targets": False,
         "needs_type_info": False,
@@ -353,6 +415,8 @@ def _base_analysis(query_lower: str) -> dict:
         "exclude_previously_listed": False,
         "function_names": [],
         "primary_function_name": None,
+        "type_names": [],
+        "primary_type_name": None,
         "expand_callers": False,
         "expand_callees": False,
         "needs_example": False,
@@ -461,6 +525,33 @@ def analyze_query(
         analysis["function_names"] = [fn for fn in analysis["function_names"] if fn.lower() != "main"]
         analysis["referenced_functions"] = [fn for fn in analysis["referenced_functions"] if fn.lower() != "main"]
 
+    unresolved_candidates = []
+    for cand in analysis.get("query_function_candidates", []):
+        if cand.lower() not in symbols_by_lower:
+            unresolved_candidates.append(cand)
+
+    type_semantics_markers = [
+        "struct", "class", "data structure", "datatype", "object type", "field", "fields", "members",
+        "структур", "класс", "тип", "поля", "члены",
+    ]
+    explicit_type_intent = any(m in query_lower for m in type_semantics_markers)
+    alias_like_explain_target = (
+        analysis.get("needs_param_semantics")
+        and len(analysis.get("function_names") or []) == 0
+    )
+    if explicit_type_intent or alias_like_explain_target or query_lower.strip().startswith("explain "):
+        type_candidates = extract_type_like_candidates(
+            query,
+            query_lower,
+            unresolved_candidates=unresolved_candidates,
+            language_name=language_name,
+        )
+        if type_candidates:
+            analysis["needs_type_semantics"] = True
+            analysis["type_names"] = type_candidates
+            analysis["primary_type_name"] = type_candidates[0]
+            analysis["needs_type_info"] = True
+
     # More conservative call-graph intent detection: avoid matching generic
     # "used for fuzzing" phrases as call-expansion signal.
     if any(w in query_lower for w in ["caller", "callee", "called by", "кто вызыва"]):
@@ -521,9 +612,20 @@ def analyze_query(
     # - enforce compact signatures (<= 4 params unless user specified another bound)
     # - require at least one practical fuzz-input surface:
     #   parse-like OR stdin/file source OR path/file-handle/simple-pointer/vector-like params
+    disable_param_cap_markers = [
+        "without parameter count limit",
+        "without any parameter count limit",
+        "without max parameter limit",
+        "no parameter limit",
+        "без ограничения по числу параметров",
+        "без ограничения на число параметров",
+        "без лимита параметров",
+    ]
+    disable_param_cap = any(marker in query_lower for marker in disable_param_cap_markers)
+
     if analysis["needs_fuzz_targets"] and analysis["is_listing"] and not is_example_request:
         analysis["needs_broad_fuzz_surface"] = True
-        if analysis["max_param_count"] is None:
+        if analysis["max_param_count"] is None and not disable_param_cap:
             analysis["max_param_count"] = 4
         analysis["constraint_mode"] = "any"
         if not analysis.get("listing_target_count"):
@@ -599,6 +701,18 @@ def analyze_query(
         analysis["needs_stdin"] = False
         if not analysis.get("primary_function_name"):
             analysis["primary_function_name"] = analysis["function_names"][0]
+    elif analysis["needs_type_semantics"] and len(analysis["type_names"]) > 0:
+        analysis["query_type"] = "type_analysis"
+        analysis["is_listing"] = False
+        # Type semantics asks are metadata-oriented and should not turn into
+        # input/output hard filters due to wording artifacts.
+        analysis["needs_file"] = False
+        analysis["needs_output"] = False
+        analysis["needs_api"] = False
+        analysis["needs_stdin"] = False
+        analysis["needs_params"] = False
+        if not analysis.get("primary_type_name"):
+            analysis["primary_type_name"] = analysis["type_names"][0]
     elif analysis["is_listing"]:
         analysis["query_type"] = "listing"
     elif analysis["needs_stdin"] or analysis["needs_file"] or analysis["needs_api"]:
@@ -613,4 +727,3 @@ def analyze_query(
         analysis["needs_broad_fuzz_surface"] = False
 
     return analysis
-

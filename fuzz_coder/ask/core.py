@@ -17,6 +17,8 @@ from .example_context import build_example_context as _build_example_context_imp
 from .example_grounding import build_example_context_grounded as _build_example_context_grounded_impl
 from .fallback_builders import build_example_answer_from_context as _build_example_answer_from_context_impl
 from .fallback_builders import build_parameter_analysis_from_context as _build_parameter_analysis_from_context_impl
+from .fallback_builders import build_type_analysis_context as _build_type_analysis_context_impl
+from .fallback_builders import build_type_analysis_from_context as _build_type_analysis_from_context_impl
 from .verification import verify_answer_with_context as _verify_answer_with_context_impl
 from .verification import verify_example_answer_with_context as _verify_example_answer_with_context_impl
 from fuzz_coder.languages.registry import get_query_language_adapter
@@ -858,6 +860,22 @@ def build_parameter_analysis_from_context(frags, analysis=None, example_context=
     )
 
 
+def build_type_analysis_context(frags, analysis=None, type_init_index=None):
+    return _build_type_analysis_context_impl(
+        frags,
+        analysis=analysis,
+        type_init_index=type_init_index,
+    )
+
+
+def build_type_analysis_from_context(frags, analysis=None, type_init_index=None):
+    return _build_type_analysis_from_context_impl(
+        frags,
+        analysis=analysis,
+        type_init_index=type_init_index,
+    )
+
+
 
 class QueryPlanner:
     """Advanced query planner with thinking mode support"""
@@ -938,6 +956,22 @@ class QueryPlanner:
                     _add_id(callee)
 
             return ordered[: max(k * 3, 30)]
+
+        if analysis.get("query_type") == "type_analysis" and analysis.get("type_names") and self.meta:
+            names = [str(t).strip() for t in analysis.get("type_names", []) if str(t).strip()]
+            if names:
+                pats = [re.compile(rf"\b{re.escape(n)}\b") for n in names]
+                matched = []
+                for idx, chunk in enumerate(self.meta):
+                    sig = str(chunk.get("signature", ""))
+                    code_head = str(chunk.get("code", ""))[:1200]
+                    blob = f"{sig}\n{code_head}"
+                    if any(p.search(blob) for p in pats):
+                        matched.append(idx)
+                        if len(matched) >= max(k * 6, 60):
+                            break
+                if matched:
+                    return matched[: max(k * 3, 30)]
 
         candidates = set()
 
@@ -1068,6 +1102,7 @@ def build_prompt(
     max_prompt_chars=20000,
     example_context=None,
     function_hints=None,
+    type_context=None,
     language_name=None,
 ):
     """Main prompt builder with total-character budget."""
@@ -1079,13 +1114,21 @@ def build_prompt(
         max_prompt_chars=max_prompt_chars,
         example_context=example_context,
         function_hints=function_hints,
+        type_context=type_context,
         language_name=language_name or DEFAULT_QUERY_LANGUAGE,
     )
 
 
-def call_llm(prompt, model, temperature=0.1):
+def call_llm(prompt, model, temperature=0.1, stream=False, token_callback=None):
     """Call LLM and return structured status dict."""
-    return _call_llm_impl(prompt, model, OLLAMA_URL, temperature=temperature)
+    return _call_llm_impl(
+        prompt,
+        model,
+        OLLAMA_URL,
+        temperature=temperature,
+        stream=stream,
+        token_callback=token_callback,
+    )
 
 
 def verify_answer_with_context(answer, context_frags, known_functions=None):

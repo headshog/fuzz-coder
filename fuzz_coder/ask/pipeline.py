@@ -57,6 +57,7 @@ def _print_query_analysis(analysis):
     print(f"  Needs error handling: {analysis['needs_error_handling']}")
     print(f"  Needs params: {analysis['needs_params']}")
     print(f"  Needs param semantics: {analysis.get('needs_param_semantics', False)}")
+    print(f"  Needs type semantics: {analysis.get('needs_type_semantics', False)}")
     print(f"  Needs parse-like: {analysis['needs_parse_like']}")
     print(f"  Needs fuzz-targets: {analysis['needs_fuzz_targets']}")
     print(f"  Path filters: {analysis['path_filters']}")
@@ -68,6 +69,8 @@ def _print_query_analysis(analysis):
     print(f"  Requested types: {analysis['requested_types']}")
     print(f"  Mentioned functions: {analysis['function_names']}")
     print(f"  Primary function: {analysis.get('primary_function_name')}")
+    print(f"  Mentioned types: {analysis.get('type_names', [])}")
+    print(f"  Primary type: {analysis.get('primary_type_name')}")
     print(f"  Keywords: {analysis['keywords'][:5]}...")
 
 
@@ -144,6 +147,8 @@ def _rerank_candidates(core, q, analysis, all_candidates, meta, reranker, rerank
         effective_rerank_top_k = max(rerank_top_k, 8)
     elif analysis.get("query_type") == "parameter_analysis":
         effective_rerank_top_k = max(rerank_top_k, 8)
+    elif analysis.get("query_type") == "type_analysis":
+        effective_rerank_top_k = max(rerank_top_k, 10)
 
     rerank_pool_size = max(effective_rerank_top_k * 4, effective_rerank_top_k + 10)
 
@@ -261,6 +266,8 @@ def _build_prompt_and_call_llm(
     language_name=None,
     example_context=None,
     function_hints=None,
+    type_context=None,
+    token_callback=None,
 ):
     prompt_history = conversation_history if (conversation_history and analysis.get("follow_up")) else None
     prompt = core.build_prompt(
@@ -271,6 +278,7 @@ def _build_prompt_and_call_llm(
         max_prompt_chars=max_prompt_chars,
         example_context=example_context,
         function_hints=function_hints,
+        type_context=type_context,
         language_name=language_name or "c_cpp",
     )
 
@@ -279,7 +287,19 @@ def _build_prompt_and_call_llm(
         print(f"  Context size: {len(frags)} functions")
         print(f"  Prompt length: {len(prompt)} chars")
 
-    llm_result = core.call_llm(prompt, model)
+    if token_callback is not None:
+        try:
+            llm_result = core.call_llm(
+                prompt,
+                model,
+                stream=True,
+                token_callback=token_callback,
+            )
+        except TypeError:
+            # Backward-compatible path for mocked/legacy call_llm stubs used in tests.
+            llm_result = core.call_llm(prompt, model)
+    else:
+        llm_result = core.call_llm(prompt, model)
     if llm_result.get("ok"):
         ans = llm_result.get("response", "")
     else:
@@ -522,6 +542,51 @@ def _verify_answer(
             used_fallback = True
             if verbose:
                 print("  Replaced model output with deterministic context-based parameter analysis")
+    elif query_type == "type_analysis":
+        verification = core.verify_answer_with_context(
+            ans,
+            frags,
+            known_functions=set(symbols.keys()),
+        )
+        _print_confidence(verification, verbose, "Type analysis")
+        target_type = str(analysis.get("primary_type_name") or "").strip()
+        has_type_line = re.search(r"^\s*Type:\s*`?.+`?\s*$", ans or "", flags=re.MULTILINE) is not None
+        has_fields_header = re.search(r"^\s*Field Semantics:\s*$", ans or "", flags=re.MULTILINE) is not None
+        target_mentioned = (not target_type) or (re.search(rf"\b{re.escape(target_type)}\b", ans or "") is not None)
+        has_verification_issues = any([
+            verification.get("hallucinated"),
+            verification.get("out_of_context"),
+            verification.get("file_mismatches"),
+            verification.get("signature_mismatches"),
+            verification.get("context_mismatches"),
+        ])
+        low_confidence = float(verification.get("confidence_score", 0.0)) < LOW_CONFIDENCE_THRESHOLD
+        if has_verification_issues or low_confidence or not has_type_line or not has_fields_header or not target_mentioned:
+            if verbose:
+                print(f"\n[⚠️  TYPE ANALYSIS WARNING]")
+                if verification.get("hallucinated"):
+                    print(f"  Unknown functions (not found in index): {verification['hallucinated']}")
+                if verification.get("out_of_context"):
+                    print(f"  Mentioned but not in current context: {verification['out_of_context']}")
+                if verification.get("file_mismatches"):
+                    print(f"  File mismatch vs indexed context: {verification['file_mismatches']}")
+                if verification.get("signature_mismatches"):
+                    print(f"  Signature mismatch vs indexed context: {verification['signature_mismatches']}")
+                if verification.get("context_mismatches"):
+                    print(f"  Function/File/Signature tuple mismatch: {verification['context_mismatches']}")
+                if not has_type_line or not has_fields_header:
+                    print("  Missing required structured header: Type/Field Semantics")
+                if target_type and not target_mentioned:
+                    print(f"  Target type `{target_type}` not clearly mentioned in model output")
+                print("  Replacing with deterministic context-grounded type analysis.")
+            ans = core.build_type_analysis_from_context(
+                frags,
+                analysis=analysis,
+                type_init_index=type_init_index or {},
+            )
+            used_fallback = True
+            if verbose:
+                print("  Replaced model output with deterministic context-based type analysis")
 
     return ans, verification, used_fallback, used_second_pass, reasoning_path
 
@@ -586,7 +651,7 @@ class QueryPipeline:
         self.config = config
         self._shadow_runner = shadow_runner
 
-    def _run_once(self, q, conversation_history):
+    def _run_once(self, q, conversation_history, token_callback=None):
         start_time = time.time()
         analysis = self.planner.analyze_query(q, conversation_history if conversation_history else None)
 
@@ -739,6 +804,7 @@ class QueryPipeline:
                 print(f"    observed_call: {observed or 'not found'}")
 
         function_hints = None
+        type_context = None
         if analysis.get("query_type") == "parameter_analysis":
             primary = analysis.get("primary_function_name")
             targets = []
@@ -752,6 +818,12 @@ class QueryPipeline:
                 hints = list(self.function_hints.get(fn, []))
                 if hints:
                     function_hints[fn] = hints
+        elif analysis.get("query_type") == "type_analysis":
+            type_context = self.core.build_type_analysis_context(
+                frags,
+                analysis=analysis,
+                type_init_index=self.type_init_index,
+            )
 
         prompt, llm_result, ans = _build_prompt_and_call_llm(
             self.core,
@@ -765,6 +837,8 @@ class QueryPipeline:
             language_name=self.language_name,
             example_context=example_context,
             function_hints=function_hints,
+            type_context=type_context,
+            token_callback=token_callback,
         )
 
         ans, verification, used_fallback, used_second_pass, reasoning_path = _verify_answer(
@@ -803,14 +877,14 @@ class QueryPipeline:
             show_response_time=True,
         )
 
-    def run(self, q, conversation_history):
+    def run(self, q, conversation_history, token_callback=None):
         if not self.config.shadow_mode:
-            return self._run_once(q, conversation_history)
+            return self._run_once(q, conversation_history, token_callback=token_callback)
 
         # Shadow mode: run both paths and compare key outputs, return main path result.
         # If shadow_runner is provided, it can execute an alternate orchestration path
         # for contract validation without affecting user output.
-        primary = self._run_once(q, conversation_history)
+        primary = self._run_once(q, conversation_history, token_callback=token_callback)
         shadow = self._shadow_runner(q, conversation_history) if self._shadow_runner else self._run_once(q, conversation_history)
         diffs = {}
         if primary.answer != shadow.answer:

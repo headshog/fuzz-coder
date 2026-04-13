@@ -132,6 +132,63 @@ def _render_function_hints(function_hints):
     return "\n".join(lines)
 
 
+def _render_type_context_facts(type_context):
+    if not type_context:
+        return ""
+    target = str(type_context.get("target_type", "")).strip()
+    resolved = str(type_context.get("resolved_type", "")).strip()
+    if not target:
+        return ""
+
+    lines = [
+        "### Structured Type Facts",
+        f"- Target type: {target}",
+        f"- Resolved type key: {resolved or target}",
+    ]
+
+    fields = list(type_context.get("fields") or [])
+    if fields:
+        lines.append("- Observed fields:")
+        for f in fields[:12]:
+            path = str(f.get("path", "")).strip()
+            if not path:
+                continue
+            writes = int(f.get("writes", 0) or 0)
+            reads = int(f.get("reads", 0) or 0)
+            required_hits = int(f.get("required_hits", 0) or 0)
+            sample = str(f.get("sample_expr", "")).strip()
+            sample_text = f"; sample `{sample}`" if sample else ""
+            lines.append(
+                f"  - {path} (writes={writes}, reads={reads}, required_hits={required_hits}{sample_text})"
+            )
+    else:
+        lines.append("- Observed fields: not found in provided context")
+
+    init_patterns = list(type_context.get("init_patterns") or [])
+    if init_patterns:
+        lines.append("- Initialization patterns:")
+        for p in init_patterns[:8]:
+            kind = str(p.get("kind", "")).strip() or "unknown"
+            expr = str(p.get("expr", "")).strip() or "unknown"
+            lines.append(f"  - {kind}: `{expr}`")
+    else:
+        lines.append("- Initialization patterns: not found")
+
+    usage = list(type_context.get("usage") or [])
+    if usage:
+        lines.append("- Usage functions:")
+        for u in usage[:8]:
+            fn = str(u.get("function", "")).strip()
+            sig = str(u.get("signature", "")).strip()
+            if not fn:
+                continue
+            lines.append(f"  - {fn}: `{sig}`" if sig else f"  - {fn}")
+    else:
+        lines.append("- Usage functions: not found")
+
+    return "\n".join(lines)
+
+
 def _build_constraint_text(analysis):
     constraints = []
     if analysis.get("needs_stdin"):
@@ -312,6 +369,39 @@ Unknowns:
 """.strip()
 
 
+def _build_type_analysis_system_block():
+    return """
+### SYSTEM BLOCK (TYPE_ANALYSIS)
+MUST:
+- Focus on the requested struct/class/type from context.
+- Explain each field/member using observed evidence (writes/reads/init patterns/usage).
+- For every claim, include concrete `file:line` evidence when available.
+- If unknown, explicitly write "unknown from provided context".
+SHOULD:
+- Distinguish likely role, expected value format/range, and read/write direction.
+- Mention typical initialization patterns and where the type is used.
+NICE TO HAVE:
+- Call out fields that look required before key function calls.
+
+### OUTPUT FORMAT (STRICT)
+Type: `name`
+Resolved type key: `name_or_alias`
+Field Semantics:
+1. `field`
+- Role: ...
+- Expected format/range: ...
+- Direction: input/output/inout/unknown
+- Sample value/expression: ...
+- Evidence: `path:line`
+Observed Initialization Patterns:
+- ...
+Typical Usage in Codebase:
+- ...
+Unknowns:
+- ...
+""".strip()
+
+
 def _build_generic_system_block(analysis, max_items):
     if analysis.get("needs_type_info"):
         return f"""
@@ -355,6 +445,8 @@ def _build_intent_system_block(analysis, max_items, language_name="c_cpp"):
         return _build_example_system_block(language_name=language_name)
     if query_type == "parameter_analysis":
         return _build_parameter_analysis_system_block()
+    if query_type == "type_analysis":
+        return _build_type_analysis_system_block()
     if query_type == "implementation_explanation":
         return _build_explanation_system_block()
     return _build_generic_system_block(analysis, max_items)
@@ -368,6 +460,7 @@ def _build_thinking_prompt_with_limit(
     code_char_limit=1500,
     example_context=None,
     function_hints=None,
+    type_context=None,
     language_name="c_cpp",
 ):
     max_items = len(frags)
@@ -379,6 +472,9 @@ def _build_thinking_prompt_with_limit(
     function_hints_block = ""
     if (analysis or {}).get("query_type") == "parameter_analysis":
         function_hints_block = _render_function_hints(function_hints)
+    type_ctx_block = ""
+    if (analysis or {}).get("query_type") == "type_analysis":
+        type_ctx_block = _render_type_context_facts(type_context)
     policy_block = _build_policy_layers_block()
     intent_block = _build_intent_system_block(analysis or {}, max_items=max_items, language_name=language_name)
     thinking_instructions = """
@@ -396,6 +492,7 @@ Return only final answer in the required format.
 {ctx}
 {example_ctx_block}
 {function_hints_block}
+{type_ctx_block}
 {policy_block}
 
 {intent_block}
@@ -452,9 +549,18 @@ def _build_prompt_with_limits(
     code_char_limit_simple=2000,
     example_context=None,
     function_hints=None,
+    type_context=None,
     language_name="c_cpp",
 ):
-    complex_types = ["listing", "example_generation", "parameter_analysis", "implementation_explanation", "type_specific", "input_specific"]
+    complex_types = [
+        "listing",
+        "example_generation",
+        "parameter_analysis",
+        "type_analysis",
+        "implementation_explanation",
+        "type_specific",
+        "input_specific",
+    ]
     use_thinking = (analysis and analysis["query_type"] in complex_types) or (conversation_history and len(conversation_history) > 0)
 
     if use_thinking:
@@ -466,6 +572,7 @@ def _build_prompt_with_limits(
             code_char_limit=code_char_limit_thinking,
             example_context=example_context,
             function_hints=function_hints,
+            type_context=type_context,
             language_name=language_name,
         )
 
@@ -485,6 +592,7 @@ def build_prompt(
     max_prompt_chars=DEFAULT_MAX_PROMPT_CHARS,
     example_context=None,
     function_hints=None,
+    type_context=None,
     language_name="c_cpp",
 ):
     """Build prompt with a total character budget.
@@ -510,6 +618,7 @@ def build_prompt(
             code_char_limit_simple=max(250, int(limit * 1.2)),
             example_context=example_context,
             function_hints=function_hints,
+            type_context=type_context,
             language_name=language_name,
         )
         last_prompt = prompt
@@ -529,6 +638,7 @@ def build_prompt(
             code_char_limit_simple=max(250, int(min_limit * 1.2)),
             example_context=example_context,
             function_hints=function_hints,
+            type_context=type_context,
             language_name=language_name,
         )
         last_prompt = prompt

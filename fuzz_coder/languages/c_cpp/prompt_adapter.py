@@ -3,7 +3,7 @@ from __future__ import annotations
 from ..prompt_adapters import PromptLanguageAdapter
 
 
-_C_CPP_ALIAS_FUZZ = "Write a list of functions that can be used for fuzzing"
+_C_CPP_ALIAS_FUZZ = "Write a list of functions that can be used for fuzzing without parameter count limit."
 
 _C_CPP_ALIAS_FUZZ_WIDE = (
     "Write a large list (20-30) of functions that can be used for fuzzing. "
@@ -47,11 +47,11 @@ C_CPP_PROMPT_ADAPTER = PromptLanguageAdapter(
     name="c_cpp",
     code_fence_lang="cpp",
     cli_file_expr="argv[1]",
-    help_type_query_example="- Покажи функции с параметром std::string\n",
-    alias_fuzz=_C_CPP_ALIAS_FUZZ,
-    alias_fuzz_wide=_C_CPP_ALIAS_FUZZ_WIDE,
-    alias_more_fuzz_wide=_C_CPP_ALIAS_MORE_FUZZ_WIDE,
-    alias_more_fuzz="Write other functions that are good for fuzzing",
+    help_type_query_example="- Show functions with a std::string parameter\n",
+    alias_fuzz=_C_CPP_ALIAS_FUZZ_WIDE,
+    alias_fuzz_wide=_C_CPP_ALIAS_FUZZ,
+    alias_more_fuzz_wide="Write other functions that are good for fuzzing without parameter count limit.",
+    alias_more_fuzz=_C_CPP_ALIAS_MORE_FUZZ_WIDE,
     alias_example_template=_C_CPP_ALIAS_EXAMPLE,
     alias_explain_template=_C_CPP_ALIAS_EXPLAIN,
 )

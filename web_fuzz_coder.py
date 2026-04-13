@@ -7,10 +7,12 @@ import argparse
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Dict, List
 
@@ -768,22 +770,61 @@ def main():
         pending_history = _append_pending_turn(chat_history, q, mode)
         yield "", pending_history, histories
 
-        try:
-            if ask_app.is_help_query(q):
-                lang = getattr(_get_pipeline(project_name), "language_name", None) if project_name else None
-                ans = ask_app.render_help_text(language_name=lang or ask_app.DEFAULT_CHAT_LANGUAGE)
-            else:
-                pipeline = _get_pipeline(project_name)
-                expanded_q, _alias_used = ask_app.expand_chat_alias(
-                    q,
-                    language_name=(getattr(pipeline, "language_name", None) or ask_app.DEFAULT_CHAT_LANGUAGE),
-                )
-                result = pipeline.run(expanded_q, conversation_history)
-                ans = result.answer
-        except Exception as e:
-            ans = f"[ERROR] {type(e).__name__}: {e}"
+        token_q = queue.Queue()
+        done = threading.Event()
+        run_state = {"answer": "", "error": None}
 
+        def _on_token(token: str):
+            if token:
+                token_q.put(str(token))
+
+        def _run_worker():
+            try:
+                if ask_app.is_help_query(q):
+                    lang = getattr(_get_pipeline(project_name), "language_name", None) if project_name else None
+                    run_state["answer"] = ask_app.render_help_text(language_name=lang or ask_app.DEFAULT_CHAT_LANGUAGE)
+                else:
+                    pipeline = _get_pipeline(project_name)
+                    expanded_q, _alias_used = ask_app.expand_chat_alias(
+                        q,
+                        language_name=(getattr(pipeline, "language_name", None) or ask_app.DEFAULT_CHAT_LANGUAGE),
+                    )
+                    result = pipeline.run(expanded_q, conversation_history, token_callback=_on_token)
+                    run_state["answer"] = result.answer
+            except Exception as e:
+                run_state["error"] = f"[ERROR] {type(e).__name__}: {e}"
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=_run_worker, daemon=True)
+        worker.start()
+
+        streamed_answer = ""
+        while True:
+            emitted = False
+            while True:
+                try:
+                    streamed_answer += token_q.get_nowait()
+                    emitted = True
+                except queue.Empty:
+                    break
+            if emitted:
+                partial_history = _finalize_pending_turn(pending_history, q, streamed_answer, mode)
+                yield "", partial_history, histories
+
+            if done.is_set():
+                try:
+                    streamed_answer += token_q.get_nowait()
+                    continue
+                except queue.Empty:
+                    break
+            done.wait(0.03)
+
+        ans = run_state["error"] if run_state["error"] else run_state["answer"]
         final_history = _finalize_pending_turn(pending_history, q, ans, mode)
+        if ans != streamed_answer:
+            yield "", final_history, histories
+
         conversation_history = _history_to_conversation(final_history)
         user_histories[project_name] = conversation_history
         histories["last_project"][username] = project_name
@@ -794,8 +835,6 @@ def main():
             project_names,
             last_project=project_name,
         )
-
-        yield "", final_history, histories
 
     def _chat_request_started(message):
         if not str(message or "").strip():
@@ -1340,7 +1379,7 @@ def main():
         gr.Markdown(
             "## Fuzz Coder\n"
             "Codebase analysis chat for fuzzing targets, examples, parameter semantics, and implementation details.\n"
-            "Aliases: `fuzz`, `fuzz wide`, `more fuzz`, `more fuzz wide`, `example FUNCTION`, `explain FUNCTION`."
+            "Aliases: `fuzz`, `fuzz wide`, `more fuzz`, `more fuzz wide`, `example FUNCTION`, `explain SYMBOL`."
         )
         with gr.Row():
             project = gr.Dropdown(
