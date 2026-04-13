@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
@@ -28,6 +29,7 @@ from fuzz_coder.languages.registry import get_supported_language_names
 
 TYPING_PLACEHOLDER_TEXT = "..."
 TYPING_PLACEHOLDER_HTML = "<div class='fc-chat-typing fc-typing-dots'><span></span><span></span><span></span></div>"
+PROJECT_ID_SEP = "::"
 
 
 def _parse_args():
@@ -283,8 +285,8 @@ def _history_file_for_user(history_dir: Path, username: str):
     return history_dir / f"{_safe_user_slug(username)}.json"
 
 
-def _load_user_histories(history_dir: Path, username: str, project_names: List[str]):
-    result = {name: [] for name in project_names}
+def _load_user_histories(history_dir: Path, username: str, project_ids: List[str]):
+    result = {pid: [] for pid in project_ids}
     p = _history_file_for_user(history_dir, username)
     if not p.exists():
         return result
@@ -297,12 +299,17 @@ def _load_user_histories(history_dir: Path, username: str, project_names: List[s
     if not isinstance(projects_blob, dict):
         return result
 
-    for project_name in project_names:
-        result[project_name] = _normalize_conversation(projects_blob.get(project_name, []))
+    for pid in project_ids:
+        conv = projects_blob.get(pid, [])
+        if not conv:
+            # Backward compatibility: older history schema used project name as key.
+            pname, _ptag = _split_project_id(pid)
+            conv = projects_blob.get(pname, [])
+        result[pid] = _normalize_conversation(conv)
     return result
 
 
-def _load_user_last_project(history_dir: Path, username: str, project_names: List[str]):
+def _load_user_last_project(history_dir: Path, username: str, project_ids: List[str]):
     p = _history_file_for_user(history_dir, username)
     if not p.exists():
         return ""
@@ -312,15 +319,22 @@ def _load_user_last_project(history_dir: Path, username: str, project_names: Lis
         return ""
     if not isinstance(data, dict):
         return ""
-    project_name = str(data.get("last_project", "") or "").strip()
-    return project_name if project_name in project_names else ""
+    project_id = str(data.get("last_project", "") or "").strip()
+    if project_id in project_ids:
+        return project_id
+    # Backward compatibility: older schema stored only project name.
+    if project_id:
+        matches = [pid for pid in project_ids if _split_project_id(pid)[0] == project_id]
+        if matches:
+            return sorted(matches, reverse=True)[0]
+    return ""
 
 
 def _save_user_histories(
     history_dir: Path,
     username: str,
     user_histories,
-    project_names: List[str],
+    project_ids: List[str],
     *,
     last_project: str | None = None,
 ):
@@ -331,10 +345,10 @@ def _save_user_histories(
     }
     if last_project:
         payload["last_project"] = last_project
-    for project_name in project_names:
-        conv = _normalize_conversation(user_histories.get(project_name, []))
+    for pid in project_ids:
+        conv = _normalize_conversation(user_histories.get(pid, []))
         if conv:
-            payload["projects"][project_name] = [[u, a] for u, a in conv]
+            payload["projects"][pid] = [[u, a] for u, a in conv]
 
     p = _history_file_for_user(history_dir, username)
     tmp = p.with_suffix(".tmp")
@@ -355,6 +369,73 @@ def _looks_like_index_dir(path: Path):
     return path.is_dir() and all((path / f).exists() for f in required)
 
 
+def _sanitize_tag_name(tag: str) -> str:
+    raw = str(tag or "").strip()
+    if not raw:
+        return ""
+    # Preserve human-readable tags (including spaces/colon) and only block path separators.
+    cleaned = raw.replace("/", "-").replace("\\", "-")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _default_project_tag() -> str:
+    return datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+
+
+def _compose_project_id(project_name: str, tag: str) -> str:
+    return f"{project_name}{PROJECT_ID_SEP}{tag}"
+
+
+def _split_project_id(project_id: str) -> tuple[str, str]:
+    raw = str(project_id or "")
+    if PROJECT_ID_SEP not in raw:
+        return raw, "default"
+    project_name, tag = raw.split(PROJECT_ID_SEP, 1)
+    return project_name, tag or "default"
+
+
+def _parse_index_suffix_to_project_tag(suffix: str) -> tuple[str, str]:
+    token = str(suffix or "").strip()
+    if not token:
+        return "project", "default"
+    if "_" not in token:
+        return token, "default"
+    project_name, tag = token.rsplit("_", 1)
+    project_name = project_name.strip() or token
+    tag = str(tag or "").strip() or "default"
+    return project_name, tag
+
+
+def _build_project_tag_map(projects: Dict[str, Path]) -> Dict[str, Dict[str, str]]:
+    out: Dict[str, Dict[str, str]] = {}
+    for pid in projects.keys():
+        pname, ptag = _split_project_id(pid)
+        out.setdefault(pname, {})[ptag] = pid
+    return out
+
+
+def _get_project_names(projects: Dict[str, Path]) -> List[str]:
+    return sorted(_build_project_tag_map(projects).keys())
+
+
+def _get_tags_for_project(projects: Dict[str, Path], project_name: str) -> List[str]:
+    mapping = _build_project_tag_map(projects)
+    tags = list(mapping.get(project_name, {}).keys())
+    return sorted(tags, reverse=True)
+
+
+def _resolve_project_id(projects: Dict[str, Path], project_name: str, tag: str) -> str | None:
+    mapping = _build_project_tag_map(projects)
+    by_tag = mapping.get(project_name, {})
+    if not by_tag:
+        return None
+    if tag in by_tag:
+        return by_tag[tag]
+    tags = sorted(by_tag.keys(), reverse=True)
+    return by_tag[tags[0]] if tags else None
+
+
 def _discover_projects(args):
     projects: Dict[str, Path] = {}
 
@@ -365,7 +446,8 @@ def _discover_projects(args):
         name = explicit.name
         if name.startswith("index_data_"):
             name = name[len("index_data_"):]
-        projects[name] = explicit
+        project_name, tag = _parse_index_suffix_to_project_tag(name)
+        projects[_compose_project_id(project_name, tag)] = explicit
         return projects
 
     base_dir = Path(args.index_base_dir).resolve()
@@ -375,11 +457,20 @@ def _discover_projects(args):
     for p in sorted(base_dir.glob("index_data_*")):
         if not _looks_like_index_dir(p):
             continue
-        name = p.name[len("index_data_"):] or p.name
-        # Guard against duplicate suffixes.
-        if name in projects:
-            name = p.name
-        projects[name] = p.resolve()
+        suffix = p.name[len("index_data_"):] or p.name
+        project_name, tag = _parse_index_suffix_to_project_tag(suffix)
+        pid = _compose_project_id(project_name, tag)
+        if pid in projects:
+            # Keep deterministic and collision-safe behavior.
+            i = 2
+            while True:
+                alt_tag = f"{tag}-{i}"
+                alt_pid = _compose_project_id(project_name, alt_tag)
+                if alt_pid not in projects:
+                    pid = alt_pid
+                    break
+                i += 1
+        projects[pid] = p.resolve()
 
     return projects
 
@@ -562,14 +653,23 @@ def main():
     pipeline_cache: Dict[str, QueryPipeline] = {}
     active_builds: Dict[str, dict] = {}
 
-    def _get_pipeline(project_name: str):
-        if project_name not in projects:
-            raise ValueError(f"Unknown project: {project_name}")
-        if project_name not in pipeline_cache:
-            pipeline_cache[project_name] = _build_pipeline_for_index(
-                projects[project_name], args, embed_model, reranker
+    project_ids = list(projects.keys())
+    project_names = _get_project_names(projects)
+    if not project_names:
+        raise FileNotFoundError("No projects found after discovery.")
+    default_project = project_names[0]
+    default_tags = _get_tags_for_project(projects, default_project)
+    default_tag = default_tags[0] if default_tags else "default"
+    default_project_id = _resolve_project_id(projects, default_project, default_tag) or project_ids[0]
+
+    def _get_pipeline(project_id: str):
+        if project_id not in projects:
+            raise ValueError(f"Unknown project id: {project_id}")
+        if project_id not in pipeline_cache:
+            pipeline_cache[project_id] = _build_pipeline_for_index(
+                projects[project_id], args, embed_model, reranker
             )
-        return pipeline_cache[project_name]
+        return pipeline_cache[project_id]
 
     def _sync_projects_from_disk():
         if args.index_dir:
@@ -578,10 +678,14 @@ def main():
             discovered = _discover_projects(args)
         except Exception:
             return
-        for name, path in discovered.items():
-            if name not in projects:
-                projects[name] = path.resolve()
-                project_names.append(name)
+        changed = False
+        for pid, path in discovered.items():
+            if pid not in projects:
+                projects[pid] = path.resolve()
+                changed = True
+        if changed:
+            project_ids[:] = list(projects.keys())
+            project_names[:] = _get_project_names(projects)
 
     chatbot_mode_holder = {"mode": "messages"}
 
@@ -601,57 +705,73 @@ def main():
         state = _init_history_state(state)
         users = state["users"]
         if username not in users:
-            users[username] = _load_user_histories(history_dir, username, project_names)
+            users[username] = _load_user_histories(history_dir, username, project_ids)
         user_histories = users[username]
         user_last = state["last_project"]
         if username not in user_last:
-            loaded_last = _load_user_last_project(history_dir, username, project_names)
+            loaded_last = _load_user_last_project(history_dir, username, project_ids)
             if loaded_last:
                 user_last[username] = loaded_last
-        for pname in project_names:
-            if pname not in user_histories:
-                user_histories[pname] = []
+        for pid in project_ids:
+            if pid not in user_histories:
+                user_histories[pid] = []
             else:
-                user_histories[pname] = _normalize_conversation(user_histories[pname])
+                user_histories[pid] = _normalize_conversation(user_histories[pid])
         return user_histories, state
 
-    def _on_project_change(project_name, histories, request: gr.Request = None):
+    def _on_project_change(project_name, project_tag, histories, request: gr.Request = None):
         username = _user_from_request(request)
         user_histories, histories = _ensure_user_histories(histories, username)
-        histories["last_project"][username] = project_name
+        tags = _get_tags_for_project(projects, project_name)
+        selected_tag = project_tag if project_tag in tags else (tags[0] if tags else "default")
+        selected_project_id = _resolve_project_id(projects, project_name, selected_tag) or default_project_id
+        histories["last_project"][username] = selected_project_id
         _save_user_histories(
             history_dir,
             username,
             user_histories,
-            project_names,
-            last_project=project_name,
+            project_ids,
+            last_project=selected_project_id,
         )
         mode = chatbot_mode_holder["mode"]
-        project_hist = _conversation_to_history(user_histories.get(project_name, []), mode)
-        return project_hist, histories
+        project_hist = _conversation_to_history(user_histories.get(selected_project_id, []), mode)
+        return gr.update(choices=tags, value=selected_tag), project_hist, histories
 
-    def _on_page_load(project_name, histories, request: gr.Request = None):
+    def _on_page_load(project_name, project_tag, histories, request: gr.Request = None):
         _sync_projects_from_disk()
         username = _user_from_request(request)
         user_histories, histories = _ensure_user_histories(histories, username)
-        remembered_project = str(histories.get("last_project", {}).get(username, "") or "").strip()
-        if remembered_project in project_names:
-            current_project = remembered_project
-        elif project_name in project_names:
-            current_project = project_name
-        else:
-            current_project = project_names[0]
-        histories["last_project"][username] = current_project
+        remembered_project_id = str(histories.get("last_project", {}).get(username, "") or "").strip()
+
+        current_project = project_name if project_name in project_names else default_project
+        current_tag = project_tag or ""
+        if remembered_project_id in project_ids:
+            remembered_project, remembered_tag = _split_project_id(remembered_project_id)
+            if remembered_project in project_names:
+                current_project = remembered_project
+                current_tag = remembered_tag
+
+        tags = _get_tags_for_project(projects, current_project)
+        if current_tag not in tags:
+            current_tag = tags[0] if tags else "default"
+
+        selected_project_id = _resolve_project_id(projects, current_project, current_tag) or default_project_id
+        histories["last_project"][username] = selected_project_id
         _save_user_histories(
             history_dir,
             username,
             user_histories,
-            project_names,
-            last_project=current_project,
+            project_ids,
+            last_project=selected_project_id,
         )
         mode = chatbot_mode_holder["mode"]
-        project_hist = _conversation_to_history(user_histories.get(current_project, []), mode)
-        return gr.update(choices=project_names, value=current_project), project_hist, histories
+        project_hist = _conversation_to_history(user_histories.get(selected_project_id, []), mode)
+        return (
+            gr.update(choices=project_names, value=current_project),
+            gr.update(choices=tags, value=current_tag),
+            project_hist,
+            histories,
+        )
 
     def _append_pending_turn(chat_history, q: str, mode: str):
         normalized = _normalize_history_for_mode(chat_history, mode)
@@ -707,9 +827,12 @@ def main():
                 normalized[-1] = (last_user, None)
         return normalized
 
-    def _chat_submit(message, chat_history, project_name, histories, request: gr.Request = None):
+    def _chat_submit(message, chat_history, project_name, project_tag, histories, request: gr.Request = None):
         username = _user_from_request(request)
         user_histories, histories = _ensure_user_histories(histories, username)
+        project_id = _resolve_project_id(projects, project_name, project_tag)
+        if not project_id:
+            raise ValueError(f"Unknown project/tag: {project_name} / {project_tag}")
         mode = chatbot_mode_holder["mode"]
         chat_history = _normalize_history_for_mode(chat_history, mode)
         conversation_history = _history_to_conversation(chat_history)
@@ -731,10 +854,10 @@ def main():
         def _run_worker():
             try:
                 if ask_app.is_help_query(q):
-                    lang = getattr(_get_pipeline(project_name), "language_name", None) if project_name else None
+                    lang = getattr(_get_pipeline(project_id), "language_name", None) if project_id else None
                     run_state["answer"] = ask_app.render_help_text(language_name=lang or ask_app.DEFAULT_CHAT_LANGUAGE)
                 else:
-                    pipeline = _get_pipeline(project_name)
+                    pipeline = _get_pipeline(project_id)
                     expanded_q, _alias_used = ask_app.expand_chat_alias(
                         q,
                         language_name=(getattr(pipeline, "language_name", None) or ask_app.DEFAULT_CHAT_LANGUAGE),
@@ -776,14 +899,14 @@ def main():
             yield "", final_history, histories
 
         conversation_history = _history_to_conversation(final_history)
-        user_histories[project_name] = conversation_history
-        histories["last_project"][username] = project_name
+        user_histories[project_id] = conversation_history
+        histories["last_project"][username] = project_id
         _save_user_histories(
             history_dir,
             username,
             user_histories,
-            project_names,
-            last_project=project_name,
+            project_ids,
+            last_project=project_id,
         )
 
     def _chat_request_started(message):
@@ -799,30 +922,34 @@ def main():
         cleaned = _drop_pending_typing(chat_history, mode)
         return cleaned, gr.update(visible=True), gr.update(visible=False)
 
-    def _clear_project_chat(project_name, histories, request: gr.Request = None):
+    def _clear_project_chat(project_name, project_tag, histories, request: gr.Request = None):
         username = _user_from_request(request)
         user_histories, histories = _ensure_user_histories(histories, username)
-        user_histories[project_name] = []
+        project_id = _resolve_project_id(projects, project_name, project_tag) or default_project_id
+        user_histories[project_id] = []
         _save_user_histories(
             history_dir,
             username,
             user_histories,
-            project_names,
-            last_project=histories.get("last_project", {}).get(username) or project_name,
+            project_ids,
+            last_project=histories.get("last_project", {}).get(username) or project_id,
         )
         return _conversation_to_history([], chatbot_mode_holder["mode"]), histories
 
     def _add_project_from_zip(
         zip_file,
         project_name_input,
+        project_tag_input,
         language_name,
         current_project_name,
+        current_project_tag,
         histories,
         request: gr.Request = None,
     ):
         histories = _init_history_state(histories)
         username = _user_from_request(request)
         current_project_name = current_project_name or default_project
+        current_project_tag = current_project_tag or default_tag
         zip_value = _normalize_uploaded_zip_path(zip_file)
         zip_ready = bool(zip_value)
 
@@ -832,6 +959,7 @@ def main():
             keep_zip: bool = True,
             keep_ready: bool = True,
             next_project_name: str | None = None,
+            next_project_tag: str | None = None,
             show_cancel: bool | None = None,
             show_add: bool | None = None,
             update_zip_value: bool = False,
@@ -851,6 +979,7 @@ def main():
                 zip_update = gr.update(value=(zip_value if keep_zip else None))
             return (
                 (next_project_name or current_project_name),
+                (next_project_tag or current_project_tag),
                 histories,
                 status_text,
                 zip_update,
@@ -881,16 +1010,21 @@ def main():
         if not base_name:
             yield _resp("Unable to derive project name. Please set Project Name explicitly.")
             return
-        if base_name in project_names or (index_base_dir / f"index_data_{base_name}").exists():
+        tag_name = _sanitize_tag_name(project_tag_input or "")
+        if not tag_name:
+            tag_name = _default_project_tag()
+        new_project_id = _compose_project_id(base_name, tag_name)
+        if new_project_id in project_ids or (index_base_dir / f"index_data_{base_name}_{tag_name}").exists():
             yield _resp(
-                f"Project `{base_name}` already exists. Choose another project name.",
+                f"Project `{base_name}` with tag `{tag_name}` already exists. Choose another project/tag.",
                 keep_zip=True,
                 keep_ready=True,
             )
             return
 
         new_project_name = base_name
-        new_index_dir = index_base_dir / f"index_data_{new_project_name}"
+        new_project_tag = tag_name
+        new_index_dir = index_base_dir / f"index_data_{new_project_name}_{new_project_tag}"
 
         index_entry = Path(__file__).resolve().parent / "index_fuzz_coder.py"
         cmd = [
@@ -910,7 +1044,7 @@ def main():
 
         log_lines: List[str] = []
         yield _resp(
-            _build_index_status_text(new_project_name, log_lines),
+            _build_index_status_text(f"{new_project_name}:{new_project_tag}", log_lines),
             keep_zip=True,
             keep_ready=True,
             show_cancel=True,
@@ -936,7 +1070,7 @@ def main():
                     if len(log_lines) > 500:
                         log_lines = log_lines[-300:]
                     yield _resp(
-                        _build_index_status_text(new_project_name, log_lines),
+                        _build_index_status_text(f"{new_project_name}:{new_project_tag}", log_lines),
                         keep_zip=True,
                         keep_ready=True,
                         show_cancel=True,
@@ -974,30 +1108,32 @@ def main():
             )
             return
 
-        projects[new_project_name] = new_index_dir.resolve()
-        if new_project_name not in project_names:
-            project_names.append(new_project_name)
-        pipeline_cache.pop(new_project_name, None)
+        projects[new_project_id] = new_index_dir.resolve()
+        if new_project_id not in project_ids:
+            project_ids.append(new_project_id)
+        project_names[:] = _get_project_names(projects)
+        pipeline_cache.pop(new_project_id, None)
 
         for user_key, user_map in histories.get("users", {}).items():
-            if isinstance(user_map, dict) and new_project_name not in user_map:
-                user_map[new_project_name] = []
+            if isinstance(user_map, dict) and new_project_id not in user_map:
+                user_map[new_project_id] = []
                 _save_user_histories(
                     history_dir,
                     user_key,
                     user_map,
-                    project_names,
-                    last_project=histories.get("last_project", {}).get(user_key) or new_project_name,
+                    project_ids,
+                    last_project=histories.get("last_project", {}).get(user_key) or new_project_id,
                 )
 
         if args.verbose and details:
             print("[Add Project] Index build output:")
             print(details[-2000:])
         yield _resp(
-            f"Added project `{new_project_name}`.",
+            f"Added project `{new_project_name}` with tag `{new_project_tag}`.",
             keep_zip=False,
             keep_ready=False,
             next_project_name=new_project_name,
+            next_project_tag=new_project_tag,
             show_cancel=False,
             show_add=True,
             update_zip_value=True,
@@ -1051,9 +1187,17 @@ def main():
         except Exception:
             return False
 
-    def _cancel_project_upload(zip_file, project_name_input, current_project_name, request: gr.Request = None):
+    def _cancel_project_upload(
+        zip_file,
+        project_name_input,
+        project_tag_input,
+        current_project_name,
+        current_project_tag,
+        request: gr.Request = None,
+    ):
         username = _user_from_request(request)
         current_project_name = current_project_name or default_project
+        current_project_tag = current_project_tag or default_tag
         removed_any = False
 
         active = active_builds.pop(username, None)
@@ -1078,7 +1222,10 @@ def main():
                 zip_path = Path(zip_value).expanduser().resolve()
                 base_name = _derive_project_name(zip_path, project_name_input or "")
                 if base_name:
-                    candidate = (index_base_dir / f"index_data_{base_name}").resolve()
+                    tag_name = _sanitize_tag_name(project_tag_input or "")
+                    if not tag_name:
+                        tag_name = _default_project_tag()
+                    candidate = (index_base_dir / f"index_data_{base_name}_{tag_name}").resolve()
                     protected_dirs = {p.resolve() for p in projects.values()}
                     if candidate not in protected_dirs:
                         removed_any = _cleanup_partial_index_dir(candidate) or removed_any
@@ -1094,6 +1241,7 @@ def main():
             gr.update(interactive=bool(_normalize_uploaded_zip_path(zip_file)), visible=True),
             gr.update(visible=False),
             current_project_name,
+            current_project_tag,
             gr.update(visible=bool(_normalize_uploaded_zip_path(zip_file))),
             gr.update(visible=bool(_normalize_uploaded_zip_path(zip_file))),
         )
@@ -1109,8 +1257,14 @@ def main():
         )
 
     def _refresh_project_dropdown(target_project_name: str):
-        target = target_project_name or default_project
+        target = target_project_name if target_project_name in project_names else default_project
         return gr.update(choices=project_names, value=target)
+
+    def _refresh_tag_dropdown(project_name: str, target_tag: str | None = None):
+        pname = project_name if project_name in project_names else default_project
+        tags = _get_tags_for_project(projects, pname)
+        value = target_tag if target_tag in tags else (tags[0] if tags else "default")
+        return gr.update(choices=tags, value=value)
 
     def _toggle_add_project_modal(is_open: bool):
         next_open = not bool(is_open)
@@ -1157,15 +1311,68 @@ def main():
             gr.update(),
         )
 
-    project_names = list(projects.keys())
+    project_names[:] = _get_project_names(projects)
     default_project = project_names[0]
+    default_tag = (_get_tags_for_project(projects, default_project) or ["default"])[0]
     language_choices = list(get_supported_language_names()) or ["c_cpp"]
 
     ui_css = """
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
     .gradio-container {
-      max-width: min(1680px, 98vw) !important;
-      padding-left: 14px !important;
-      padding-right: 14px !important;
+      width: 100% !important;
+      max-width: 100% !important;
+      padding-left: 0 !important;
+      padding-right: 0 !important;
+    }
+    #fc_layout {
+      width: 100% !important;
+      max-width: min(1500px, 96vw) !important;
+      margin-left: auto !important;
+      margin-right: auto !important;
+      padding-left: 6px !important;
+      padding-right: 6px !important;
+      overflow-x: hidden !important;
+    }
+    #fc_layout > * {
+      width: 100% !important;
+    }
+    #fc_layout .gr-row {
+      width: 100% !important;
+      margin-left: 0 !important;
+      margin-right: 0 !important;
+      flex-wrap: wrap !important;
+      gap: 8px !important;
+    }
+    #fc_layout .gr-row > * {
+      min-width: 0 !important;
+    }
+    #fc_top_project_row > * {
+      flex: 1 1 320px !important;
+    }
+    #fc_add_project_row > * {
+      flex: 0 1 auto !important;
+    }
+    #fc_actions_row { }
+    #main_chatbot {
+      height: clamp(320px, 60dvh, 760px) !important;
+      min-height: 320px !important;
+    }
+    @media (min-width: 981px) and (orientation: portrait) {
+      #main_chatbot {
+        height: clamp(820px, 160dvh, 2000px) !important;
+        min-height: 420px !important;
+      }
+    }
+    @media (min-width: 981px) and (orientation: landscape) {
+      #main_chatbot {
+        height: clamp(380px, 65dvh, 900px) !important;
+        min-height: 320px !important;
+      }
+    }
+    #chat_input_row > * {
+      min-width: 0 !important;
     }
     #add_project_btn button {
       background: #f59e0b !important;
@@ -1186,6 +1393,8 @@ def main():
       font-weight: 700 !important;
     }
     #chat_input_row {
+      margin-top: 8px !important;
+      margin-bottom: 8px !important;
       background: var(--block-background-fill, #1f2937);
       border: 1px solid var(--border-color-primary, #374151);
       border-radius: 12px;
@@ -1303,14 +1512,22 @@ def main():
     .fc-typing-dots span:nth-child(3) {
       animation-delay: 0.24s;
     }
-    #main_chatbot {
-      height: calc(100vh - 340px) !important;
-      min-height: 360px !important;
-    }
     @media (max-width: 980px) {
+      #fc_layout {
+        max-width: 100vw !important;
+        padding-left: 8px !important;
+        padding-right: 8px !important;
+      }
       #main_chatbot {
-        height: calc(100vh - 390px) !important;
-        min-height: 300px !important;
+        height: clamp(260px, 52dvh, 620px) !important;
+        min-height: 260px !important;
+      }
+      #chat_input_row {
+        margin-bottom: max(8px, env(safe-area-inset-bottom)) !important;
+      }
+      #chat_send_btn button, #chat_cancel_btn button {
+        min-width: 48px !important;
+        width: 48px !important;
       }
     }
     @keyframes fc-bounce {
@@ -1326,84 +1543,95 @@ def main():
     """
 
     with gr.Blocks(title="Fuzz Coder", css=ui_css) as demo:
-        gr.Markdown(
-            "## Fuzz Coder\n"
-            "Codebase analysis chat for fuzzing targets, examples, parameter semantics, and implementation details.\n"
-            "Aliases: `fuzz`, `fuzz wide`, `more fuzz`, `more fuzz wide`, `example FUNCTION`, `explain SYMBOL`."
-        )
-        with gr.Row():
-            project = gr.Dropdown(
-                choices=project_names,
-                value=default_project,
-                label="Project (index_data_PROJECT)",
+        with gr.Column(elem_id="fc_layout"):
+            gr.Markdown(
+                "## Fuzz Coder\n"
+                "Codebase analysis chat for fuzzing targets, examples, parameter semantics, and implementation details.\n"
+                "Aliases: `help`, `fuzz`, `fuzz wide`, `more fuzz`, `more fuzz wide`, `example FUNCTION`, `explain SYMBOL`."
             )
-        with gr.Row():
-            open_add_project_btn = gr.Button(
-                "Add Project",
-                variant="secondary",
-                elem_id="open_add_project_btn",
-                min_width=150,
-            )
+            with gr.Row(elem_id="fc_top_project_row"):
+                project = gr.Dropdown(
+                    choices=project_names,
+                    value=default_project,
+                    label="Project",
+                )
+                project_tag = gr.Dropdown(
+                    choices=_get_tags_for_project(projects, default_project),
+                    value=default_tag,
+                    label="Tag",
+                )
+            with gr.Row(elem_id="fc_add_project_row"):
+                open_add_project_btn = gr.Button(
+                    "Add Project",
+                    variant="secondary",
+                    elem_id="open_add_project_btn",
+                    min_width=150,
+                )
 
-        with gr.Row(visible=False) as add_project_modal_wrap:
-            with gr.Group(elem_id="add_project_modal") as add_project_modal:
-                gr.Markdown("### Add Project From ZIP")
-                add_project_status = gr.Markdown("")
-                with gr.Row():
-                    zip_upload = gr.File(
-                        label="Project ZIP Archive",
-                        file_types=[".zip"],
-                        type="filepath",
-                        elem_id="project_zip_upload",
-                    )
-                with gr.Row(elem_id="clear_zip_row", visible=False) as clear_zip_row:
-                    clear_zip_select_btn = gr.Button(
-                        "✕",
-                        visible=False,
-                        elem_id="cancel_zip_select_btn",
-                        min_width=42,
-                    )
-                with gr.Row():
-                    project_name_input = gr.Textbox(
-                        label="Project Name (optional)",
-                        placeholder="e.g. pytorch",
-                    )
-                    language_input = gr.Dropdown(
-                        choices=language_choices,
-                        value="c_cpp" if "c_cpp" in language_choices else language_choices[0],
-                        label="Language",
-                    )
-                with gr.Row():
-                    add_project_btn = gr.Button(
-                        "Add Project from ZIP",
-                        variant="primary",
-                        interactive=False,
-                        elem_id="add_project_btn",
-                    )
-                    cancel_add_project_btn = gr.Button("✕", variant="stop", visible=False, min_width=56)
-        chatbot, chatbot_mode = _create_chatbot()
-        chatbot_mode_holder["mode"] = chatbot_mode
-        if args.verbose:
-            print(f"[Web UI] Chatbot mode: {chatbot_mode}")
-            print(f"[Web UI] Auth enabled: {'yes' if auth_credentials else 'no'}")
-            print(f"[Web UI] History dir: {history_dir}")
-        with gr.Row(elem_id="chat_input_row"):
-            msg = gr.Textbox(
-                placeholder="Ask about functions, fuzz targets, or type 'help'",
-                show_label=False,
-                scale=12,
-                container=False,
-            )
-            send_btn = gr.Button("→", variant="primary", scale=1, min_width=56, elem_id="chat_send_btn")
-            cancel_chat_btn = gr.Button("■", variant="stop", visible=False, scale=1, min_width=56, elem_id="chat_cancel_btn")
-        logout_btn = None
-        with gr.Row():
-            clear_btn = gr.Button("Clear Current Project Chat")
-            if auth_credentials:
-                logout_btn = gr.Button("Logout")
+            with gr.Row(visible=False, elem_id="add_project_modal_wrap") as add_project_modal_wrap:
+                with gr.Group(elem_id="add_project_modal") as add_project_modal:
+                    gr.Markdown("### Add Project From ZIP")
+                    add_project_status = gr.Markdown("")
+                    with gr.Row():
+                        zip_upload = gr.File(
+                            label="Project ZIP Archive",
+                            file_types=[".zip"],
+                            type="filepath",
+                            elem_id="project_zip_upload",
+                        )
+                    with gr.Row(elem_id="clear_zip_row", visible=False) as clear_zip_row:
+                        clear_zip_select_btn = gr.Button(
+                            "✕",
+                            visible=False,
+                            elem_id="cancel_zip_select_btn",
+                            min_width=42,
+                        )
+                    with gr.Row():
+                        project_name_input = gr.Textbox(
+                            label="Project Name (optional)",
+                            placeholder="e.g. pytorch",
+                        )
+                        project_tag_input = gr.Textbox(
+                            label="Tag (optional)",
+                            placeholder="e.g. v1 (default: current datetime)",
+                        )
+                        language_input = gr.Dropdown(
+                            choices=language_choices,
+                            value="c_cpp" if "c_cpp" in language_choices else language_choices[0],
+                            label="Language",
+                        )
+                    with gr.Row():
+                        add_project_btn = gr.Button(
+                            "Add Project from ZIP",
+                            variant="primary",
+                            interactive=False,
+                            elem_id="add_project_btn",
+                        )
+                        cancel_add_project_btn = gr.Button("✕", variant="stop", visible=False, min_width=56)
+            chatbot, chatbot_mode = _create_chatbot()
+            chatbot_mode_holder["mode"] = chatbot_mode
+            if args.verbose:
+                print(f"[Web UI] Chatbot mode: {chatbot_mode}")
+                print(f"[Web UI] Auth enabled: {'yes' if auth_credentials else 'no'}")
+                print(f"[Web UI] History dir: {history_dir}")
+            with gr.Row(elem_id="chat_input_row"):
+                msg = gr.Textbox(
+                    placeholder="Ask about functions, fuzz targets, or type 'help'",
+                    show_label=False,
+                    scale=12,
+                    container=False,
+                )
+                send_btn = gr.Button("→", variant="primary", scale=1, min_width=56, elem_id="chat_send_btn")
+                cancel_chat_btn = gr.Button("■", variant="stop", visible=False, scale=1, min_width=56, elem_id="chat_cancel_btn")
+            logout_btn = None
+            with gr.Row(elem_id="fc_actions_row"):
+                clear_btn = gr.Button("Clear Current Project Chat")
+                if auth_credentials:
+                    logout_btn = gr.Button("Logout")
 
         histories_state = gr.State({"users": {}})
         add_project_target_state = gr.State(default_project)
+        add_project_target_tag_state = gr.State(default_tag)
         add_project_modal_open_state = gr.State(False)
 
         open_add_project_btn.click(
@@ -1425,8 +1653,13 @@ def main():
         )
         project.change(
             fn=_on_project_change,
-            inputs=[project, histories_state],
-            outputs=[chatbot, histories_state],
+            inputs=[project, project_tag, histories_state],
+            outputs=[project_tag, chatbot, histories_state],
+        )
+        project_tag.change(
+            fn=_on_project_change,
+            inputs=[project, project_tag, histories_state],
+            outputs=[project_tag, chatbot, histories_state],
         )
         zip_change_evt = zip_upload.change(
             fn=_on_zip_change,
@@ -1451,9 +1684,10 @@ def main():
         )
         add_project_evt = add_project_btn.click(
             fn=_add_project_from_zip,
-            inputs=[zip_upload, project_name_input, language_input, project, histories_state],
+            inputs=[zip_upload, project_name_input, project_tag_input, language_input, project, project_tag, histories_state],
             outputs=[
                 add_project_target_state,
+                add_project_target_tag_state,
                 histories_state,
                 add_project_status,
                 zip_upload,
@@ -1476,25 +1710,39 @@ def main():
             outputs=[project],
             show_progress="hidden",
         )
+        add_project_evt.then(
+            fn=lambda pname, tag_value: _refresh_tag_dropdown(pname, tag_value),
+            inputs=[add_project_target_state, add_project_target_tag_state],
+            outputs=[project_tag],
+            show_progress="hidden",
+        )
         cancel_add_project_btn.click(
             fn=_cancel_project_upload,
-            inputs=[zip_upload, project_name_input, project],
+            inputs=[zip_upload, project_name_input, project_tag_input, project, project_tag],
             outputs=[
                 add_project_status,
                 zip_upload,
                 add_project_btn,
                 cancel_add_project_btn,
                 add_project_target_state,
+                add_project_target_tag_state,
                 clear_zip_select_btn,
                 clear_zip_row,
             ],
             cancels=[add_project_evt],
             show_progress="hidden",
         )
+        cancel_add_project_btn.click(
+            fn=lambda pname, ptag: _refresh_tag_dropdown(pname, ptag),
+            inputs=[add_project_target_state, add_project_target_tag_state],
+            outputs=[project_tag],
+            show_progress="hidden",
+            queue=False,
+        )
         demo.load(
             fn=_on_page_load,
-            inputs=[project, histories_state],
-            outputs=[project, chatbot, histories_state],
+            inputs=[project, project_tag, histories_state],
+            outputs=[project, project_tag, chatbot, histories_state],
         )
         send_start_evt = send_btn.click(
             fn=_chat_request_started,
@@ -1505,7 +1753,7 @@ def main():
         )
         send_chat_evt = send_start_evt.then(
             fn=_chat_submit,
-            inputs=[msg, chatbot, project, histories_state],
+            inputs=[msg, chatbot, project, project_tag, histories_state],
             outputs=[msg, chatbot, histories_state],
         )
         send_chat_evt.then(
@@ -1524,7 +1772,7 @@ def main():
         )
         submit_chat_evt = submit_start_evt.then(
             fn=_chat_submit,
-            inputs=[msg, chatbot, project, histories_state],
+            inputs=[msg, chatbot, project, project_tag, histories_state],
             outputs=[msg, chatbot, histories_state],
         )
         submit_chat_evt.then(
@@ -1544,7 +1792,7 @@ def main():
         )
         clear_btn.click(
             fn=_clear_project_chat,
-            inputs=[project, histories_state],
+            inputs=[project, project_tag, histories_state],
             outputs=[chatbot, histories_state],
         )
         if logout_btn is not None:
