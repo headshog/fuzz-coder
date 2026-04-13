@@ -11,7 +11,6 @@ import os
 from collections import defaultdict
 from .llm import call_llm as _call_llm_impl
 from .prompting import build_prompt as _build_prompt_impl
-from .prompting import _build_thinking_prompt_with_limit as _build_thinking_prompt_impl
 from .query_analysis import analyze_query as _analyze_query_impl
 from .example_context import build_example_context as _build_example_context_impl
 from .example_grounding import build_example_context_grounded as _build_example_context_grounded_impl
@@ -1058,11 +1057,6 @@ class QueryPlanner:
             candidates.difference_update(self.special_indices["output"])
 
         return sorted(candidates)[:k*3]  # deterministic order for stable retrieval
-
-
-def build_thinking_prompt(frags, q, analysis=None, conversation_history=None):
-    """Compatibility wrapper for thinking prompt builder."""
-    return _build_thinking_prompt_impl(frags, q, analysis=analysis, conversation_history=conversation_history)
 
 
 def build_example_context(frags, analysis=None, language_name=None):

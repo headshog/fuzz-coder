@@ -403,17 +403,6 @@ def _derive_project_name(zip_path: Path, preferred_name: str) -> str:
     return stem or "project"
 
 
-def _pick_unique_project_name(base_name: str, existing_names: List[str]) -> str:
-    if base_name not in existing_names:
-        return base_name
-    i = 2
-    while True:
-        candidate = f"{base_name}_{i}"
-        if candidate not in existing_names:
-            return candidate
-        i += 1
-
-
 def _normalize_uploaded_zip_path(zip_file) -> str:
     if zip_file is None:
         return ""
@@ -441,45 +430,6 @@ def _build_index_status_text(project_name: str, log_lines: List[str]) -> str:
         + "\n".join(tail)
         + "\n```"
     )
-
-
-def _run_index_build(
-    zip_path: Path,
-    out_dir: Path,
-    language: str,
-    args,
-    *,
-    active_builds: dict | None = None,
-    build_key: str | None = None,
-) -> tuple[bool, str]:
-    index_entry = Path(__file__).resolve().parent / "index_fuzz_coder.py"
-    cmd = [
-        sys.executable,
-        str(index_entry),
-        "--src",
-        str(zip_path),
-        "--out",
-        str(out_dir),
-        "--embed_model",
-        str(args.embed_model),
-        "--embedding_backend",
-        str(args.embedding_backend),
-        "--language",
-        str(language),
-    ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if active_builds is not None and build_key:
-        active_builds[build_key] = {"proc": proc, "out_dir": out_dir}
-    stdout, stderr = proc.communicate()
-    if active_builds is not None and build_key:
-        active_builds.pop(build_key, None)
-    stdout = (stdout or "").strip()
-    stderr = (stderr or "").strip()
-    if proc.returncode != 0:
-        details = stderr or stdout or f"indexer exited with code {proc.returncode}"
-        return False, details
-    details = stdout or "index build completed"
-    return True, details
 
 
 def _build_pipeline_for_index(index_dir: Path, args, embed_model, reranker):

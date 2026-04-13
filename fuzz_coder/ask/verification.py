@@ -101,21 +101,6 @@ def _extract_file_source_vars(code_text: str, adapter=None) -> List[str]:
     return ad.extract_file_source_vars(code_text or "")
 
 
-def _normalize_chain_token(token: str) -> str:
-    ad = _resolve_verification_adapter()
-    return ad.normalize_chain_token(token)
-
-
-def _lhs_base_name(lhs_expr: str) -> str:
-    ad = _resolve_verification_adapter()
-    return ad.lhs_base_name(lhs_expr)
-
-
-def _extract_simple_assignment_edges(code: str, adapter=None) -> List[tuple[str, str]]:
-    ad = _resolve_verification_adapter(adapter=adapter)
-    return ad.extract_simple_assignment_edges(code or "")
-
-
 def _extract_file_data_flow_symbols(code_text: str, source_vars: List[str], adapter=None) -> List[str]:
     ad = _resolve_verification_adapter(adapter=adapter)
     return ad.extract_file_data_flow_symbols(code_text or "", source_vars or [])
