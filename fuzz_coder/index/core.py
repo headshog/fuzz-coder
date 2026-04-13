@@ -560,13 +560,6 @@ def build_lexical_index(chunks):
     return idx
 
 
-def _split_call_args_top_level(args_text, language_name=None):
-    args_text = str(args_text or "").strip()
-    if not args_text:
-        return []
-    return split_top_level_params(args_text, language_name=language_name)
-
-
 def _is_literal_like_token(token, language_name=None):
     lang = language_name or ACTIVE_INDEX_LANGUAGE
     adapter = get_index_language_adapter(lang)

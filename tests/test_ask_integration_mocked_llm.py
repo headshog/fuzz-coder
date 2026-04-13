@@ -350,7 +350,8 @@ def test_help_command_prints_capabilities_without_llm_call(tmp_path, monkeypatch
     assert "more fuzz ->" in out_lower
     assert "more fuzz wide ->" in out_lower
     assert "example function_name ->" in out_lower
-    assert "explain function_name ->" in out_lower
+    assert "explain function function_name ->" in out_lower
+    assert "explain struct struct_name ->" in out_lower
 
 
 def test_alias_fuzz_variants_expand_to_canonical_queries(tmp_path, monkeypatch, capsys):
@@ -424,12 +425,13 @@ def test_alias_fuzz_variants_expand_to_canonical_queries(tmp_path, monkeypatch, 
     _ = capsys.readouterr().out
 
     assert len(prompts) == 4
-    assert "### Current Question: Write a list of functions that can be used for fuzzing" in prompts[0]
-    assert "### Current Question: Write a large list (20-30) of functions that can be used for fuzzing." in prompts[1]
-    assert "at most 4 parameters" in prompts[1]
-    assert "### Current Question: Write other functions that are good for fuzzing" in prompts[2]
-    assert "### Current Question: Write other functions in a large list (20-30) that can be used for fuzzing." in prompts[3]
-    assert "Exclude functions already listed previously." in prompts[3]
+    assert "### Current Question: Write a large list (20-30) of functions that can be used for fuzzing." in prompts[0]
+    assert "at most 4 parameters" in prompts[0]
+    assert "### Current Question: Write a list of functions that can be used for fuzzing without parameter count limit." in prompts[1]
+    assert "at most 4 parameters" not in prompts[1]
+    assert "### Current Question: Write other functions in a large list (20-30) that can be used for fuzzing." in prompts[2]
+    assert "Exclude functions already listed previously." in prompts[2]
+    assert "### Current Question: Write other functions that are good for fuzzing without parameter count limit." in prompts[3]
 
 
 def test_alias_example_function_name_expands_to_example_query(tmp_path, monkeypatch, capsys):
@@ -549,7 +551,7 @@ def test_alias_example_with_path_then_module_is_normalized():
 
 
 def test_alias_explain_function_name_expands_to_parameter_semantics_query():
-    expanded, used = ask_app.expand_chat_alias("explain llama_params_fit")
+    expanded, used = ask_app.expand_chat_alias("explain function llama_params_fit")
     assert used is True
     assert expanded.startswith("Analyze function parameter semantics for llama_params_fit:")
     assert "for each parameter, explain its role" in expanded
@@ -557,26 +559,38 @@ def test_alias_explain_function_name_expands_to_parameter_semantics_query():
 
 
 def test_alias_explain_with_module_tail_preserves_module_constraint():
-    expanded, used = ask_app.expand_chat_alias("explain split from module vendor/cpp-httplib")
+    expanded, used = ask_app.expand_chat_alias("explain function split from module vendor/cpp-httplib")
     assert used is True
     assert expanded.startswith("Analyze function parameter semantics for split:")
     assert "from module vendor/cpp-httplib" in expanded
 
 
+def test_alias_explain_struct_expands_to_type_analysis_query():
+    expanded, used = ask_app.expand_chat_alias("explain struct jas_image_t")
+    assert used is True
+    assert expanded.lower().startswith("explain struct jas_image_t and describe what its fields mean")
+
+
+def test_alias_explain_without_explicit_kind_is_not_expanded():
+    expanded, used = ask_app.expand_chat_alias("explain llama_params_fit")
+    assert used is False
+    assert expanded == "explain llama_params_fit"
+
+
 def test_alias_fuzz_wide_expands_to_large_broad_fuzz_query():
     expanded, used = ask_app.expand_chat_alias("fuzz wide")
     assert used is True
-    assert expanded.startswith("Write a large list (20-30) of functions that can be used for fuzzing.")
-    assert "at most 4 parameters" in expanded
-    assert "ANY of these is true" in expanded
+    assert expanded.startswith("Write a list of functions that can be used for fuzzing")
+    assert "without parameter count limit" in expanded
+    assert "at most 4 parameters" not in expanded
 
 
 def test_alias_more_fuzz_wide_expands_to_large_novelty_fuzz_query():
     expanded, used = ask_app.expand_chat_alias("more fuzz wide")
     assert used is True
-    assert expanded.startswith("Write other functions in a large list (20-30) that can be used for fuzzing.")
-    assert "Exclude functions already listed previously." in expanded
-    assert "at most 4 parameters" in expanded
+    assert expanded.startswith("Write other functions that are good for fuzzing")
+    assert "without parameter count limit" in expanded
+    assert "at most 4 parameters" not in expanded
 
 
 def test_example_generation_does_not_emit_listing_verification_warning(tmp_path, monkeypatch, capsys):

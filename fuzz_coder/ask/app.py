@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 from pathlib import Path
 
 import faiss
@@ -62,30 +63,41 @@ def expand_chat_alias(q: str, language_name: str = DEFAULT_CHAT_LANGUAGE):
     if normalized == "more fuzz":
         return adapter.alias_more_fuzz, True
     if normalized.startswith("explain "):
-        parts = raw.split(None, 1)
-        if len(parts) == 2:
-            rest = parts[1].strip()
-            m = re.match(r"^([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)(?:\s+(.*))?$", rest)
-            if m:
-                fn = (m.group(1) or "").strip("`'\"")
-                tail = (m.group(2) or "").strip()
-                if fn:
-                    tail = re.sub(
-                        r"\b(from|in)\s+([^\n,;]+?)\s+(module|directory|subdirectory|folder|path)\b",
-                        r"\1 \3 \2",
-                        tail,
-                        flags=re.IGNORECASE,
-                    )
-                    tail = re.sub(
-                        r"\b(из|в)\s+([^\n,;]+?)\s+(модуле|модуля|директории|поддиректории|папке)\b",
-                        r"\1 \3 \2",
-                        tail,
-                        flags=re.IGNORECASE,
-                    )
-                    expanded = adapter.alias_explain_template.format(function_name=fn)
-                    if tail:
-                        expanded = f"{expanded} {tail}"
-                    return expanded, True
+        m = re.match(
+            r"^\s*explain\s+"
+            r"(function|func|method|struct|class|type)\s+"
+            r"([A-Za-z_]\w*(?:(?:::|\.|\$)[A-Za-z_]\w*)*)"
+            r"(?:\s+(.*))?$",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            kind = (m.group(1) or "").strip().lower()
+            symbol = (m.group(2) or "").strip("`'\"")
+            tail = (m.group(3) or "").strip()
+            tail = re.sub(
+                r"\b(from|in)\s+([^\n,;]+?)\s+(module|directory|subdirectory|folder|path)\b",
+                r"\1 \3 \2",
+                tail,
+                flags=re.IGNORECASE,
+            )
+            tail = re.sub(
+                r"\b(из|в)\s+([^\n,;]+?)\s+(модуле|модуля|директории|поддиректории|папке)\b",
+                r"\1 \3 \2",
+                tail,
+                flags=re.IGNORECASE,
+            )
+            if kind in {"function", "func", "method"}:
+                expanded = adapter.alias_explain_template.format(function_name=symbol)
+            else:
+                expanded = (
+                    f"Explain {kind} {symbol} and describe what its fields mean. "
+                    "Provide evidence from signature, call sites, and docs (file:line). "
+                    "If unknown, say explicitly \"unknown from provided context\"."
+                )
+            if tail:
+                expanded = f"{expanded} {tail}"
+            return expanded, True
     if normalized.startswith("example "):
         parts = raw.split(None, 1)
         if len(parts) == 2:
@@ -126,24 +138,26 @@ def render_help_text(language_name: str = DEFAULT_CHAT_LANGUAGE) -> str:
         "1. List functions by criteria (stdin/file/API/types/parse/fuzz).\n"
         "2. Filter by module/subdirectory (path filter).\n"
         "3. Give examples of function usage.\n"
-        "4. Explain parameter semantics (format/role/source) for a function.\n"
+        "4. Explain parameter semantics (format/role/source) for a function or structure/class.\n"
         "5. Explain implementation details from indexed code.\n"
         "6. Handle follow-ups (including 'other functions' without repeats).\n\n"
         "Chat aliases:\n"
-        "- fuzz -> Write a list of functions that can be used for fuzzing\n"
-        "- fuzz wide -> Large fuzz-target list (20-30) with <=4 params and broad OR input-surface constraints\n"
-        "- more fuzz -> Write other functions that are good for fuzzing\n"
-        "- more fuzz wide -> Like fuzz wide, but exclude previously listed functions\n"
+        "- fuzz -> Large fuzz-target list (20-30) with <=4 params and broad OR input-surface constraints\n"
+        "- fuzz wide -> Write a list of functions that can be used for fuzzing (no parameter-count limit)\n"
+        "- more fuzz -> Like fuzz, but exclude previously listed functions\n"
+        "- more fuzz wide -> Write other functions that are good for fuzzing (no parameter-count limit)\n"
         f"- example FUNCTION_NAME -> Write an example of FUNCTION_NAME with a standalone main() and {cli_expr}-based params\n\n"
-        "- explain FUNCTION_NAME -> Analyze parameter semantics/format/source for FUNCTION_NAME with evidence\n\n"
+        "- explain function FUNCTION_NAME -> Analyze function parameter semantics with evidence\n"
+        "- explain struct STRUCT_NAME -> Analyze struct/class field semantics with evidence\n\n"
         "Example queries:\n"
         "- List functions good for fuzzing from module src/parsers\n"
-        "- Какие функции читают из stdin?\n"
         f"{adapter.help_type_query_example}"
-        "- Дай список других функций для фаззинга из директории src/parsers\n"
+        "- Which functions read from stdin?\n"
+        "- List other functions good for fuzzing from directory src/parsers\n"
         "- Explain how decode_binary_blob works\n"
         "- Give an example calling parse_json_payload\n"
-        "- What parameters does llama_params_fit take and what does each mean?\n"
+        "- explain function llama_params_fit\n"
+        "- explain struct jas_image_t\n"
     )
 
 
@@ -265,9 +279,27 @@ def main():
             print(f"\n[Alias]")
             print(f"  Expanded query: {q}")
 
-        result = pipeline.run(q, conversation_history)
+        stream_state = {"started": False, "chunks": []}
 
-        print(f"\n{result.answer}")
+        def _on_token(token: str):
+            if not token:
+                return
+            if not stream_state["started"]:
+                print()
+                stream_state["started"] = True
+            stream_state["chunks"].append(token)
+            sys.stdout.write(token)
+            sys.stdout.flush()
+
+        result = pipeline.run(q, conversation_history, token_callback=_on_token)
+
+        if not stream_state["started"]:
+            print(f"\n{result.answer}")
+        else:
+            print()
+            streamed_text = "".join(stream_state["chunks"])
+            if streamed_text != str(result.answer or ""):
+                print(result.answer)
         if result.show_response_time:
             print(f"\n[Response time: {result.elapsed:.2f}s]")
 

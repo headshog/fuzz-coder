@@ -182,7 +182,7 @@ python web_fuzz_coder.py \
 - `more fuzz`
 - `more fuzz wide`
 - `example FUNCTION_NAME`
-- `explain FUNCTION_NAME`
+- `explain SYMBOL_NAME` (function or struct/class)
 
 ### Шаг 2.2 (опционально): Автозапуск через systemd
 
