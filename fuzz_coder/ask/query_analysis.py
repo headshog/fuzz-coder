@@ -331,8 +331,13 @@ def _looks_like_type_symbol(token: str) -> bool:
     base = re.split(r"::|\.", t)[-1]
     if not base:
         return False
-    # Favor nominal/user-defined names (e.g. ColorMapObject, AVFormatContext).
-    return bool(re.search(r"[A-Z]", base)) and len(base) >= 3
+    # Favor nominal/user-defined names (e.g. ColorMapObject, AVFormatContext),
+    # plus C typedef-style names like jas_image_t.
+    if bool(re.search(r"[A-Z]", base)) and len(base) >= 3:
+        return True
+    if re.fullmatch(r"[a-z_][a-z0-9_]*_t", base):
+        return True
+    return False
 
 
 def extract_type_like_candidates(
@@ -375,12 +380,6 @@ def extract_type_like_candidates(
     # Fallback to unresolved symbol-like candidates.
     for cand in unresolved_candidates or []:
         _add(cand)
-
-    # If user asked plain "explain X" and we still have nothing, use last token.
-    if not out and query_lower.strip().startswith("explain "):
-        m = re.match(rf"^\s*explain\s+({symbol_pat})\s*$", query, flags=re.IGNORECASE)
-        if m:
-            _add(m.group(1))
 
     return out
 
@@ -535,11 +534,7 @@ def analyze_query(
         "структур", "класс", "тип", "поля", "члены",
     ]
     explicit_type_intent = any(m in query_lower for m in type_semantics_markers)
-    alias_like_explain_target = (
-        analysis.get("needs_param_semantics")
-        and len(analysis.get("function_names") or []) == 0
-    )
-    if explicit_type_intent or alias_like_explain_target or query_lower.strip().startswith("explain "):
+    if explicit_type_intent:
         type_candidates = extract_type_like_candidates(
             query,
             query_lower,
@@ -664,6 +659,20 @@ def analyze_query(
                 analysis["function_names"],
                 language_name=language_name,
             )
+
+    # For explicit function-parameter semantics asks with unresolved symbols,
+    # keep function intent instead of auto-switching to type analysis.
+    if (
+        analysis.get("needs_param_semantics")
+        and not analysis.get("function_names")
+        and analysis.get("query_function_candidates")
+    ):
+        analysis["query_type"] = "function_specific"
+        analysis["is_listing"] = False
+        analysis["needs_file"] = False
+        analysis["needs_output"] = False
+        analysis["needs_api"] = False
+        analysis["needs_stdin"] = False
 
     if any(w in query_lower for w in ["implement", "реализ", "как работает", "how does", "algorithm", "алгоритм"]):
         analysis["needs_implementation"] = True

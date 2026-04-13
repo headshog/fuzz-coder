@@ -1,7 +1,7 @@
 from fuzz_coder.ask.core import QueryPlanner, build_type_analysis_from_context
 
 
-def test_analyze_query_explain_alias_text_switches_to_type_analysis_for_unresolved_symbol():
+def test_analyze_query_parameter_semantics_unresolved_symbol_stays_function_intent():
     planner = QueryPlanner(
         special_indices={},
         symbols={
@@ -20,10 +20,10 @@ def test_analyze_query_explain_alias_text_switches_to_type_analysis_for_unresolv
 
     analysis = planner.analyze_query(q)
 
-    assert analysis["query_type"] == "type_analysis"
-    assert analysis["needs_type_semantics"] is True
-    assert analysis["primary_type_name"] == "ColorMapObject"
-    assert "ColorMapObject" in analysis["type_names"]
+    assert analysis["query_type"] == "function_specific"
+    assert analysis["needs_type_semantics"] is False
+    assert analysis["type_names"] == []
+    assert "ColorMapObject" in analysis["query_function_candidates"]
     assert analysis["function_names"] == []
 
 
@@ -42,6 +42,27 @@ def test_analyze_query_explicit_struct_fields_intent_is_type_analysis():
     assert analysis["query_type"] == "type_analysis"
     assert analysis["needs_type_semantics"] is True
     assert analysis["primary_type_name"] == "ColorMapObject"
+
+
+def test_analyze_query_explicit_struct_intent_is_type_analysis_for_c_style_typedef_t():
+    planner = QueryPlanner(
+        special_indices={},
+        symbols={
+            "jas_image_encode": [1],
+        },
+        call_graph={},
+        called_by={},
+        meta=[],
+    )
+    q = "Explain struct jas_image_t and describe what its fields mean."
+
+    analysis = planner.analyze_query(q)
+
+    assert analysis["query_type"] == "type_analysis"
+    assert analysis["needs_type_semantics"] is True
+    assert analysis["primary_type_name"] == "jas_image_t"
+    assert "jas_image_t" in analysis["type_names"]
+    assert analysis["function_names"] == []
 
 
 def test_build_type_analysis_from_context_uses_type_index_field_evidence():

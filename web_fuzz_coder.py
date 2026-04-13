@@ -1547,7 +1547,8 @@ def main():
             gr.Markdown(
                 "## Fuzz Coder\n"
                 "Codebase analysis chat for fuzzing targets, examples, parameter semantics, and implementation details.\n"
-                "Aliases: `help`, `fuzz`, `fuzz wide`, `more fuzz`, `more fuzz wide`, `example FUNCTION`, `explain SYMBOL`."
+                "Aliases: `help`, `fuzz`, `fuzz wide`, `more fuzz`, `more fuzz wide`, "
+                "`example FUNCTION`, `explain function FUNCTION`, `explain struct STRUCT`."
             )
             with gr.Row(elem_id="fc_top_project_row"):
                 project = gr.Dropdown(

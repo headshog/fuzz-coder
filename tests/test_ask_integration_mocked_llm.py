@@ -350,7 +350,8 @@ def test_help_command_prints_capabilities_without_llm_call(tmp_path, monkeypatch
     assert "more fuzz ->" in out_lower
     assert "more fuzz wide ->" in out_lower
     assert "example function_name ->" in out_lower
-    assert "explain symbol ->" in out_lower
+    assert "explain function function_name ->" in out_lower
+    assert "explain struct struct_name ->" in out_lower
 
 
 def test_alias_fuzz_variants_expand_to_canonical_queries(tmp_path, monkeypatch, capsys):
@@ -550,7 +551,7 @@ def test_alias_example_with_path_then_module_is_normalized():
 
 
 def test_alias_explain_function_name_expands_to_parameter_semantics_query():
-    expanded, used = ask_app.expand_chat_alias("explain llama_params_fit")
+    expanded, used = ask_app.expand_chat_alias("explain function llama_params_fit")
     assert used is True
     assert expanded.startswith("Analyze function parameter semantics for llama_params_fit:")
     assert "for each parameter, explain its role" in expanded
@@ -558,10 +559,22 @@ def test_alias_explain_function_name_expands_to_parameter_semantics_query():
 
 
 def test_alias_explain_with_module_tail_preserves_module_constraint():
-    expanded, used = ask_app.expand_chat_alias("explain split from module vendor/cpp-httplib")
+    expanded, used = ask_app.expand_chat_alias("explain function split from module vendor/cpp-httplib")
     assert used is True
     assert expanded.startswith("Analyze function parameter semantics for split:")
     assert "from module vendor/cpp-httplib" in expanded
+
+
+def test_alias_explain_struct_expands_to_type_analysis_query():
+    expanded, used = ask_app.expand_chat_alias("explain struct jas_image_t")
+    assert used is True
+    assert expanded.lower().startswith("explain struct jas_image_t and describe what its fields mean")
+
+
+def test_alias_explain_without_explicit_kind_is_not_expanded():
+    expanded, used = ask_app.expand_chat_alias("explain llama_params_fit")
+    assert used is False
+    assert expanded == "explain llama_params_fit"
 
 
 def test_alias_fuzz_wide_expands_to_large_broad_fuzz_query():

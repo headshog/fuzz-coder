@@ -63,30 +63,41 @@ def expand_chat_alias(q: str, language_name: str = DEFAULT_CHAT_LANGUAGE):
     if normalized == "more fuzz":
         return adapter.alias_more_fuzz, True
     if normalized.startswith("explain "):
-        parts = raw.split(None, 1)
-        if len(parts) == 2:
-            rest = parts[1].strip()
-            m = re.match(r"^([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)(?:\s+(.*))?$", rest)
-            if m:
-                fn = (m.group(1) or "").strip("`'\"")
-                tail = (m.group(2) or "").strip()
-                if fn:
-                    tail = re.sub(
-                        r"\b(from|in)\s+([^\n,;]+?)\s+(module|directory|subdirectory|folder|path)\b",
-                        r"\1 \3 \2",
-                        tail,
-                        flags=re.IGNORECASE,
-                    )
-                    tail = re.sub(
-                        r"\b(из|в)\s+([^\n,;]+?)\s+(модуле|модуля|директории|поддиректории|папке)\b",
-                        r"\1 \3 \2",
-                        tail,
-                        flags=re.IGNORECASE,
-                    )
-                    expanded = adapter.alias_explain_template.format(function_name=fn)
-                    if tail:
-                        expanded = f"{expanded} {tail}"
-                    return expanded, True
+        m = re.match(
+            r"^\s*explain\s+"
+            r"(function|func|method|struct|class|type)\s+"
+            r"([A-Za-z_]\w*(?:(?:::|\.|\$)[A-Za-z_]\w*)*)"
+            r"(?:\s+(.*))?$",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            kind = (m.group(1) or "").strip().lower()
+            symbol = (m.group(2) or "").strip("`'\"")
+            tail = (m.group(3) or "").strip()
+            tail = re.sub(
+                r"\b(from|in)\s+([^\n,;]+?)\s+(module|directory|subdirectory|folder|path)\b",
+                r"\1 \3 \2",
+                tail,
+                flags=re.IGNORECASE,
+            )
+            tail = re.sub(
+                r"\b(из|в)\s+([^\n,;]+?)\s+(модуле|модуля|директории|поддиректории|папке)\b",
+                r"\1 \3 \2",
+                tail,
+                flags=re.IGNORECASE,
+            )
+            if kind in {"function", "func", "method"}:
+                expanded = adapter.alias_explain_template.format(function_name=symbol)
+            else:
+                expanded = (
+                    f"Explain {kind} {symbol} and describe what its fields mean. "
+                    "Provide evidence from signature, call sites, and docs (file:line). "
+                    "If unknown, say explicitly \"unknown from provided context\"."
+                )
+            if tail:
+                expanded = f"{expanded} {tail}"
+            return expanded, True
     if normalized.startswith("example "):
         parts = raw.split(None, 1)
         if len(parts) == 2:
@@ -136,7 +147,8 @@ def render_help_text(language_name: str = DEFAULT_CHAT_LANGUAGE) -> str:
         "- more fuzz -> Like fuzz, but exclude previously listed functions\n"
         "- more fuzz wide -> Write other functions that are good for fuzzing (no parameter-count limit)\n"
         f"- example FUNCTION_NAME -> Write an example of FUNCTION_NAME with a standalone main() and {cli_expr}-based params\n\n"
-        "- explain SYMBOL -> Analyze function parameters OR struct/class fields (auto-detected) with evidence\n\n"
+        "- explain function FUNCTION_NAME -> Analyze function parameter semantics with evidence\n"
+        "- explain struct STRUCT_NAME -> Analyze struct/class field semantics with evidence\n\n"
         "Example queries:\n"
         "- List functions good for fuzzing from module src/parsers\n"
         f"{adapter.help_type_query_example}"
@@ -144,7 +156,8 @@ def render_help_text(language_name: str = DEFAULT_CHAT_LANGUAGE) -> str:
         "- List other functions good for fuzzing from directory src/parsers\n"
         "- Explain how decode_binary_blob works\n"
         "- Give an example calling parse_json_payload\n"
-        "- What parameters does llama_params_fit take and what does each mean?\n"
+        "- explain function llama_params_fit\n"
+        "- explain struct jas_image_t\n"
     )
 
 
